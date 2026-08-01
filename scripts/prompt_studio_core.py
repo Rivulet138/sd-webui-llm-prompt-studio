@@ -514,6 +514,11 @@ class StudioDB:
         with self.lock, self._connection() as conn:
             conn.execute("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value, ensure_ascii=False)))
 
+    def delete_setting(self, key: str) -> bool:
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute("DELETE FROM settings WHERE key=?", (key,))
+            return cursor.rowcount > 0
+
 
 class CredentialStore:
     """Versioned server-side API-key storage; keys are never returned to the browser."""

@@ -74,21 +74,12 @@ def _safe_error(error: Exception) -> str:
 
 
 def _connection_store() -> dict[str, Any]:
+    DB.delete_setting("llm_connection")
     stored = DB.get_setting("llm_connections_v2", {}) or {}
     if isinstance(stored, dict) and isinstance(stored.get("providers"), dict):
         return stored
-    legacy = DB.get_setting("llm_connection", {}) or {}
-    provider = str(legacy.get("provider") or legacy.get("backend") or DEFAULT_LLM_SETTINGS["provider"])
-    if provider not in PROVIDER_PROFILES:
-        provider = DEFAULT_LLM_SETTINGS["provider"]
-    return {"version": 2, "active_provider": provider, "providers": {provider: {
-        "endpoint": legacy.get("endpoint") or get_provider_profile(provider)["default_endpoint"],
-        "model": legacy.get("model") or "",
-        "temperature": legacy.get("temperature", DEFAULT_LLM_SETTINGS["temperature"]),
-        "timeout": legacy.get("timeout", DEFAULT_LLM_SETTINGS["timeout"]),
-        "max_tokens": legacy.get("max_tokens", DEFAULT_LLM_SETTINGS["max_tokens"]),
-        "send_temperature": legacy.get("send_temperature", get_provider_profile(provider)["send_temperature"]),
-    }}}
+    provider = DEFAULT_LLM_SETTINGS["provider"]
+    return {"version": 2, "active_provider": provider, "providers": {}}
 
 
 def _connection_settings(provider: str | None = None) -> dict[str, Any]:
@@ -336,7 +327,6 @@ def _save_llm_settings(provider, endpoint, model, api_key, temperature, timeout,
     providers = dict(store.get("providers", {}))
     providers[provider] = settings
     DB.set_setting("llm_connections_v2", {"version": 2, "active_provider": provider, "providers": providers})
-    DB.set_setting("llm_connection", {"backend": provider, **settings})
     key_saved = CREDENTIALS.save(provider, endpoint, api_key)
     key_available = key_saved or CREDENTIALS.has_matching(provider, endpoint)
     message = f"{provider} 设置已保存，URL、模型和生成参数下次会自动恢复。"
@@ -536,14 +526,10 @@ def _api_generate(payload: dict[str, Any]):
         "nsfw_injection": "", "user_instruction": "", "source_tags": "",
     }
     payload = dict(payload or {})
-    allowed_fields = set(defaults) | {"request", "backend"}
+    allowed_fields = set(defaults) | {"request"}
     unknown_fields = sorted(set(payload) - allowed_fields)
     if unknown_fields:
         raise ValueError(f"API request contains unsupported fields: {', '.join(unknown_fields)}")
-    if "backend" in payload:
-        if "provider" in payload and payload["provider"] != payload["backend"]:
-            raise ValueError("API provider and legacy backend values conflict")
-        payload["provider"] = payload.pop("backend")
     if payload.get("api_key"):
         raise ValueError("API Key cannot be supplied through the plugin API; save it in the Chinese UI")
     if "provider" in payload and payload["provider"] != saved_connection["provider"]:

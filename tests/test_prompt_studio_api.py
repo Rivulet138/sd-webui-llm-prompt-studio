@@ -33,12 +33,19 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         ui.CREDENTIALS = CredentialStore(root / "credentials.json")
         ui.DEFAULT_WILDCARDS = self.lexicon
         ui.call_llm = lambda *args, **kwargs: "1girl, red_hair"
-        ui.DB.set_setting("llm_connection", {
-            "backend": "OpenAI Compatible",
-            "endpoint": "http://127.0.0.1:1234/v1",
-            "model": "test-model",
-            "temperature": 0.35,
-            "timeout": 90,
+        ui.DB.set_setting("llm_connections_v2", {
+            "version": 2,
+            "active_provider": "OpenAI Compatible",
+            "providers": {
+                "OpenAI Compatible": {
+                    "endpoint": "http://127.0.0.1:1234/v1",
+                    "model": "test-model",
+                    "temperature": 0.35,
+                    "timeout": 90,
+                    "max_tokens": 1024,
+                    "send_temperature": True,
+                }
+            },
         })
 
     def tearDown(self):
@@ -123,31 +130,35 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(label == ui.PROVIDER_PROFILES[provider]["ui_label"] for label, provider in ui.PROVIDER_UI_CHOICES))
 
-    async def test_v2_connection_settings_take_priority_over_legacy_mirror(self):
+    async def test_legacy_connection_setting_is_deleted_and_ignored(self):
         ui.DB.set_setting("llm_connection", {
             "backend": "OpenAI Compatible",
             "endpoint": "http://127.0.0.1:9999/v1",
             "model": "stale-legacy-model",
         })
-        ui.DB.set_setting("llm_connections_v2", {
-            "version": 2,
-            "active_provider": "Anthropic",
-            "providers": {
-                "Anthropic": {
-                    "endpoint": "https://api.anthropic.com",
-                    "model": "current-v2-model",
-                    "temperature": 0.1,
-                    "timeout": 120,
-                    "max_tokens": 2048,
-                    "send_temperature": False,
-                }
-            },
-        })
+        ui.DB.delete_setting("llm_connections_v2")
 
         settings = ui._connection_settings()
-        self.assertEqual(settings["provider"], "Anthropic")
-        self.assertEqual(settings["model"], "current-v2-model")
-        self.assertEqual(settings["endpoint"], "https://api.anthropic.com")
+        self.assertEqual(settings["provider"], "OpenAI Compatible")
+        self.assertEqual(settings["model"], "")
+        self.assertEqual(settings["endpoint"], "http://127.0.0.1:1234/v1")
+        self.assertIsNone(ui.DB.get_setting("llm_connection"))
+
+    async def test_generate_api_rejects_removed_backend_alias(self):
+        self._install_shared("")
+        app = FastAPI()
+        ui.on_app_started(None, app)
+
+        response = await self._request(
+            app,
+            "127.0.0.1",
+            "POST",
+            "/llm-prompt-studio/v1/generate",
+            json={"request": "red-haired girl", "backend": "OpenAI Compatible"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unsupported fields", response.json()["detail"])
 
     async def test_generate_api_rejects_unknown_fields(self):
         self._install_shared("")

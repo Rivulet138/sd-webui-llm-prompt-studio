@@ -61,7 +61,7 @@ git pull --ff-only
 - API Key 不会回填到浏览器。
 - API Key 输入框留空时，仅当 Provider 和 URL 完全匹配，服务端才会复用对应凭据。
 - “清除已保存的 API Key”只清除当前 Provider 与 URL 的凭据，不影响其他 Provider。
-- 旧版单连接设置和凭据会自动读取；下次保存时迁移为多 Provider 格式。存在 `llm_connections_v2` 时始终以 v2 为准，旧 `llm_connection` 仅作为向后兼容镜像继续写入。
+- 插件只使用 `llm_connections_v2` 多 Provider 配置。旧 `llm_connection` 配置不会读取，并会在加载连接设置时自动删除。旧版单文件 API Key 仍会在下次保存凭据时迁移，避免无提示丢失密钥。
 
 ## Provider 兼容性
 
@@ -262,7 +262,7 @@ POST /llm-prompt-studio/v1/generate
 }
 ```
 
-API 使用中文界面中当前激活并保存的 Provider、URL 和服务端凭据；请求不能覆盖 Provider、URL 或直接提交 API Key。旧字段 `backend` 仍可作为 `provider` 的兼容别名，但值必须与当前激活配置一致。生成、模型、采样、RAG、标签处理、结构化输出与缓存参数采用显式白名单，未声明字段会返回 HTTP 400，不会透传到 Provider。未配置 Forge `--api-auth` 时，仅允许本机回环地址调用；远程调用必须启用 `--api-auth`。
+API 使用中文界面中当前激活并保存的 Provider、URL 和服务端凭据；请求不能覆盖 Provider、URL 或直接提交 API Key。旧字段 `backend` 已移除，提交该字段会返回 HTTP 400。生成、模型、采样、RAG、标签处理、结构化输出与缓存参数采用显式白名单，未声明字段不会透传到 Provider。未配置 Forge `--api-auth` 时，仅允许本机回环地址调用；远程调用必须启用 `--api-auth`。
 
 ### 查询缓存
 

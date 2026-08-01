@@ -121,6 +121,9 @@ class PromptStudioCoreTests(unittest.TestCase):
             db = StudioDB(Path(directory) / "studio.db")
             db.set_setting("connection", {"endpoint": "http://127.0.0.1:1234/v1"})
             self.assertEqual(db.get_setting("connection")["endpoint"], "http://127.0.0.1:1234/v1")
+            self.assertTrue(db.delete_setting("connection"))
+            self.assertIsNone(db.get_setting("connection"))
+            self.assertFalse(db.delete_setting("connection"))
 
     def test_credentials_are_reused_only_for_matching_url(self):
         with tempfile.TemporaryDirectory() as directory:
