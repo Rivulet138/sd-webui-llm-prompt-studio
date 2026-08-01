@@ -1,0 +1,91 @@
+airport
+amusement park
+aquarium
+architecture
+arena
+art gallery
+auditorium
+bakery
+balcony
+bar
+billiard
+bowling alley
+bridge
+building
+building ruins
+bus stop
+cafe
+carousel
+casino
+castle
+cathedral
+chinese style architecture
+chinese style loft
+church
+classroom
+clock tower
+coffee house
+concert
+convenience store
+courtroom
+disney land
+dock
+dungeon
+east asian architecture
+engine room
+ferris wheel
+food stand
+fountain
+gohci
+gothic architecture
+greco-roman architectur
+gym
+harbor
+house
+in the movie theatre
+industrial wind chinese architecture
+izakaya
+jail bars
+japanese hotel
+laboratory
+library
+lighthouse
+magnificent architecture
+modern europe
+mosque
+movie theater
+museum
+pagoda
+pharmacy
+phone booth
+pier
+planetarium
+pool
+poolside
+prison
+rappelling
+remains
+restaurant
+rooftop
+rubble ruins
+ruins
+shop
+shrine
+skyscraper
+stadium
+stage
+storefront
+supermarket
+swimming pool
+temple
+theater
+tombstone
+torii
+tower
+traditional chinese room
+train station
+trapeze
+turret
+veranda
+warehouse
+workshop

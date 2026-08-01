@@ -1,0 +1,60 @@
+anchor print
+arm garter
+arm guards
+arm ribbon
+arm strap
+arm tattoo
+arm warmers
+armband
+ascot
+back bow
+beads
+belt
+belt buckle
+belt pouch
+bowtie
+bra strap
+button eyes
+collar
+cross pasties
+cuffs
+epaulettes
+feather boa
+gauntlets
+gloves
+harness
+kote
+lace
+lanyard
+mittens
+multiple belts
+neck ribbon
+neck ruff
+neckerchief
+necktie
+o-ring
+obi
+obiage
+obijime
+pasties
+paw gloves
+paw shoes
+ribbon
+sash
+scarf
+shoulder armor
+shoulder sash
+sleeve bow
+spikes
+star pasties
+strap
+suspenders
+tail bow
+tassel
+under-rim eyewear
+vambraces
+waist bow
+wrist cuffs
+wrist ribbon
+wrist scrunchie
+wristband

@@ -1,0 +1,48 @@
+holding
+holding animal
+holding balloon
+holding basket
+holding beachball
+holding book
+holding bouquet
+holding broom
+holding cake
+holding camera
+holding clothes
+holding dagger
+holding drink
+holding envelope
+holding fan
+holding fireworks
+holding flag
+holding flower
+holding food
+holding game controller
+holding gohei
+holding ice cream
+holding instrument
+holding lantern
+holding leaf
+holding lollipop
+holding magnifying glass
+holding map
+holding mask
+holding microphone
+holding microphone stand
+holding own tail
+holding paintbrush
+holding phone
+holding pom poms
+holding popsicle
+holding saucer
+holding spoon
+holding staff
+holding stuffed toy
+holding swim ring
+holding sword
+holding towel
+holding wand
+holding water gun
+bird on hand
+hand on hilt
+hands on hilt

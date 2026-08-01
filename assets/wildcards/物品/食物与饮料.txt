@@ -1,0 +1,82 @@
+alcohol
+apple
+baguette
+banana
+baozi
+beer
+bento
+berry
+birthday cake
+bottle
+bowl
+bread
+bubble tea
+burger
+butter
+cake
+candy
+carrot
+champagne
+cheese
+cherry
+chocolate
+coffee
+cookie
+crepe
+croissant
+cupcake
+dango
+dessert
+doughnut
+drink
+dumpling
+egg
+french fries
+fried egg
+fruit
+grapes
+hamburger
+ice cream
+juice
+ketchup
+lemon
+lettuce
+lollipop
+macaron
+meat
+melon
+milk carton
+mochi
+omelet
+omurice
+onigiri
+orange (fruit)
+pancake
+parfait
+pasta
+peach
+pie
+pizza
+pocky
+popsicle
+potato
+pudding
+ramune
+rice
+sake
+sandwich
+sausage
+shaved ice
+shrimp
+soda
+strawberry
+sushi
+sweets
+taiyaki
+tea
+tempura
+tomato
+vegetable
+water bottle
+watermelon
+wine

@@ -1,0 +1,9 @@
+blurry
+blurry foreground
+bokeh
+chromatic aberration
+contrast
+depth of field
+drop shadow
+fisheye
+motion blur

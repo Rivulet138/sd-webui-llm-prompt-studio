@@ -1,0 +1,44 @@
+angora rabbit
+animal
+bat (animal)
+bear
+bird
+butterfly
+cat
+chick
+chicken
+clownfish
+cow
+crab
+crow
+dinosaur
+dog
+dolphin
+dove
+dragon
+duck
+fish
+fox
+goat
+goldfish
+hamster
+horse
+jellyfish
+koi
+octopus
+panda
+parrot
+penguin
+pig
+pigeon
+rabbit
+seagull
+seal (animal)
+shark
+sheep
+shiba inu
+snail
+snake
+tiger
+turtle
+whale

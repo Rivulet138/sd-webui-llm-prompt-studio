@@ -1,0 +1,31 @@
+arrow (projectile)
+assault rifle
+axe
+baton (weapon)
+battle axe
+bomb
+bow (weapon)
+bullet
+dagger
+explosive
+gun
+halberd
+hammer
+handgun
+katana
+knife
+kunai
+lance
+machine gun
+pistol
+polearm
+rifle
+scythe
+shield
+shuriken
+sniper rifle
+spear
+sword
+tank
+weapon
+whip

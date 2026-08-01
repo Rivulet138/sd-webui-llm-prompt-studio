@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import html
+import ipaddress
 import json
 import sys
 import threading
@@ -8,10 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import gradio as gr
+from starlette.requests import Request
 
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, CredentialStore, StudioDB, build_system_prompt,
-    build_user_message, call_llm, is_sfw_output, process_tags, regional_format,
+    build_user_message, call_llm, is_sfw_output, process_tags, regional_format, validate_endpoint,
 )
 
 
@@ -61,6 +64,10 @@ def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
 def _refresh_cache(query: str = ""):
     records = DB.list_prompts(query)
     return gr.update(value=_as_rows(records)), f"本地缓存共 {len(records)} 条记录"
+
+
+def _safe_error(error: Exception) -> str:
+    return html.escape(str(error), quote=False)
 
 
 def _load_record(record_id):
@@ -140,7 +147,7 @@ def _export_cache(file_format):
         path = DB.export_records(str(file_format or "JSON").lower())
         return f"导出完成：{path}", path
     except Exception as error:
-        return f"导出失败：{error}", None
+        return f"导出失败：{_safe_error(error)}", None
 
 
 def _import_cache(file_value, dedupe):
@@ -151,7 +158,7 @@ def _import_cache(file_value, dedupe):
         stats = DB.import_records(path, bool(dedupe))
         return f"导入完成：新增 {stats['inserted']} 条，跳过重复 {stats['duplicates']} 条", gr.update(value=_as_rows(DB.list_prompts()))
     except Exception as error:
-        return f"导入失败：{error}", gr.update()
+        return f"导入失败：{_safe_error(error)}", gr.update()
 
 
 def _cancel_batch_generation():
@@ -272,10 +279,10 @@ def _generate(
         resolved_key = CREDENTIALS.resolve(api_key, backend, endpoint)
         result = call_llm(backend, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90))
     except Exception as error:
-        return "", system, f"生成失败：{error}"
+        return "", system, f"生成失败：{_safe_error(error)}"
     if safety == "SFW" and not is_sfw_output(result):
         return "", system, "SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。"
-    if preset in {"Danbooru Tags", "Anima Tags"}:
+    if preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
         result = process_tags(result, bool(remove_bad), remove_terms, bool(shuffle), bool(spaces), int(max_tags or 0))
     if structured_mode != "Plain Prompt":
         result = regional_format(result, structured_mode, int(region_count or 1))
@@ -291,7 +298,7 @@ def _expand_or_polish(source, action, preset, system_override, base_model, safet
         resolved_key = CREDENTIALS.resolve(api_key, backend, endpoint)
         return call_llm(backend, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90)), "LLM 提示词处理完成"
     except Exception as error:
-        return "", f"处理失败：{error}"
+        return "", f"处理失败：{_safe_error(error)}"
 
 
 def _test_connection(backend, endpoint, model, api_key, timeout):
@@ -300,7 +307,7 @@ def _test_connection(backend, endpoint, model, api_key, timeout):
         output = call_llm(backend, endpoint, model, resolved_key, "Reply exactly: READY", "Connection test", 0, int(timeout or 30))
         return f"连接成功：{output[:160]}"
     except Exception as error:
-        return f"连接失败：{error}"
+        return f"连接失败：{_safe_error(error)}"
 
 
 def _inline_generate(*values):
@@ -412,18 +419,26 @@ def _wd14_interrogate(image, endpoint, model, threshold):
         tags = [key for key, value in data.get("caption", {}).items() if isinstance(value, (float, int)) and value >= float(threshold)]
         return ", ".join(tags), f"WD14 返回了 {len(tags)} 个标签"
     except Exception as error:
-        return "", f"WD14 不可用：{error}"
+        return "", f"WD14 不可用：{_safe_error(error)}"
 
 
 def _api_generate(payload: dict[str, Any]):
+    saved_connection = {**DEFAULT_LLM_SETTINGS, **(DB.get_setting("llm_connection", {}) or {})}
     defaults = {
         "preset": "Danbooru Tags", "system_override": "", "base_model": "Auto / checkpoint default", "safety": "SFW",
-        "backend": "OpenAI Compatible", "endpoint": "http://127.0.0.1:1234/v1", "model": "", "api_key": "",
+        "backend": saved_connection["backend"], "endpoint": saved_connection["endpoint"], "model": saved_connection["model"], "api_key": "",
         "temperature": 0.35, "timeout": 90, "few_shot_count": 3, "rag_min_score": 0,
         "remove_bad": True, "remove_terms": "", "shuffle": False, "spaces": False, "max_tags": 0,
         "structured_mode": "Plain Prompt", "region_count": 1, "save_score": 0, "cache_result": False,
         "nsfw_injection": "", "user_instruction": "", "source_tags": "",
     }
+    payload = payload or {}
+    if payload.get("api_key"):
+        raise ValueError("API Key cannot be supplied through the plugin API; save it in the Chinese UI")
+    if "backend" in payload and payload["backend"] != saved_connection["backend"]:
+        raise ValueError("API backend must match the connection saved in the plugin UI")
+    if "endpoint" in payload and validate_endpoint(payload["endpoint"]) != validate_endpoint(saved_connection["endpoint"]):
+        raise ValueError("API endpoint must match the connection saved in the plugin UI")
     values = {**defaults, **(payload or {})}
     generated, system, status = _generate(values.get("request", ""), *[values[key] for key in [
         "source_tags", "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction", "backend", "endpoint", "model", "api_key", "temperature", "timeout", "few_shot_count", "rag_min_score", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags", "structured_mode", "region_count", "save_score", "cache_result"
@@ -442,22 +457,30 @@ def on_app_started(_, app):
             print(f"[LLM Prompt Studio] wildcard indexing skipped: {error}")
     try:
         from fastapi import Depends, HTTPException
-        from fastapi.security import HTTPBasic, HTTPBasicCredentials
+        from fastapi.security import HTTPBasic
         from modules import shared
         from secrets import compare_digest
 
-        api_dependencies = []
         configured_auth = str(getattr(shared.cmd_opts, "api_auth", "") or "").strip()
-        if configured_auth:
-            credentials = dict(item.split(":", 1) for item in configured_auth.split(",") if ":" in item)
-            security = HTTPBasic()
+        security = HTTPBasic(auto_error=False)
+        credentials = dict(item.split(":", 1) for item in configured_auth.split(",") if ":" in item)
 
-            def api_auth(value: HTTPBasicCredentials = Depends(security)):
-                if value.username in credentials and compare_digest(value.password, credentials[value.username]):
+        def api_access(request: Request, value=Depends(security)):
+            if configured_auth:
+                if value and value.username in credentials and compare_digest(value.password, credentials[value.username]):
                     return True
                 raise HTTPException(status_code=401, detail="Incorrect username or password", headers={"WWW-Authenticate": "Basic"})
+            client_host = (request.client.host if request.client else "").split("%", 1)[0]
+            try:
+                if ipaddress.ip_address(client_host).is_loopback:
+                    return True
+            except ValueError:
+                pass
+            raise HTTPException(status_code=403, detail="Plugin API requires Forge --api-auth for remote access")
 
-            api_dependencies = [Depends(api_auth)]
+        api_dependencies = [Depends(api_access)]
+        if configured_auth:
+            print("[LLM Prompt Studio] API protected by Forge --api-auth")
 
         @app.post("/llm-prompt-studio/v1/generate", dependencies=api_dependencies)
         def prompt_studio_generate(payload: dict[str, Any]):

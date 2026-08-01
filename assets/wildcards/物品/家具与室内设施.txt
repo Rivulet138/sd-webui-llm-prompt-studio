@@ -1,0 +1,34 @@
+air conditioner
+armchair
+bath
+bed
+bench
+bookshelf
+cabinet
+carpet
+ceiling light
+chair
+chandelier
+clock
+couch
+curtains
+cushion
+desk
+door
+drawer
+fan (mechanical)
+fireplace
+futon
+kotatsu
+lamp
+mirror
+pillow
+refrigerator
+rug
+shelf
+sink
+sofa
+stool
+stove
+table
+window

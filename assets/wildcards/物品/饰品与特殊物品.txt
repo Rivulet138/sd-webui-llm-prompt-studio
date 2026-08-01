@@ -1,0 +1,25 @@
+amulet
+anchor
+badge
+bandage
+bell
+bow (ribbon)
+chain
+crown
+flag
+gohei
+halo
+lantern
+leash
+ofuda
+orb
+ribbon
+ring
+scroll
+shimenawa
+staff
+star
+syringe
+talisman
+wand
+wings

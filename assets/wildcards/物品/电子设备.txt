@@ -1,0 +1,18 @@
+camera
+cellphone
+computer
+controller
+game boy
+headphones
+keyboard (computer)
+laptop
+microphone
+monitor
+mouse (computer)
+nintendo switch
+phone
+radio
+smartphone
+speaker
+tablet pc
+television

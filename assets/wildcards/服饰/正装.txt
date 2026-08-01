@@ -1,0 +1,13 @@
+blazer
+dress shirt
+evening gown
+formal
+furisode
+kariginu
+pant suit
+suit
+tuxedo
+uchikake
+wedding dress
+haori
+kimono

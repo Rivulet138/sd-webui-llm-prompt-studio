@@ -1,0 +1,35 @@
+aquarium
+bar \(place\)
+bath
+bathroom
+bedroom
+cafe
+ceiling
+church
+classroom
+concert
+doorway
+fireplace
+hallway
+indoors
+kitchen
+library
+laboratory
+living room
+loaded interior
+locker room
+on bed
+on couch
+onsen
+office
+prison
+restaurant
+school
+shop
+shower \(place\)
+stage
+tatami
+train interior
+wooden floor
+indoor
+room

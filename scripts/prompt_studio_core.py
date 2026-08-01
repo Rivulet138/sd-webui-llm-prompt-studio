@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from contextlib import contextmanager
@@ -26,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "user"
 DB_PATH = DATA_DIR / "prompt_studio.db"
 CREDENTIALS_PATH = DATA_DIR / "credentials" / "llm_credentials.json"
-DEFAULT_WILDCARDS = Path(r"E:\wildcards")
+DEFAULT_WILDCARDS = ROOT / "assets" / "wildcards"
 
 BAD_TAGS = {
     "watermark", "signature", "text", "english text", "chinese text",
@@ -84,6 +85,10 @@ class StudioDB:
     BACKUP_MAX_COUNT = 20
     BACKUP_MAX_AGE_DAYS = 30
     BACKUP_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+    MAX_WILDCARD_FILES = 5000
+    MAX_WILDCARD_FILE_BYTES = 4 * 1024 * 1024
+    MAX_WILDCARD_TERMS_PER_FILE = 20000
+    MAX_WILDCARD_TERM_LENGTH = 256
 
     def __init__(self, path: Path = DB_PATH):
         self.path = path
@@ -256,7 +261,7 @@ class StudioDB:
         backup_dir = self.path.parent / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         safe_reason = re.sub(r"[^a-zA-Z0-9_-]+", "_", reason)[:40] or "backup"
-        backup_path = backup_dir / f"prompt_studio_{time.strftime('%Y%m%d_%H%M%S')}_{safe_reason}.db"
+        backup_path = backup_dir / f"prompt_studio_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}_{safe_reason}.db"
         with self.lock:
             source = sqlite3.connect(self.path, timeout=30)
             destination = sqlite3.connect(backup_path)
@@ -373,22 +378,36 @@ class StudioDB:
         return sorted(matches, key=lambda item: (item["similarity"], item["score"]), reverse=True)[:max(0, min(count, 10))]
 
     def index_wildcards(self, source: str | Path) -> tuple[int, int]:
-        root = Path(source).expanduser()
+        root = Path(source).expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"Wildcard directory does not exist: {root}")
         indexed, terms = 0, set()
-        paths = list(root.rglob("*.txt")) + list(root.rglob("*.csv"))
+        paths = sorted(list(root.rglob("*.txt")) + list(root.rglob("*.csv")))
+        if len(paths) > self.MAX_WILDCARD_FILES:
+            raise ValueError(f"Wildcard directory exceeds {self.MAX_WILDCARD_FILES} files")
+        active_paths = {str(path.resolve()) for path in paths}
         with self.lock, self._connection() as conn:
+            # The UI selects one active lexicon directory. Remove records from old,
+            # moved, or deleted sources before rebuilding its aggregate vocabulary.
+            stale_paths = [row[0] for row in conn.execute("SELECT path FROM wildcard_files") if row[0] not in active_paths]
+            conn.executemany("DELETE FROM wildcard_files WHERE path=?", ((path,) for path in stale_paths))
             for path in paths:
                 try:
                     stat = path.stat()
-                    cached = conn.execute("SELECT modified_at, terms_json FROM wildcard_files WHERE path=?", (str(path),)).fetchone()
+                    if stat.st_size > self.MAX_WILDCARD_FILE_BYTES:
+                        conn.execute("DELETE FROM wildcard_files WHERE path=?", (str(path.resolve()),))
+                        continue
+                    canonical_path = str(path.resolve())
+                    cached = conn.execute("SELECT modified_at, terms_json FROM wildcard_files WHERE path=?", (canonical_path,)).fetchone()
                     if cached and cached["modified_at"] == stat.st_mtime:
                         terms.update(json.loads(cached["terms_json"]))
                         continue
                     content = path.read_text(encoding="utf-8-sig", errors="ignore")
-                    values = sorted({line.strip() for line in content.splitlines() if line.strip() and not line.lstrip().startswith("#")})
-                    conn.execute("INSERT INTO wildcard_files(path, modified_at, terms_json) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET modified_at=excluded.modified_at, terms_json=excluded.terms_json", (str(path), stat.st_mtime, json.dumps(values, ensure_ascii=False)))
+                    values = sorted({
+                        line.strip() for line in content.splitlines()
+                        if line.strip() and not line.lstrip().startswith("#") and len(line.strip()) <= self.MAX_WILDCARD_TERM_LENGTH
+                    })[:self.MAX_WILDCARD_TERMS_PER_FILE]
+                    conn.execute("INSERT INTO wildcard_files(path, modified_at, terms_json) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET modified_at=excluded.modified_at, terms_json=excluded.terms_json", (canonical_path, stat.st_mtime, json.dumps(values, ensure_ascii=False)))
                     terms.update(values)
                     indexed += 1
                 except OSError:
@@ -505,6 +524,14 @@ def is_sfw_output(text: str) -> bool:
     return not any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", normalized) for term in SFW_BLOCKLIST)
 
 
+def _inert_json(value: Any) -> str:
+    """Serialize untrusted prompt references without allowing delimiter closure."""
+    return (json.dumps(value, ensure_ascii=False)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026"))
+
+
 def build_system_prompt(preset: str, base_model: str, safety: str, nsfw_injection: str, user_instruction: str, examples: list[dict[str, Any]], static_tags: list[str] | None = None, system_override: str = "") -> str:
     output_profile = system_override.strip() or PRESETS.get(preset, PRESETS["Danbooru Tags"])
     system = PROMPT_POLICY_V2
@@ -517,20 +544,42 @@ def build_system_prompt(preset: str, base_model: str, safety: str, nsfw_injectio
         if nsfw_injection.strip():
             system += "\n<nsfw_policy_injection>\n" + nsfw_injection.strip() + "\n</nsfw_policy_injection>"
     if user_instruction.strip():
-        system += "\n\n<user_requirement priority=\"low\">\n" + user_instruction.strip() + "\n</user_requirement>"
+        requirement = {"requirement": user_instruction.strip()[:8000]}
+        system += "\n\n<user_requirement priority=\"low\" encoding=\"json\">\n" + _inert_json(requirement) + "\n</user_requirement>"
     if examples:
-        system += "\n\n<rag_examples purpose=\"format-and-specificity-reference-only\">\n"
-        system += "\n".join(f"- Example ({item['output_mode']}, score {item['score']}): {item['prompt']}" for item in examples)
+        references = [{
+            "output_mode": str(item.get("output_mode") or "")[:100],
+            "score": float(item.get("score") or 0),
+            "prompt": str(item.get("prompt") or "")[:4000],
+        } for item in examples[:8]]
+        system += "\n\n<rag_examples purpose=\"format-and-specificity-reference-only\" encoding=\"json\">\n"
+        system += _inert_json(references)
         system += "\n</rag_examples>"
     if static_tags:
-        system += "\n\n<static_tag_lexicon purpose=\"vocabulary-reference-only\">\n"
-        system += ", ".join(static_tags[:40]) + "\n</static_tag_lexicon>"
+        tags = [str(tag)[:256] for tag in static_tags[:40]]
+        system += "\n\n<static_tag_lexicon purpose=\"vocabulary-reference-only\" encoding=\"json\">\n"
+        system += _inert_json(tags) + "\n</static_tag_lexicon>"
     return system
 
 
 def build_user_message(request: str) -> str:
     """Keep the user-controlled image request explicitly below system policy."""
-    return "<user_image_request priority=\"low\">\n" + (request or "").strip() + "\n</user_image_request>"
+    payload = {"request": (request or "").strip()[:16000]}
+    return "<user_image_request priority=\"low\" encoding=\"json\">\n" + _inert_json(payload) + "\n</user_image_request>"
+
+
+def validate_endpoint(endpoint: str) -> str:
+    endpoint = str(endpoint or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("LLM endpoint must be an absolute HTTP or HTTPS URL")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("LLM endpoint cannot contain credentials or a URL fragment")
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError("LLM endpoint contains an invalid port") from error
+    return endpoint
 
 
 def _request_json(url: str, payload: dict[str, Any], api_key: str = "", timeout: int = 90) -> dict[str, Any]:
@@ -539,14 +588,13 @@ def _request_json(url: str, payload: dict[str, Any], api_key: str = "", timeout:
         with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:1000]
-        raise RuntimeError(f"LLM HTTP {error.code}: {detail}") from error
+        raise RuntimeError(f"LLM HTTP {error.code}: {error.reason}") from error
     except urllib.error.URLError as error:
         raise RuntimeError(f"LLM connection failed: {error.reason}") from error
 
 
 def call_llm(backend: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 0.35, timeout: int = 90) -> str:
-    endpoint = endpoint.rstrip("/")
+    endpoint = validate_endpoint(endpoint)
     if backend == "Ollama":
         data = _request_json(endpoint + "/api/chat", {"model": model, "stream": False, "options": {"temperature": temperature}, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, timeout=timeout)
         return str(data.get("message", {}).get("content", "")).strip()

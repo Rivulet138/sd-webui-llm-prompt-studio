@@ -1,0 +1,17 @@
+clear sky
+cloud
+clouds
+cloudy sky
+cold
+cumulonimbus cloud
+fog
+hot
+lightning
+overcast
+rain
+rainbow
+snow
+snowflakes
+snowing
+wind
+wind lift

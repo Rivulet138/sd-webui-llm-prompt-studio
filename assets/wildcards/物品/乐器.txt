@@ -1,0 +1,7 @@
+drum
+electric guitar
+flute
+guitar
+piano
+trumpet
+violin
