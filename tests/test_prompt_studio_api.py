@@ -193,6 +193,116 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[8], 64)
         self.assertTrue(args[9])
 
+    async def test_workflow_parameters_are_saved_and_restored(self):
+        message = ui._save_workflow_settings(
+            "NoobAI Tags", "custom system", "NoobAI", "NSFW", "local policy", "最多 40 个标签",
+            "Regional JSON", 4, True, "watermark", True, True, 40,
+            5, 8.5, 9, True,
+            False, 3, 8,
+            "http://127.0.0.1:7861", "wd-test", 0.42, str(self.lexicon),
+        )
+
+        restored = ui._workflow_settings()
+        self.assertIn("下次打开", message)
+        self.assertEqual(restored["preset"], "NoobAI Tags")
+        self.assertEqual(restored["base_model"], "NoobAI")
+        self.assertEqual(restored["structured_mode"], "Regional JSON")
+        self.assertEqual(restored["batch_retries"], 3)
+        self.assertEqual(restored["wd_model"], "wd-test")
+        self.assertEqual(restored["wildcard_path"], str(self.lexicon))
+
+        reset_values = ui._reset_workflow_settings()
+        self.assertEqual(len(reset_values), 25)
+        self.assertEqual(reset_values[0], ui.WORKFLOW_DEFAULTS["preset"])
+        self.assertIn("已恢复默认", reset_values[-1])
+        self.assertIsNone(ui.DB.get_setting("workflow_settings_v1"))
+
+    async def test_batch_and_direct_import_previews_report_queue_shape(self):
+        queue, status = ui._preview_batch_sources(
+            "first request\nfirst request\n# note\nsecond request", True, "NoobAI Tags", "NoobAI",
+        )
+        direct, direct_status = ui._preview_bulk_cache(
+            "8\tfirst prompt\nsecond prompt\n# note", "NoobAI Tags", "NoobAI", 6,
+        )
+
+        self.assertEqual(len(queue["value"]), 2)
+        self.assertIn("重复输入 1 条", status)
+        self.assertEqual(direct["value"][0][1], 8)
+        self.assertEqual(direct["value"][1][1], 6)
+        self.assertIn("2 条可导入", direct_status)
+
+    async def test_cache_table_selection_loads_editor_and_multiselect_preview(self):
+        record_id = ui.DB.save_prompt(
+            "selected prompt", "negative", "NoobAI Tags", "NoobAI", 9, "source tags",
+        )
+        rows = ui._as_rows(ui.DB.list_prompts())
+        event = SimpleNamespace(index=(0, 5))
+
+        selected_update, loaded_id, prompt, negative, output_mode, base_model, score, tags, status = ui._select_cache_row(rows, event)
+
+        self.assertEqual(selected_update["value"], [str(record_id)])
+        self.assertEqual(loaded_id, str(record_id))
+        self.assertEqual(prompt, "selected prompt")
+        self.assertEqual(negative, "negative")
+        self.assertEqual(output_mode, "NoobAI Tags")
+        self.assertEqual(base_model, "NoobAI")
+        self.assertEqual(score, 9)
+        self.assertEqual(tags, "source tags")
+        self.assertIn("已载入", status)
+        preview, previewed_ids = ui._preview_selected([str(record_id)])
+        self.assertIn("将操作 1 条记录", preview)
+        self.assertEqual(previewed_ids, [str(record_id)])
+
+    async def test_cache_mutations_preserve_active_filters(self):
+        kept_id = ui.DB.save_prompt("keep this prompt", output_mode="NoobAI Tags", base_model="NoobAI", score=9)
+        ui.DB.save_prompt("hide this prompt", output_mode="Natural Language", base_model="Krea 2", score=2)
+
+        status, table, selected = ui._save_record_as_new(
+            "another hidden prompt", "", "Natural Language", "Krea 2", 1, "",
+            "keep", 8, "NoobAI Tags", "NoobAI",
+        )
+        self.assertIn("已保存", status)
+        self.assertEqual([row[1] for row in table["value"]], [kept_id])
+        self.assertEqual(selected["value"], [])
+
+        status, table, selected = ui._bulk_cache(
+            "bulk hidden prompt", "Natural Language", "Krea 2", 1,
+            "keep", 8, "NoobAI Tags", "NoobAI",
+        )
+        self.assertIn("批量导入完成", status)
+        self.assertEqual([row[1] for row in table["value"]], [kept_id])
+        self.assertEqual(selected["value"], [])
+
+        status, table, selected = ui._delete_previewed_records(
+            [str(kept_id)], [str(kept_id)], "keep", 8, "NoobAI Tags", "NoobAI",
+        )
+        self.assertIn("已删除 1 条", status)
+        self.assertEqual(table["value"], [])
+        self.assertEqual(selected["value"], [])
+
+    async def test_selected_delete_requires_preview_of_current_selection(self):
+        first = ui.DB.save_prompt("first prompt")
+        second = ui.DB.save_prompt("second prompt")
+
+        status, table, selected = ui._delete_previewed_records([str(second)], [str(first)])
+
+        self.assertIn("选择已变化", status)
+        self.assertEqual(table.get("__type__"), "update")
+        self.assertNotIn("value", table)
+        self.assertEqual(selected.get("__type__"), "update")
+        self.assertNotIn("value", selected)
+        self.assertIsNotNone(ui.DB.get_prompt(first))
+        self.assertIsNotNone(ui.DB.get_prompt(second))
+
+    async def test_selected_export_reports_only_existing_records(self):
+        existing = ui.DB.save_prompt("export me")
+
+        status, path = ui._export_selected([str(existing), "999999"], "JSON")
+
+        self.assertIn("已导出选中的 1 条记录", status)
+        self.assertIn("忽略已不存在的 1 条选择", status)
+        self.assertTrue(Path(path).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -273,13 +273,35 @@ class StudioDB:
                 seen.add(content_hash)
         return {"requested": len(prepared), "inserted": inserted, "duplicates": duplicates, "ids": ids}
 
-    def list_prompts(self, query: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        where, params = "", []
+    def list_prompts(
+        self,
+        query: str = "",
+        limit: int = 200,
+        min_score: float = 0,
+        output_mode: str = "",
+        base_model: str = "",
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
         if query.strip():
-            where = "WHERE prompt LIKE ? OR tags LIKE ?"
-            params = [f"%{query.strip()}%", f"%{query.strip()}%"]
+            clauses.append("(prompt LIKE ? OR negative_prompt LIKE ? OR tags LIKE ?)")
+            needle = f"%{query.strip()}%"
+            params.extend([needle, needle, needle])
+        if float(min_score or 0) > 0:
+            clauses.append("score>=?")
+            params.append(float(min_score))
+        if str(output_mode or "").strip():
+            clauses.append("output_mode=?")
+            params.append(str(output_mode).strip())
+        if str(base_model or "").strip():
+            clauses.append("base_model=?")
+            params.append(str(base_model).strip())
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
         with self.lock, self._connection() as conn:
-            rows = conn.execute(f"WITH visible AS (SELECT prompts.*, ROW_NUMBER() OVER (ORDER BY id ASC) AS visible_position FROM prompts) SELECT * FROM visible {where} ORDER BY score DESC, updated_at DESC LIMIT ?", (*params, max(1, min(limit, 1000)))).fetchall()
+            rows = conn.execute(
+                f"WITH visible AS (SELECT prompts.*, ROW_NUMBER() OVER (ORDER BY id ASC) AS visible_position FROM prompts) "
+                f"SELECT * FROM visible {where} ORDER BY visible_position ASC LIMIT ?",
+                (*params, max(1, min(limit, 1000))),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def get_prompt(self, record_id: int) -> dict[str, Any] | None:
@@ -403,16 +425,19 @@ class StudioDB:
             conn.execute("DELETE FROM deletion_journal WHERE id=?", (journal["id"],))
         return restored
 
-    def export_records(self, file_format: str = "json", directory: Path | None = None) -> str:
+    def export_records(self, file_format: str = "json", directory: Path | None = None, ids: Iterable[int] | None = None) -> str:
         file_format = file_format.lower()
         if file_format not in {"json", "csv"}:
             raise ValueError("Unsupported export format")
         export_dir = Path(directory or (self.path.parent / "exports"))
         export_dir.mkdir(parents=True, exist_ok=True)
-        path = export_dir / f"prompt_cache_{time.strftime('%Y%m%d_%H%M%S')}.{file_format}"
-        records = self.list_prompts(limit=1000)
+        path = export_dir / f"prompt_cache_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.{file_format}"
+        selected_ids = sorted({int(item) for item in ids or []})
         with self.lock, self._connection() as conn:
-            if len(records) == 1000:
+            if selected_ids:
+                placeholders = ",".join("?" for _ in selected_ids)
+                records = [dict(row) for row in conn.execute(f"SELECT * FROM prompts WHERE id IN ({placeholders}) ORDER BY id", selected_ids).fetchall()]
+            else:
                 records = [dict(row) for row in conn.execute("SELECT * FROM prompts ORDER BY id").fetchall()]
         for record in records:
             record.pop("visible_position", None)
@@ -444,16 +469,23 @@ class StudioDB:
         return self.save_prompts_batch(records, dedupe=dedupe)
 
     def retrieve(self, query: str, count: int = 3, min_score: float = 0) -> list[dict[str, Any]]:
+        result_count = max(0, min(int(count or 0), 10))
+        if not result_count:
+            return []
         vector = _tokens(query)
         matches = []
-        for row in self.list_prompts(limit=1000):
-            if row["score"] < min_score:
-                continue
+        with self.lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM prompts WHERE score>=? ORDER BY score DESC, updated_at DESC",
+                (float(min_score or 0),),
+            ).fetchall()
+        for raw_row in rows:
+            row = dict(raw_row)
             similarity = _cosine(vector, _tokens(f"{row['prompt']} {row['tags']}"))
             if similarity:
                 row["similarity"] = round(similarity, 4)
                 matches.append(row)
-        return sorted(matches, key=lambda item: (item["similarity"], item["score"]), reverse=True)[:max(0, min(count, 10))]
+        return sorted(matches, key=lambda item: (item["similarity"], item["score"]), reverse=True)[:result_count]
 
     def index_wildcards(self, source: str | Path) -> tuple[int, int]:
         root = Path(source).expanduser().resolve()

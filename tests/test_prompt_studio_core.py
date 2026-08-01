@@ -26,6 +26,19 @@ class PromptStudioCoreTests(unittest.TestCase):
             db.save_prompt("sports car in rain", score=10, tags="vehicle")
             self.assertEqual(db.retrieve("mage reading in library", 1, 7)[0]["prompt"], "red-haired mage in moonlit library")
 
+    def test_local_vector_rag_searches_records_beyond_ui_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            db.save_prompts_batch([
+                {"prompt": f"filler cache record {index}", "score": 9, "tags": "unrelated"}
+                for index in range(1000)
+            ])
+            db.save_prompt("moonlit archive needle", score=9, tags="celestial librarian")
+
+            matches = db.retrieve("moonlit celestial librarian", 1, 7)
+
+            self.assertEqual(matches[0]["prompt"], "moonlit archive needle")
+
     def test_batch_cache_dedupes_in_one_transaction(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
@@ -37,6 +50,33 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertEqual(stats["inserted"], 2)
             self.assertEqual(stats["duplicates"], 1)
             self.assertTrue(db.has_source_prompt("source one"))
+
+    def test_cache_listing_filters_keep_stable_full_library_positions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            first = db.save_prompt("low score", output_mode="Natural Language", base_model="Krea 2", score=2, tags="first")
+            second = db.save_prompt("high score", output_mode="NoobAI Tags", base_model="NoobAI", score=9, tags="second")
+            third = db.save_prompt("middle score", output_mode="NoobAI Tags", base_model="NoobAI", score=6, tags="third")
+
+            all_rows = db.list_prompts()
+            filtered = db.list_prompts("score", min_score=5, output_mode="NoobAI Tags", base_model="NoobAI")
+
+            self.assertEqual([row["id"] for row in all_rows], [first, second, third])
+            self.assertEqual([(row["id"], row["visible_position"]) for row in filtered], [(second, 2), (third, 3)])
+
+    def test_export_can_be_limited_to_selected_cache_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = StudioDB(root / "studio.db")
+            first = db.save_prompt("first prompt")
+            second = db.save_prompt("second prompt")
+
+            path = Path(db.export_records("json", root / "exports", ids=[second]))
+            exported = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(len(exported), 1)
+            self.assertEqual(exported[0]["id"], second)
+            self.assertNotEqual(exported[0]["id"], first)
 
     def test_visible_positions_backup_delete_and_undo(self):
         with tempfile.TemporaryDirectory() as directory:

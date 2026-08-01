@@ -53,6 +53,32 @@ OUTPUT_UI_CHOICES = [
 ]
 PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
 ACTION_UI_CHOICES = [("扩写", "Expand"), ("润色", "Polish")]
+WORKFLOW_DEFAULTS = {
+    "preset": "Danbooru Tags",
+    "system_override": "",
+    "base_model": "Auto / checkpoint default",
+    "safety": "SFW",
+    "nsfw_injection": "",
+    "user_instruction": "",
+    "structured_mode": "Plain Prompt",
+    "region_count": 2,
+    "remove_bad": True,
+    "remove_terms": "",
+    "shuffle": False,
+    "spaces": False,
+    "max_tags": 0,
+    "few_shot_count": 3,
+    "rag_min_score": 7,
+    "save_score": 0,
+    "cache_result": True,
+    "batch_skip_existing": True,
+    "batch_retries": 2,
+    "batch_score": 7,
+    "wd_endpoint": "http://127.0.0.1:7860",
+    "wd_model": "wd14-moat-v2",
+    "wd_threshold": 0.35,
+    "wildcard_path": str(DEFAULT_WILDCARDS),
+}
 _PROMPT_TARGETS: dict[str, Any] = {}
 _INLINE_SLOTS: set[str] = set()
 _INLINE_LOCK = threading.RLock()
@@ -64,13 +90,152 @@ def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
     return [[row.get("visible_position", ""), row["id"], row["score"], row["output_mode"], row["base_model"], row["prompt"], row["negative_prompt"], row["tags"]] for row in records]
 
 
-def _refresh_cache(query: str = ""):
-    records = DB.list_prompts(query)
-    return gr.update(value=_as_rows(records)), f"本地缓存共 {len(records)} 条记录"
+def _cache_choices(records: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    choices = []
+    for row in records:
+        preview = " ".join(str(row.get("prompt") or "").split())
+        if len(preview) > 72:
+            preview = preview[:69] + "..."
+        choices.append((f"#{row['visible_position']} · ID {row['id']} · {preview}", str(row["id"])))
+    return choices
+
+
+def _cache_records(query: str = "", min_score: float = 0, output_mode: str = "全部", base_model: str = "全部") -> list[dict[str, Any]]:
+    return DB.list_prompts(
+        str(query or ""),
+        min_score=float(min_score or 0),
+        output_mode="" if output_mode == "全部" else str(output_mode or ""),
+        base_model="" if base_model == "全部" else str(base_model or ""),
+    )
+
+
+def _refresh_cache(query: str = "", min_score: float = 0, output_mode: str = "全部", base_model: str = "全部"):
+    records = _cache_records(query, min_score, output_mode, base_model)
+    if records:
+        message = f"当前筛选显示 {len(records)} 条缓存。点击表格任意单元格可载入该行，或在选择框中多选。"
+    else:
+        message = "当前筛选没有记录。可清除筛选，或在批量缓存页导入和生成 Prompt。"
+    return gr.update(value=_as_rows(records)), gr.update(choices=_cache_choices(records), value=[]), message
+
+
+def _filtered_cache_updates(query: str = "", min_score: float = 0, output_mode: str = "全部", base_model: str = "全部", selected=None):
+    records = _cache_records(query, min_score, output_mode, base_model)
+    available_ids = {str(record["id"]) for record in records}
+    retained_selection = [value for value in _selected_values(selected) if value in available_ids]
+    return (
+        gr.update(value=_as_rows(records)),
+        gr.update(choices=_cache_choices(records), value=retained_selection),
+    )
+
+
+def _clear_cache_filters():
+    table, choices, status = _refresh_cache()
+    return "", 0, "全部", "全部", table, choices, status
 
 
 def _safe_error(error: Exception) -> str:
     return html.escape(str(error), quote=False)
+
+
+def _workflow_settings() -> dict[str, Any]:
+    stored = DB.get_setting("workflow_settings_v1", {}) or {}
+    values = {**WORKFLOW_DEFAULTS, **(stored if isinstance(stored, dict) else {})}
+    preset_values = {value for _, value in PRESET_UI_CHOICES}
+    model_values = {value for _, value in MODEL_UI_CHOICES}
+    output_values = {value for _, value in OUTPUT_UI_CHOICES}
+    if values["preset"] not in preset_values:
+        values["preset"] = WORKFLOW_DEFAULTS["preset"]
+    if values["base_model"] not in model_values:
+        values["base_model"] = WORKFLOW_DEFAULTS["base_model"]
+    if values["structured_mode"] not in output_values:
+        values["structured_mode"] = WORKFLOW_DEFAULTS["structured_mode"]
+    if values["safety"] not in {"SFW", "NSFW"}:
+        values["safety"] = WORKFLOW_DEFAULTS["safety"]
+    integer_limits = {
+        "region_count": (1, 8), "max_tags": (0, 200), "few_shot_count": (0, 8),
+        "batch_retries": (0, 3),
+    }
+    float_limits = {
+        "rag_min_score": (0, 10), "save_score": (0, 10), "batch_score": (0, 10),
+        "wd_threshold": (0, 1),
+    }
+    for key, (minimum, maximum) in integer_limits.items():
+        try:
+            values[key] = max(minimum, min(int(values[key]), maximum))
+        except (TypeError, ValueError):
+            values[key] = WORKFLOW_DEFAULTS[key]
+    for key, (minimum, maximum) in float_limits.items():
+        try:
+            values[key] = max(minimum, min(float(values[key]), maximum))
+        except (TypeError, ValueError):
+            values[key] = WORKFLOW_DEFAULTS[key]
+    for key in ["remove_bad", "shuffle", "spaces", "cache_result", "batch_skip_existing"]:
+        values[key] = bool(values[key])
+    for key in [
+        "system_override", "nsfw_injection", "user_instruction", "remove_terms",
+        "wd_endpoint", "wd_model", "wildcard_path",
+    ]:
+        values[key] = str(values.get(key) or "")
+    return values
+
+
+def _save_workflow_values(updates: dict[str, Any]) -> str:
+    values = _workflow_settings()
+    values.update(updates)
+    DB.set_setting("workflow_settings_v1", {"version": 1, **values})
+    return "工作参数已保存。下次打开完整页和内嵌面板时会自动填入。"
+
+
+def _save_workflow_settings(
+    preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+    structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
+    few_shot_count, rag_min_score, save_score, cache_result,
+    batch_skip_existing, batch_retries, batch_score,
+    wd_endpoint, wd_model, wd_threshold, wildcard_path,
+):
+    return _save_workflow_values({
+        "preset": preset, "system_override": system_override, "base_model": base_model,
+        "safety": safety, "nsfw_injection": nsfw_injection, "user_instruction": user_instruction,
+        "structured_mode": structured_mode, "region_count": int(region_count or 1),
+        "remove_bad": bool(remove_bad), "remove_terms": remove_terms, "shuffle": bool(shuffle),
+        "spaces": bool(spaces), "max_tags": int(max_tags or 0),
+        "few_shot_count": int(few_shot_count or 0), "rag_min_score": float(rag_min_score or 0),
+        "save_score": float(save_score or 0), "cache_result": bool(cache_result),
+        "batch_skip_existing": bool(batch_skip_existing), "batch_retries": int(batch_retries or 0),
+        "batch_score": float(batch_score or 0), "wd_endpoint": wd_endpoint, "wd_model": wd_model,
+        "wd_threshold": float(wd_threshold or 0), "wildcard_path": wildcard_path,
+    })
+
+
+def _workflow_component_values(values: dict[str, Any]) -> list[Any]:
+    return [values[key] for key in [
+        "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction",
+        "structured_mode", "region_count", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags",
+        "few_shot_count", "rag_min_score", "save_score", "cache_result",
+        "batch_skip_existing", "batch_retries", "batch_score",
+        "wd_endpoint", "wd_model", "wd_threshold", "wildcard_path",
+    ]]
+
+
+def _reset_workflow_settings():
+    DB.delete_setting("workflow_settings_v1")
+    return (*_workflow_component_values(WORKFLOW_DEFAULTS), "已恢复默认工作参数。下次打开界面也会使用默认值。")
+
+
+def _save_inline_workflow_settings(
+    preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+    structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
+    few_shot_count, rag_min_score, save_score, cache_result,
+):
+    return _save_workflow_values({
+        "preset": preset, "system_override": system_override, "base_model": base_model,
+        "safety": safety, "nsfw_injection": nsfw_injection, "user_instruction": user_instruction,
+        "structured_mode": structured_mode, "region_count": int(region_count or 1),
+        "remove_bad": bool(remove_bad), "remove_terms": remove_terms, "shuffle": bool(shuffle),
+        "spaces": bool(spaces), "max_tags": int(max_tags or 0),
+        "few_shot_count": int(few_shot_count or 0), "rag_min_score": float(rag_min_score or 0),
+        "save_score": float(save_score or 0), "cache_result": bool(cache_result),
+    })
 
 
 def _connection_store() -> dict[str, Any]:
@@ -137,36 +302,135 @@ def _load_record(record_id):
     except (TypeError, ValueError):
         record = None
     if not record:
-        return "", "", 0, "", "未找到该记录"
-    return record["prompt"], record["negative_prompt"], record["score"], record["tags"], f"已载入记录 #{record['id']}"
+        return "", "", "", "Danbooru Tags", "Auto / checkpoint default", 0, "", "未找到该记录"
+    return (
+        str(record["id"]), record["prompt"], record["negative_prompt"],
+        record["output_mode"] or "Danbooru Tags", record["base_model"] or "Auto / checkpoint default",
+        record["score"], record["tags"], f"已载入记录 #{record['id']}。保存会更新该记录。",
+    )
 
 
-def _save_record(record_id, prompt, negative, output_mode, base_model, score, tags):
+def _table_row_id(rows, row_index: int) -> str:
+    if hasattr(rows, "values"):
+        rows = rows.values.tolist()
+    if isinstance(rows, dict):
+        rows = rows.get("data", [])
+    if not isinstance(rows, list) or row_index < 0 or row_index >= len(rows):
+        return ""
+    row = rows[row_index]
+    if not isinstance(row, (list, tuple)) or len(row) < 2:
+        return ""
+    return str(row[1])
+
+
+def _selected_values(selected_ids) -> list[str]:
+    if isinstance(selected_ids, (list, tuple, set)):
+        values = selected_ids
+    elif selected_ids in {None, ""}:
+        values = []
+    else:
+        values = [selected_ids]
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _select_cache_row(rows, evt: gr.SelectData):
+    index = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    record_id = _table_row_id(rows, int(index))
+    loaded = _load_record(record_id)
+    return gr.update(value=[record_id] if record_id else []), *loaded
+
+
+def _load_selected_record(selected_ids):
+    values = _selected_values(selected_ids)
+    if len(values) != 1:
+        return "", "", "", "Danbooru Tags", "Auto / checkpoint default", 0, "", f"已选择 {len(values)} 条。编辑前请选择一条记录。"
+    return _load_record(values[0])
+
+
+def _save_record(record_id, prompt, negative, output_mode, base_model, score, tags, query="", min_score=0, filter_output_mode="全部", filter_base_model="全部"):
     try:
         parsed_id = int(record_id) if str(record_id).strip() else None
     except ValueError:
         parsed_id = None
     if not str(prompt).strip():
-        return "提示词不能为空", gr.update()
+        return "提示词不能为空", gr.update(), gr.update()
     saved_id = DB.save_prompt(str(prompt).strip(), str(negative or ""), output_mode, base_model, float(score or 0), str(tags or ""), parsed_id)
-    return f"已保存缓存记录 #{saved_id}", gr.update(value=_as_rows(DB.list_prompts()))
+    table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model, [str(saved_id)])
+    return f"已保存缓存记录 #{saved_id}", table, choices
 
 
-def _delete_records(ids):
-    pieces = [piece.strip() for piece in str(ids or "").split(",") if piece.strip()]
+def _save_record_as_new(prompt, negative, output_mode, base_model, score, tags, query="", min_score=0, filter_output_mode="全部", filter_base_model="全部"):
+    return _save_record("", prompt, negative, output_mode, base_model, score, tags, query, min_score, filter_output_mode, filter_base_model)
+
+
+def _delete_records(ids, query="", min_score=0, output_mode="全部", base_model="全部"):
+    if isinstance(ids, (list, tuple, set)):
+        pieces = [str(piece).strip() for piece in ids if str(piece).strip()]
+    else:
+        pieces = [piece.strip() for piece in str(ids or "").split(",") if piece.strip()]
     try:
         count = DB.delete_prompts([int(piece) for piece in pieces])
     except ValueError:
-        return "记录 ID 必须是用逗号分隔的整数", gr.update()
-    return f"已删除 {count} 条记录", gr.update(value=_as_rows(DB.list_prompts()))
+        return "选择中包含无效记录 ID", gr.update(), gr.update()
+    table, choices = _filtered_cache_updates(query, min_score, output_mode, base_model)
+    return f"已删除 {count} 条记录，并创建自动备份。可使用撤销按钮恢复。", table, choices
 
 
-def _bulk_cache(import_text, output_mode, base_model, default_score):
+def _preview_selected(ids):
+    values = [int(value) for value in _selected_values(ids) if value.isdigit()]
+    records = [DB.get_prompt(value) for value in values]
+    records = [record for record in records if record]
+    if not records:
+        return "尚未选择缓存记录。", []
+    lines = [f"将操作 {len(records)} 条记录："]
+    for record in records[:12]:
+        prompt = " ".join(str(record["prompt"] or "").split())
+        lines.append(f"ID {record['id']} · {prompt[:120]}{'...' if len(prompt) > 120 else ''}")
+    if len(records) > 12:
+        lines.append(f"另有 {len(records) - 12} 条未展开。")
+    return "\n".join(lines), [str(record["id"]) for record in records]
+
+
+def _delete_previewed_records(ids, previewed_ids, query="", min_score=0, output_mode="全部", base_model="全部"):
+    selected = sorted(_selected_values(ids))
+    previewed = sorted(_selected_values(previewed_ids))
+    if not selected or selected != previewed:
+        return "删除未执行：选择已变化，请先点击“预览所选”核对当前记录。", gr.update(), gr.update()
+    return _delete_records(selected, query, min_score, output_mode, base_model)
+
+
+def _export_selected(ids, file_format):
+    values = [int(value) for value in _selected_values(ids) if value.isdigit()]
+    existing = [value for value in values if DB.get_prompt(value)]
+    if not existing:
+        return "请先选择要导出的缓存记录", None
+    try:
+        path = DB.export_records(str(file_format or "JSON").lower(), ids=existing)
+        missing = len(values) - len(existing)
+        suffix = f"；忽略已不存在的 {missing} 条选择" if missing else ""
+        return f"已导出选中的 {len(existing)} 条记录{suffix}：{path}", path
+    except Exception as error:
+        return f"导出失败：{_safe_error(error)}", None
+
+
+def _bulk_cache(import_text, output_mode, base_model, default_score, query="", min_score=0, filter_output_mode="全部", filter_base_model="全部"):
     """Import one prompt per line, optionally prefixed by `score<TAB>`."""
+    records, _summary = _parse_bulk_cache(import_text, output_mode, base_model, default_score)
+    stats = DB.save_prompts_batch(records, dedupe=True)
+    table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
+    return (
+        f"批量导入完成：新增 {stats['inserted']} 条，跳过重复 {stats['duplicates']} 条",
+        table, choices,
+    )
+
+
+def _parse_bulk_cache(import_text, output_mode, base_model, default_score):
     records = []
+    ignored = 0
     for line in str(import_text or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
+            ignored += 1
             continue
         score, prompt = float(default_score or 0), line
         if "\t" in line:
@@ -177,30 +441,46 @@ def _bulk_cache(import_text, output_mode, base_model, default_score):
                 prompt = line
         if prompt.strip():
             records.append({"prompt": prompt.strip(), "output_mode": output_mode, "base_model": base_model, "score": score})
-    stats = DB.save_prompts_batch(records, dedupe=True)
-    return f"批量导入完成：新增 {stats['inserted']} 条，跳过重复 {stats['duplicates']} 条", gr.update(value=_as_rows(DB.list_prompts()))
+    return records, {"records": len(records), "ignored": ignored}
+
+
+def _preview_bulk_cache(import_text, output_mode, base_model, default_score):
+    records, summary = _parse_bulk_cache(import_text, output_mode, base_model, default_score)
+    rows = [[index, item["score"], item["prompt"]] for index, item in enumerate(records[:200], start=1)]
+    message = f"解析到 {summary['records']} 条可导入 Prompt，忽略 {summary['ignored']} 个空行或注释行。"
+    if len(records) > 200:
+        message += " 预览仅显示前 200 条。"
+    return gr.update(value=rows), message
 
 
 def _preview_positions(position_spec):
     try:
         records = DB.get_by_positions(position_spec)
-        return f"范围预览命中 {len(records)} 条记录", gr.update(value=_as_rows(records))
+        return (
+            f"范围预览命中 {len(records)} 条记录。删除前请核对下表。",
+            gr.update(value=_as_rows(records)), gr.update(choices=_cache_choices(records), value=[]),
+        )
     except ValueError as error:
-        return f"序号范围格式错误：{error}", gr.update()
+        return f"序号范围格式错误：{error}", gr.update(), gr.update()
 
 
-def _delete_positions(position_spec):
+def _delete_positions(position_spec, query="", min_score=0, output_mode="全部", base_model="全部"):
     try:
         count = DB.delete_by_positions(position_spec)
-        return f"已删除 {count} 条记录，并创建自动备份；可使用撤销按钮恢复。", gr.update(value=_as_rows(DB.list_prompts()))
+        table, choices = _filtered_cache_updates(query, min_score, output_mode, base_model)
+        return (
+            f"已删除 {count} 条记录，并创建自动备份；可使用撤销按钮恢复。",
+            table, choices,
+        )
     except ValueError as error:
-        return f"序号范围格式错误：{error}", gr.update()
+        return f"序号范围格式错误：{error}", gr.update(), gr.update()
 
 
-def _undo_last_delete():
+def _undo_last_delete(query="", min_score=0, output_mode="全部", base_model="全部"):
     count = DB.undo_last_delete()
     message = f"已恢复上次删除的 {count} 条记录" if count else "没有可撤销的删除操作"
-    return message, gr.update(value=_as_rows(DB.list_prompts()))
+    table, choices = _filtered_cache_updates(query, min_score, output_mode, base_model)
+    return message, table, choices
 
 
 def _export_cache(file_format):
@@ -211,15 +491,19 @@ def _export_cache(file_format):
         return f"导出失败：{_safe_error(error)}", None
 
 
-def _import_cache(file_value, dedupe):
+def _import_cache(file_value, dedupe, query="", min_score=0, output_mode="全部", base_model="全部"):
     path = getattr(file_value, "name", file_value)
     if not path:
-        return "请选择 JSON 或 CSV 文件", gr.update()
+        return "请选择 JSON 或 CSV 文件", gr.update(), gr.update()
     try:
         stats = DB.import_records(path, bool(dedupe))
-        return f"导入完成：新增 {stats['inserted']} 条，跳过重复 {stats['duplicates']} 条", gr.update(value=_as_rows(DB.list_prompts()))
+        table, choices = _filtered_cache_updates(query, min_score, output_mode, base_model)
+        return (
+            f"导入完成：新增 {stats['inserted']} 条，跳过重复 {stats['duplicates']} 条",
+            table, choices,
+        )
     except Exception as error:
-        return f"导入失败：{_safe_error(error)}", gr.update()
+        return f"导入失败：{_safe_error(error)}", gr.update(), gr.update()
 
 
 def _cancel_batch_generation():
@@ -227,29 +511,57 @@ def _cancel_batch_generation():
     return "已请求取消。当前 HTTP 请求返回后会停止，并保存已完成结果。"
 
 
+def _parse_batch_sources(source_text: str) -> tuple[list[str], dict[str, int]]:
+    sources, seen = [], set()
+    ignored, duplicates = 0, 0
+    for line in str(source_text or "").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            ignored += 1
+            continue
+        if value in seen:
+            duplicates += 1
+            continue
+        seen.add(value)
+        sources.append(value)
+        if len(sources) >= 10000:
+            break
+    return sources, {"ignored": ignored, "duplicates": duplicates}
+
+
+def _preview_batch_sources(source_text, skip_existing, preset, base_model):
+    sources, stats = _parse_batch_sources(source_text)
+    cached = sum(1 for source in sources if skip_existing and DB.has_source_prompt(source, preset, base_model))
+    rows = []
+    for index, source in enumerate(sources[:200], start=1):
+        state = "将跳过：已有缓存" if skip_existing and DB.has_source_prompt(source, preset, base_model) else "等待生成"
+        rows.append([index, source, state])
+    message = (
+        f"队列共 {len(sources)} 条；重复输入 {stats['duplicates']} 条；空行或注释 {stats['ignored']} 条；"
+        f"按当前规则将跳过已有缓存 {cached} 条。"
+    )
+    if len(sources) > 200:
+        message += " 预览仅显示前 200 条。"
+    return gr.update(value=rows), message
+
+
 def _batch_generate(
     source_text, skip_existing, retries, batch_score,
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
+    query="", min_score=0, filter_output_mode="全部", filter_base_model="全部",
 ):
-    sources = []
-    seen = set()
-    for line in str(source_text or "").splitlines():
-        value = line.strip()
-        if value and not value.startswith("#") and value not in seen:
-            seen.add(value)
-            sources.append(value)
-        if len(sources) >= 10000:
-            break
+    sources, _parse_stats = _parse_batch_sources(source_text)
     if not sources:
-        yield "请输入批量请求，每行一条。", gr.update()
+        yield "请输入批量请求，每行一条。", gr.update(), gr.update(), gr.update(value=[])
         return
     if not _BATCH_LOCK.acquire(blocking=False):
-        yield "已有批量任务正在运行。", gr.update()
+        yield "已有批量任务正在运行。", gr.update(), gr.update(), gr.update()
         return
     _BATCH_CANCEL.clear()
     pending, inserted, duplicates, skipped, failed = [], 0, 0, 0, 0
+    failures = []
 
     def flush_pending():
         nonlocal inserted, duplicates
@@ -264,7 +576,11 @@ def _batch_generate(
         for index, source in enumerate(sources, start=1):
             if _BATCH_CANCEL.is_set():
                 flush_pending()
-                yield f"任务已取消：处理 {index - 1}/{len(sources)}，新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}", gr.update(value=_as_rows(DB.list_prompts()))
+                table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
+                yield (
+                    f"任务已取消：处理 {index - 1}/{len(sources)}，新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
+                    table, choices, gr.update(value=failures),
+                )
                 return
             if skip_existing and DB.has_source_prompt(source, preset, base_model):
                 skipped += 1
@@ -283,10 +599,19 @@ def _batch_generate(
                 pending.append({"prompt": generated, "output_mode": preset, "base_model": base_model, "score": batch_score, "tags": source})
             else:
                 failed += 1
+                failures.append([index, source, last_status or "未返回结果"])
             if len(pending) >= 10 or index == len(sources):
                 flush_pending()
-                yield f"进度 {index}/{len(sources)}：新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}" + (f"；最近状态：{last_status}" if last_status and not generated else ""), gr.update(value=_as_rows(DB.list_prompts()))
-        yield f"批量任务完成：新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}", gr.update(value=_as_rows(DB.list_prompts()))
+                table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
+                yield (
+                    f"进度 {index}/{len(sources)}：新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}" + (f"；最近状态：{last_status}" if last_status and not generated else ""),
+                    table, choices, gr.update(value=failures),
+                )
+        table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
+        yield (
+            f"批量任务完成：新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
+            table, choices, gr.update(value=failures),
+        )
     finally:
         try:
             flush_pending()
@@ -438,21 +763,22 @@ def inject_inline_before_negative(component, **kwargs):
 
 def _create_inline_panel(slot, prompt_target):
     settings = _connection_settings()
+    workflow = _workflow_settings()
     with gr.Accordion("LLM 提示词工作室", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
         gr.Markdown("生成结果会直接写入上方正向提示词。系统策略和模型规则优先于用户要求；RAG 与静态词库仅作为参考数据。")
         with gr.Row():
             with gr.Column(scale=3):
                 request = gr.Textbox(label="创作要求", lines=3, placeholder="描述希望生成的画面")
                 source_tags = gr.Textbox(label="源 Danbooru 标签（可选，优先使用）", lines=2)
-                preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value="Danbooru Tags")
-                system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=3, placeholder="留空则使用所选预设")
-                user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, placeholder="例如：最多 30 个标签，不使用权重")
+                preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
+                system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=3, value=workflow["system_override"], placeholder="留空则使用所选预设")
+                user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"], placeholder="例如：最多 30 个标签，不使用权重")
             with gr.Column(scale=2):
-                base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value="Auto / checkpoint default")
-                safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value="SFW")
-                nsfw_injection = gr.Textbox(label="NSFW 策略注入", lines=2, placeholder="仅在 NSFW 模式下生效")
-                structured_mode = gr.Radio(label="输出格式", choices=OUTPUT_UI_CHOICES, value="Plain Prompt")
-                region_count = gr.Slider(label="区域数量", minimum=1, maximum=8, value=2, step=1)
+                base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
+                safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
+                nsfw_injection = gr.Textbox(label="NSFW 策略注入", lines=2, value=workflow["nsfw_injection"], placeholder="仅在 NSFW 模式下生效")
+                structured_mode = gr.Radio(label="输出格式", choices=OUTPUT_UI_CHOICES, value=workflow["structured_mode"])
+                region_count = gr.Slider(label="区域数量", minimum=1, maximum=8, value=workflow["region_count"], step=1)
         with gr.Accordion("LLM 连接设置", open=False):
             with gr.Row():
                 provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=settings["provider"])
@@ -471,26 +797,33 @@ def _create_inline_panel(slot, prompt_target):
             connection_status = gr.Markdown(_credential_status(settings["provider"], settings["endpoint"]))
         with gr.Accordion("标签处理与 RAG", open=False):
             with gr.Row():
-                remove_bad = gr.Checkbox(label="移除不良标签", value=True)
-                shuffle = gr.Checkbox(label="随机打乱标签", value=False)
-                spaces = gr.Checkbox(label='将“_”转换为空格', value=False)
-                max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=0, step=1)
-            remove_terms = gr.Textbox(label="额外排除标签 / 通配规则", placeholder="watermark, *_text")
+                remove_bad = gr.Checkbox(label="移除不良标签", value=workflow["remove_bad"])
+                shuffle = gr.Checkbox(label="随机打乱标签", value=workflow["shuffle"])
+                spaces = gr.Checkbox(label='将“_”转换为空格', value=workflow["spaces"])
+                max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=workflow["max_tags"], step=1)
+            remove_terms = gr.Textbox(label="额外排除标签 / 通配规则", value=workflow["remove_terms"], placeholder="watermark, *_text")
             with gr.Row():
-                few_shot_count = gr.Slider(label="Few-Shot 示例数", minimum=0, maximum=8, value=3, step=1)
-                rag_min_score = gr.Slider(label="RAG 最低评分", minimum=0, maximum=10, value=7, step=0.5)
-                save_score = gr.Slider(label="生成结果保存评分", minimum=0, maximum=10, value=0, step=0.5)
-                cache_result = gr.Checkbox(label="缓存生成结果", value=True)
-        generate = gr.Button("生成并写入正向提示词", variant="primary")
+                few_shot_count = gr.Slider(label="Few-Shot 示例数", minimum=0, maximum=8, value=workflow["few_shot_count"], step=1)
+                rag_min_score = gr.Slider(label="RAG 最低评分", minimum=0, maximum=10, value=workflow["rag_min_score"], step=0.5)
+                save_score = gr.Slider(label="生成结果保存评分", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
+                cache_result = gr.Checkbox(label="缓存生成结果", value=workflow["cache_result"])
+        with gr.Row():
+            generate = gr.Button("生成并写入正向提示词", variant="primary")
+            save_workflow = gr.Button("保存提示词参数")
         output = gr.Textbox(label="生成的提示词", lines=5)
         system_preview = gr.Textbox(label="最终 System Prompt 与策略", lines=8)
-        status = gr.Markdown()
+        status = gr.Markdown("已自动填入上次保存的提示词参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认提示词参数。")
         inputs = [request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result]
         generate.click(_inline_generate, inputs=inputs, outputs=[output, system_preview, status, prompt_target])
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, connection_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=connection_status)
         save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[connection_status, endpoint])
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=connection_status)
+        save_workflow.click(
+            _save_inline_workflow_settings,
+            inputs=[preset, system_override, base_model, safety, nsfw_injection, user_instruction, structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags, few_shot_count, rag_min_score, save_score, cache_result],
+            outputs=status,
+        )
 
 
 def _wd14_interrogate(image, endpoint, model, threshold):
@@ -595,6 +928,8 @@ def on_app_started(_, app):
 
 def on_ui_tabs():
     llm_settings = _connection_settings()
+    workflow = _workflow_settings()
+    initial_records = DB.list_prompts()
     with gr.Blocks(analytics_enabled=False, elem_id="llm_prompt_studio") as ui:
         gr.Markdown("## LLM 提示词工作室\n本地静态词库、RAG Few-Shot、提示词缓存与 Forge 扩展集成。")
         with gr.Tabs():
@@ -603,30 +938,117 @@ def on_ui_tabs():
                     with gr.Column(scale=3):
                         request = gr.Textbox(label="创作要求", lines=4, placeholder="描述希望生成的画面，或粘贴已有提示词")
                         source_tags = gr.Textbox(label="源 Danbooru 标签（可选，优先使用）", lines=3)
-                        preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value="Danbooru Tags")
-                        system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=6, placeholder="留空则使用所选预设。安全策略、用户要求、RAG 和静态词库会自动追加。")
-                        base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value="Auto / checkpoint default")
-                        safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value="SFW")
-                        nsfw_injection = gr.Textbox(label="NSFW System Prompt 注入", lines=2, placeholder="仅在 NSFW 模式下生效")
-                        user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, placeholder="例如：只返回最多 35 个标签，不使用权重")
+                        preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
+                        base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
+                        safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
+                        with gr.Accordion("高级 Prompt 约束", open=False):
+                            system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=6, value=workflow["system_override"], placeholder="留空则使用所选预设。安全策略、用户要求、RAG 和静态词库会自动追加。")
+                            nsfw_injection = gr.Textbox(label="NSFW System Prompt 注入", lines=2, value=workflow["nsfw_injection"], placeholder="仅在 NSFW 模式下生效")
+                            user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"], placeholder="例如：只返回最多 35 个标签，不使用权重")
                     with gr.Column(scale=2):
-                        structured_mode = gr.Radio(label="输出格式", choices=OUTPUT_UI_CHOICES, value="Plain Prompt")
-                        region_count = gr.Slider(label="区域数量", minimum=1, maximum=8, value=2, step=1)
+                        structured_mode = gr.Radio(label="输出格式", choices=OUTPUT_UI_CHOICES, value=workflow["structured_mode"])
+                        region_count = gr.Slider(label="区域数量", minimum=1, maximum=8, value=workflow["region_count"], step=1)
                         with gr.Accordion("标签后处理", open=False):
-                            remove_bad = gr.Checkbox(label="移除不良标签", value=True)
-                            remove_terms = gr.Textbox(label="额外排除标签 / 通配规则", placeholder="watermark, *_text")
-                            shuffle = gr.Checkbox(label="随机打乱标签", value=False)
-                            spaces = gr.Checkbox(label='将“_”转换为空格', value=False)
-                            max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=0, step=1)
+                            remove_bad = gr.Checkbox(label="移除不良标签", value=workflow["remove_bad"])
+                            remove_terms = gr.Textbox(label="额外排除标签 / 通配规则", value=workflow["remove_terms"], placeholder="watermark, *_text")
+                            shuffle = gr.Checkbox(label="随机打乱标签", value=workflow["shuffle"])
+                            spaces = gr.Checkbox(label='将“_”转换为空格', value=workflow["spaces"])
+                            max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=workflow["max_tags"], step=1)
                         with gr.Accordion("RAG 与缓存", open=False):
-                            few_shot_count = gr.Slider(label="Few-Shot 示例数", minimum=0, maximum=8, value=3, step=1)
-                            rag_min_score = gr.Slider(label="RAG 最低缓存评分", minimum=0, maximum=10, value=7, step=0.5)
-                            save_score = gr.Slider(label="保存生成结果的评分", minimum=0, maximum=10, value=0, step=0.5)
-                            cache_result = gr.Checkbox(label="在本地缓存本次结果", value=True)
-                generate = gr.Button("生成提示词", variant="primary")
+                            few_shot_count = gr.Slider(label="Few-Shot 示例数", minimum=0, maximum=8, value=workflow["few_shot_count"], step=1)
+                            rag_min_score = gr.Slider(label="RAG 最低缓存评分", minimum=0, maximum=10, value=workflow["rag_min_score"], step=0.5)
+                            save_score = gr.Slider(label="保存生成结果的评分", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
+                            cache_result = gr.Checkbox(label="在本地缓存本次结果", value=workflow["cache_result"])
+                with gr.Row():
+                    generate = gr.Button("生成提示词", variant="primary")
+                    save_workflow = gr.Button("保存全部工作参数")
+                    reset_workflow = gr.Button("恢复默认工作参数")
                 output = gr.Textbox(label="生成的提示词", lines=8)
                 system_preview = gr.Textbox(label="最终 System Prompt", lines=12)
                 status = gr.Markdown()
+                workflow_status = gr.Markdown("已自动载入上次保存的工作参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认工作参数；保存后下次会自动填入。")
+
+            with gr.Tab("批量缓存"):
+                with gr.Tabs():
+                    with gr.Tab("LLM 批量生成"):
+                        batch_sources = gr.Textbox(label="生成队列：每行一条创作要求或源标签", lines=12, placeholder="红发魔法师在月光图书馆阅读\n蓝发少女站在雨中的车站")
+                        with gr.Row():
+                            batch_skip_existing = gr.Checkbox(label="跳过相同输入的已有缓存", value=workflow["batch_skip_existing"])
+                            batch_retries = gr.Slider(label="失败重试次数", minimum=0, maximum=3, value=workflow["batch_retries"], step=1)
+                            batch_score = gr.Slider(label="批量结果评分", minimum=0, maximum=10, value=workflow["batch_score"], step=0.5)
+                        with gr.Row():
+                            batch_preview_button = gr.Button("预览生成队列")
+                            batch_generate = gr.Button("开始生成并缓存", variant="primary")
+                            batch_cancel = gr.Button("取消批量任务", variant="stop")
+                            save_batch_workflow = gr.Button("保存批量与工作参数")
+                        batch_preview_status = gr.Markdown()
+                        batch_queue = gr.Dataframe(headers=["序号", "输入", "状态"], datatype=["number", "str", "str"], interactive=False, wrap=True, label="队列预览")
+                        batch_status = gr.Markdown("尚未开始批量任务。取消会在当前 HTTP 请求返回后生效，已完成结果会保留。")
+                        batch_failures = gr.Dataframe(headers=["序号", "输入", "错误"], datatype=["number", "str", "str"], interactive=False, wrap=True, label="失败清单")
+                    with gr.Tab("直接批量导入"):
+                        bulk_import = gr.Textbox(label="每行一条 Prompt，可使用“评分<TAB>Prompt”格式", lines=12)
+                        with gr.Row():
+                            bulk_output_mode = gr.Dropdown(label="缓存格式", choices=PRESET_UI_CHOICES, value=workflow["preset"])
+                            bulk_base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
+                            bulk_default_score = gr.Slider(label="默认评分", minimum=0, maximum=10, value=workflow["batch_score"], step=0.5)
+                        with gr.Row():
+                            bulk_preview_button = gr.Button("预览导入队列")
+                            bulk_import_button = gr.Button("导入本地缓存", variant="primary")
+                        bulk_import_status = gr.Markdown()
+                        bulk_preview = gr.Dataframe(headers=["序号", "评分", "Prompt"], datatype=["number", "number", "str"], interactive=False, wrap=True, label="导入预览")
+
+            with gr.Tab("缓存库"):
+                with gr.Row():
+                    cache_query = gr.Textbox(label="搜索 Prompt、负面词或源标签", scale=4)
+                    cache_min_score = gr.Slider(label="最低评分", minimum=0, maximum=10, value=0, step=0.5, scale=2)
+                    cache_output_filter = gr.Dropdown(label="格式", choices=["全部"] + PRESET_UI_CHOICES, value="全部", scale=2)
+                    cache_model_filter = gr.Dropdown(label="目标模型", choices=["全部"] + MODEL_UI_CHOICES, value="全部", scale=2)
+                with gr.Row():
+                    refresh = gr.Button("应用筛选", variant="primary")
+                    clear_filters = gr.Button("清除筛选")
+                    undo_delete = gr.Button("撤销上次删除")
+                cache_status = gr.Markdown(f"本地缓存共 {len(initial_records)} 条记录。点击表格任意单元格可载入该行。")
+                selected_records = gr.Dropdown(label="选择缓存记录（支持多选）", choices=_cache_choices(initial_records), value=[], multiselect=True)
+                delete_preview_state = gr.State([])
+                with gr.Row():
+                    load_selected = gr.Button("载入所选单条")
+                    preview_selected = gr.Button("预览所选")
+                    delete_selected = gr.Button("删除所选", variant="stop")
+                selection_preview = gr.Textbox(label="选择 / 删除预览", lines=6, interactive=False)
+                table = gr.Dataframe(
+                    value=_as_rows(initial_records), label="已缓存 Prompt",
+                    headers=["全库序号", "内部 ID", "评分", "格式", "目标模型", "正向提示词", "负面提示词", "源标签"],
+                    datatype=["number", "number", "number", "str", "str", "str", "str", "str"],
+                    interactive=False, wrap=True,
+                )
+                with gr.Accordion("记录编辑器", open=True):
+                    with gr.Row():
+                        record_id = gr.Textbox(label="当前内部 ID", interactive=False)
+                        record_output_mode = gr.Dropdown(label="格式", choices=PRESET_UI_CHOICES, value=workflow["preset"])
+                        record_base_model = gr.Dropdown(label="目标模型", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
+                        record_score = gr.Slider(label="评分", minimum=0, maximum=10, value=0, step=0.5)
+                    record_tags = gr.Textbox(label="源标签")
+                    record_prompt = gr.Textbox(label="正向提示词", lines=6)
+                    record_negative = gr.Textbox(label="负面提示词", lines=3)
+                    with gr.Row():
+                        save = gr.Button("保存当前记录", variant="primary")
+                        save_as_new = gr.Button("另存为新记录")
+                with gr.Accordion("按全库序号批量管理", open=False):
+                    position_spec = gr.Textbox(label="全库序号或范围", placeholder="1-100,205,300-320")
+                    with gr.Row():
+                        preview_positions = gr.Button("预览这些序号")
+                        delete_positions = gr.Button("删除这些序号", variant="stop")
+                with gr.Accordion("JSON / CSV 导入导出", open=False):
+                    with gr.Row():
+                        import_file = gr.File(label="导入文件", file_types=[".json", ".csv"], type="filepath")
+                        import_dedupe = gr.Checkbox(label="导入时跳过重复记录", value=True)
+                        import_button = gr.Button("导入文件")
+                    with gr.Row():
+                        export_format = gr.Radio(label="导出格式", choices=["JSON", "CSV"], value="JSON")
+                        export_selected = gr.Button("导出所选")
+                        export_button = gr.Button("导出全部缓存")
+                    export_file = gr.File(label="导出文件", interactive=False)
+
             with gr.Tab("LLM 连接"):
                 provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=llm_settings["provider"])
                 endpoint = gr.Textbox(label="接口地址", value=llm_settings["endpoint"])
@@ -642,66 +1064,34 @@ def on_ui_tabs():
                     clear_credentials = gr.Button("清除已保存的 API Key")
                 test_status = gr.Markdown(_credential_status(llm_settings["provider"], llm_settings["endpoint"]))
             with gr.Tab("静态词库"):
-                wildcard_path = gr.Textbox(label="静态词库目录", value=str(DEFAULT_WILDCARDS))
+                wildcard_path = gr.Textbox(label="静态词库目录", value=workflow["wildcard_path"])
                 index = gr.Button("建立 / 刷新本地索引")
                 wildcard_status = gr.Markdown()
                 wildcard_query = gr.Textbox(label="搜索已索引词条")
                 wildcard_results = gr.Dropdown(label="匹配结果", choices=[], multiselect=True)
             with gr.Tab("WD14 + LLM"):
                 image = gr.Image(label="待反推图片", type="numpy")
-                wd_endpoint = gr.Textbox(label="Forge WD14 API 地址", value="http://127.0.0.1:7860")
-                wd_model = gr.Textbox(label="WD14 模型", value="wd14-moat-v2")
-                wd_threshold = gr.Slider(label="WD14 阈值", minimum=0, maximum=1, value=0.35, step=0.01)
+                wd_endpoint = gr.Textbox(label="Forge WD14 API 地址", value=workflow["wd_endpoint"])
+                wd_model = gr.Textbox(label="WD14 模型", value=workflow["wd_model"])
+                wd_threshold = gr.Slider(label="WD14 阈值", minimum=0, maximum=1, value=workflow["wd_threshold"], step=0.01)
                 interrogate = gr.Button("调用已安装的 WD14 Tagger")
                 wd_tags = gr.Textbox(label="WD14 标签", lines=5)
                 wd_status = gr.Markdown()
                 action = gr.Radio(label="LLM 操作", choices=ACTION_UI_CHOICES, value="Expand")
                 transform = gr.Button("使用 LLM 扩写 / 润色")
                 transform_output = gr.Textbox(label="LLM 处理结果", lines=8)
-            with gr.Tab("缓存管理"):
-                cache_query = gr.Textbox(label="搜索本地缓存")
-                refresh = gr.Button("刷新缓存")
-                cache_status = gr.Markdown()
-                table = gr.Dataframe(label="已缓存提示词", headers=["序号", "内部 ID", "评分", "格式", "目标模型", "正向提示词", "负面提示词", "源标签"], datatype=["number", "number", "number", "str", "str", "str", "str", "str"], interactive=False)
-                with gr.Accordion("按连续序号管理", open=False):
-                    position_spec = gr.Textbox(label="序号或范围", placeholder="1-100,205,300-320")
-                    with gr.Row():
-                        preview_positions = gr.Button("预览这些序号")
-                        delete_positions = gr.Button("删除这些序号")
-                        undo_delete = gr.Button("撤销上次删除")
-                with gr.Row():
-                    record_id = gr.Textbox(label="记录 ID")
-                    record_score = gr.Slider(label="评分", minimum=0, maximum=10, value=0, step=0.5)
-                    record_tags = gr.Textbox(label="源标签")
-                record_prompt = gr.Textbox(label="正向提示词", lines=4)
-                record_negative = gr.Textbox(label="负面提示词", lines=2)
-                with gr.Row():
-                    load = gr.Button("载入记录")
-                    save = gr.Button("保存记录", variant="primary")
-                    delete_ids = gr.Textbox(label="要删除的 ID", placeholder="12, 17, 20")
-                    delete = gr.Button("删除指定记录")
-                with gr.Accordion("批量导入缓存", open=False):
-                    bulk_import = gr.Textbox(label="每行一条提示词，可使用“评分<TAB>提示词”格式", lines=8)
-                    bulk_import_button = gr.Button("批量导入本地缓存")
-                with gr.Accordion("批量 LLM 生成并缓存", open=False):
-                    batch_sources = gr.Textbox(label="每行一条创作要求或源标签", lines=10, placeholder="红发魔法师在月光图书馆阅读\n蓝发少女站在雨中的车站")
-                    with gr.Row():
-                        batch_skip_existing = gr.Checkbox(label="跳过已经缓存的相同输入", value=True)
-                        batch_retries = gr.Slider(label="失败重试次数", minimum=0, maximum=3, value=2, step=1)
-                        batch_score = gr.Slider(label="批量结果评分", minimum=0, maximum=10, value=7, step=0.5)
-                    with gr.Row():
-                        batch_generate = gr.Button("开始批量生成并缓存", variant="primary")
-                        batch_cancel = gr.Button("取消批量任务")
-                with gr.Accordion("JSON / CSV 导入导出", open=False):
-                    with gr.Row():
-                        import_file = gr.File(label="导入文件", file_types=[".json", ".csv"], type="filepath")
-                        import_dedupe = gr.Checkbox(label="导入时跳过重复记录", value=True)
-                    import_button = gr.Button("导入文件")
-                    with gr.Row():
-                        export_format = gr.Radio(label="导出格式", choices=["JSON", "CSV"], value="JSON")
-                        export_button = gr.Button("导出全部缓存")
-                    export_file = gr.File(label="导出文件", interactive=False)
+
+        workflow_inputs = [
+            preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+            structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
+            few_shot_count, rag_min_score, save_score, cache_result,
+            batch_skip_existing, batch_retries, batch_score,
+            wd_endpoint, wd_model, wd_threshold, wildcard_path,
+        ]
         generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
+        save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
+        save_batch_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=batch_status)
+        reset_workflow.click(_reset_workflow_settings, outputs=[*workflow_inputs, workflow_status])
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
         save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint])
@@ -710,21 +1100,31 @@ def on_ui_tabs():
         wildcard_query.change(_search_wildcards, inputs=wildcard_query, outputs=wildcard_results)
         interrogate.click(_wd14_interrogate, inputs=[image, wd_endpoint, wd_model, wd_threshold], outputs=[wd_tags, wd_status])
         transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[transform_output, wd_status])
-        refresh.click(_refresh_cache, inputs=cache_query, outputs=[table, cache_status])
-        cache_query.submit(_refresh_cache, inputs=cache_query, outputs=[table, cache_status])
-        load.click(_load_record, inputs=record_id, outputs=[record_prompt, record_negative, record_score, record_tags, cache_status])
-        save.click(_save_record, inputs=[record_id, record_prompt, record_negative, preset, base_model, record_score, record_tags], outputs=[cache_status, table])
-        delete.click(_delete_records, inputs=delete_ids, outputs=[cache_status, table])
-        bulk_import_button.click(_bulk_cache, inputs=[bulk_import, preset, base_model, record_score], outputs=[cache_status, table])
+        cache_filter_inputs = [cache_query, cache_min_score, cache_output_filter, cache_model_filter]
+        refresh.click(_refresh_cache, inputs=cache_filter_inputs, outputs=[table, selected_records, cache_status])
+        cache_query.submit(_refresh_cache, inputs=cache_filter_inputs, outputs=[table, selected_records, cache_status])
+        clear_filters.click(_clear_cache_filters, outputs=[cache_query, cache_min_score, cache_output_filter, cache_model_filter, table, selected_records, cache_status])
+        record_outputs = [record_id, record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, cache_status]
+        table.select(_select_cache_row, inputs=table, outputs=[selected_records, *record_outputs])
+        selected_records.input(_load_selected_record, inputs=selected_records, outputs=record_outputs)
+        load_selected.click(_load_selected_record, inputs=selected_records, outputs=record_outputs)
+        preview_selected.click(_preview_selected, inputs=selected_records, outputs=[selection_preview, delete_preview_state])
+        delete_selected.click(_delete_previewed_records, inputs=[selected_records, delete_preview_state, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
+        save.click(_save_record, inputs=[record_id, record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
+        save_as_new.click(_save_record_as_new, inputs=[record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
+        bulk_preview_button.click(_preview_bulk_cache, inputs=[bulk_import, bulk_output_mode, bulk_base_model, bulk_default_score], outputs=[bulk_preview, bulk_import_status])
+        bulk_import_button.click(_bulk_cache, inputs=[bulk_import, bulk_output_mode, bulk_base_model, bulk_default_score, *cache_filter_inputs], outputs=[bulk_import_status, table, selected_records])
+        batch_preview_button.click(_preview_batch_sources, inputs=[batch_sources, batch_skip_existing, preset, base_model], outputs=[batch_queue, batch_preview_status])
         batch_generate.click(
             _batch_generate,
-            inputs=[batch_sources, batch_skip_existing, batch_retries, batch_score, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count],
-            outputs=[cache_status, table],
+            inputs=[batch_sources, batch_skip_existing, batch_retries, batch_score, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs],
+            outputs=[batch_status, table, selected_records, batch_failures],
         )
-        batch_cancel.click(_cancel_batch_generation, outputs=cache_status)
-        preview_positions.click(_preview_positions, inputs=position_spec, outputs=[cache_status, table])
-        delete_positions.click(_delete_positions, inputs=position_spec, outputs=[cache_status, table])
-        undo_delete.click(_undo_last_delete, outputs=[cache_status, table])
-        import_button.click(_import_cache, inputs=[import_file, import_dedupe], outputs=[cache_status, table])
+        batch_cancel.click(_cancel_batch_generation, outputs=batch_status)
+        preview_positions.click(_preview_positions, inputs=position_spec, outputs=[cache_status, table, selected_records])
+        delete_positions.click(_delete_positions, inputs=[position_spec, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
+        undo_delete.click(_undo_last_delete, inputs=cache_filter_inputs, outputs=[cache_status, table, selected_records])
+        import_button.click(_import_cache, inputs=[import_file, import_dedupe, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
+        export_selected.click(_export_selected, inputs=[selected_records, export_format], outputs=[cache_status, export_file])
         export_button.click(_export_cache, inputs=export_format, outputs=[cache_status, export_file])
     return [(ui, "LLM 提示词工作室", "llm_prompt_studio")]
