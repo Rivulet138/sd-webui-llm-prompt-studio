@@ -1,265 +1,653 @@
 # LLM 提示词工作室 for Stable Diffusion WebUI Forge Neo
 
-面向 Stable Diffusion WebUI Forge Neo 的本地优先提示词扩展。它将 LLM、静态 Tag 词库、本地高分 Prompt RAG、Few-Shot、WD14 Tagger 和 Regional Prompter 工作流整合到同一套中文界面中。
+面向 Stable Diffusion WebUI Forge Neo 的本地优先提示词扩展。插件把 LLM 提示词生成、模型专属规则、静态 Danbooru Tag 词库、本地高分 Prompt RAG、Few-Shot、批量缓存、WD14 Tagger 和区域提示词结构化输出整合到同一套中文界面中。
 
-扩展提供独立管理页，同时在 txt2img 和 img2img 的 Ranbooru 区域之后、原生负面提示词之前插入快捷生成面板。生成结果可以直接写入正向提示词。
+插件提供两个入口：
 
-## 主要功能
+- Forge 顶部独立页签 `LLM 提示词工作室`，用于完整配置、生成、批量任务和缓存管理。
+- txt2img 与 img2img 正向提示词区域中的内嵌面板，位于 Ranbooru 区域之后、原生负面提示词之前，可以直接把 LLM 结果写入正向提示词。
 
-- 六种 System Prompt 预设：Danbooru 标签、Danbooru + 自然语言、自然语言、NoobAI 标签、Anima 标签、Krea 2 自然语言。
-- Prompt Policy v2 固定优先级：安全策略、模型规则、输出预设、用户低优先级要求、RAG/静态词库参考数据。
-- NoobAI 专属标签顺序、质量/分级/年代/来源锚点、`score_*` 禁止规则和 `1.05-1.20` 权重限制。
-- SFW/NSFW 模式、NSFW System Prompt 注入和本地 SFW 输出校验。
-- 原生支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages、Google Gemini generateContent 和 Ollama Chat，并提供 OpenRouter、DeepSeek、LM Studio 与自定义 OpenAI 兼容配置档。
-- 按 Provider 独立持久化接口 URL、模型 ID、温度、超时、最大输出 Token、温度参数开关和 API Key。
-- 可保存完整工作参数，并在完整页与 txt2img/img2img 内嵌面板中自动填入上次设置。
-- 插件内置 74 个分类静态 Tag 词库文件，支持自定义目录、增量索引和失效来源清理。
-- 本地稀疏向量 RAG、高分 Prompt 检索和 Few-Shot 示例注入。
-- Ranbooru 风格标签处理：移除不良标签、额外通配排除、随机打乱、下划线转空格、最大标签数和批次共用提示词。
-- 调用已安装的 WD14 Tagger API，并用 LLM 对反推标签进行扩写或润色。
-- 生成 Regional Prompter 可继续处理的 JSON 或 Markdown 多区域结构。
-- 提供 Forge API，可从外部程序测试和生成提示词。
+运行时只使用 Python 标准库以及 Forge 已提供的 Gradio、FastAPI 和 Pillow，不需要额外安装 Python 包。
 
-## 界面位置
+## 功能概览
 
-扩展有两个入口：
+- 六种 System Prompt 输出预设：Danbooru 标签、Danbooru + 自然语言、自然语言、NoobAI 标签、Anima 标签、Krea 2 自然语言。
+- NoobAI、Anima、Krea 2、Flux、Pony / Illustrious 与自动底模规则，不包含旧 SD1.5 或 SDXL 配置档。
+- 固定 Prompt Policy 优先级，用户要求为低优先级约束，RAG 和静态词库只作为参考数据。
+- SFW / NSFW 模式、NSFW 专用 System Prompt 注入和生成结果的本地 SFW 关键词校验。
+- OpenAI Responses、OpenAI Chat Completions、Anthropic Messages、Google Gemini、OpenRouter、DeepSeek、Ollama、LM Studio 和自定义 OpenAI 兼容接口。
+- Provider、URL、模型 ID、温度、超时、最大输出 Token 和 API Key 的独立持久化。
+- 完整工作参数保存与自动恢复，重新打开 Forge 后无需重复填写。
+- 插件内置 74 个分类 Tag 词库文件，也支持选择其他本地词库目录。
+- 本地 SQLite 高分 Prompt 库、稀疏向量 RAG 和 Few-Shot 示例注入。
+- Ranbooru 风格标签处理：移除不良标签、自定义通配排除、去重、随机打乱、下划线转空格、最大标签数量、批次共用提示词。
+- 独立的批量缓存页面，支持 LLM 批量生成、直接批量导入、队列预览、失败重试、取消和进度记录。
+- 独立的缓存库页面，支持筛选、多选、查看、编辑、另存、删除预览、撤销和 JSON / CSV 导入导出。
+- 调用已安装的 WD14 Tagger API，并使用 LLM 扩写或润色反推标签。
+- 输出 Regional JSON 或 Regional Markdown，为多人、分区和 Regional Prompter 工作流提供结构化数据。
+- 提供受 Forge `--api-auth` 保护的本地 API，方便脚本或其他工具测试和调用。
 
-1. Forge 顶部的 `LLM 提示词工作室` 页签，用于完整配置、词库、WD14、缓存和 API 管理。
-2. txt2img/img2img 正向提示词区域中的 `LLM 提示词工作室` 折叠面板，位于 Ranbooru 之后、负面提示词之前。
+## 目录
 
-内嵌面板中的“生成并写入正向提示词”会把结果直接发送到当前 txt2img 或 img2img 正向提示词。
+- [安装与更新](#安装与更新)
+- [界面入口](#界面入口)
+- [首次使用](#首次使用)
+- [System Prompt 与规则优先级](#system-prompt-与规则优先级)
+- [LLM Provider 设置](#llm-provider-设置)
+- [参数保存与自动恢复](#参数保存与自动恢复)
+- [提示词生成工作流](#提示词生成工作流)
+- [标签后处理](#标签后处理)
+- [静态 Tag 词库](#静态-tag-词库)
+- [本地 RAG 与 Few-Shot](#本地-rag-与-few-shot)
+- [批量缓存](#批量缓存)
+- [缓存库管理](#缓存库管理)
+- [WD14 Tagger 与 LLM](#wd14-tagger-与-llm)
+- [Regional Prompter 结构化输出](#regional-prompter-结构化输出)
+- [本地 API](#本地-api)
+- [数据目录与安全](#数据目录与安全)
+- [开发与测试](#开发与测试)
+- [常见问题](#常见问题)
+- [已知边界](#已知边界)
 
-## 安装
+## 安装与更新
 
-进入 Forge Neo 的 `extensions` 目录：
+### 安装
+
+关闭 Forge Neo，进入它的 `extensions` 目录：
 
 ```powershell
+cd E:\sd-webui-forge-neo\extensions
 git clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio.git
 ```
 
-重新启动 Forge Neo。插件不需要额外安装第三方 Python 包。
+重新启动 Forge Neo。启动日志中出现类似以下内容，表示内置词库已完成检查或索引：
 
-更新插件：
+```text
+[LLM Prompt Studio] wildcard library ready: ...
+```
+
+### 更新
 
 ```powershell
-cd sd-webui-llm-prompt-studio
+cd E:\sd-webui-forge-neo\extensions\sd-webui-llm-prompt-studio
 git pull --ff-only
 ```
 
-## LLM 设置
+更新后重新启动 Forge Neo。运行数据保存在插件的 `user` 目录中，正常 `git pull` 不会覆盖该目录。
 
-打开 `LLM 连接` 页签或内嵌面板中的 `LLM 连接设置`：
+### 安装要求
 
-1. 选择 Provider。
-2. 填写接口地址、模型 ID 和 API Key。
-3. 设置最大输出 Token；推理模型不支持温度时，关闭“发送温度参数”。
-4. 点击“测试 API”。
-5. 点击“保存全部 LLM 设置”。
+- Stable Diffusion WebUI Forge Neo。
+- 一个可以访问的 LLM 服务及其模型 ID。
+- 使用 WD14 功能时，需要另外安装并启用 WD14 Tagger 扩展。
+- 使用区域提示词时，Regional Prompter 是可选扩展；本插件只负责生成结构化结果，不会直接控制 Regional Prompter 的界面。
 
-保存后：
+## 界面入口
 
-- 每个 Provider 的 URL、模型、温度、超时、最大输出 Token 和温度开关会分别保存，切换 Provider 时自动恢复。
-- API Key 不会回填到浏览器。
-- API Key 输入框留空时，仅当 Provider 和 URL 完全匹配，服务端才会复用对应凭据。
-- “清除已保存的 API Key”只清除当前 Provider 与 URL 的凭据，不影响其他 Provider。
-- 插件只使用 `llm_connections_v2` 多 Provider 配置。旧 `llm_connection` 配置不会读取，并会在加载连接设置时自动删除。旧版单文件 API Key 仍会在下次保存凭据时迁移，避免无提示丢失密钥。
+### 独立管理页
 
-## Provider 兼容性
+Forge 顶部的 `LLM 提示词工作室` 包含六个一级页签：
 
-| Provider | 默认地址 | 调用协议 |
-| --- | --- | --- |
-| OpenAI | `https://api.openai.com/v1` | `POST /responses` |
-| OpenAI Chat Completions | `https://api.openai.com/v1` | `POST /chat/completions` |
-| OpenRouter | `https://openrouter.ai/api/v1` | OpenAI Chat 兼容 |
-| Anthropic | `https://api.anthropic.com` | `POST /v1/messages` |
-| Google Gemini | `https://generativelanguage.googleapis.com/v1beta` | `POST /models/{model}:generateContent` |
-| DeepSeek | `https://api.deepseek.com` | OpenAI Chat 兼容 |
-| Ollama | `http://127.0.0.1:11434` | `POST /api/chat`，强制非流式 |
-| LM Studio | `http://127.0.0.1:1234/v1` | OpenAI Chat 兼容 |
-| 自定义 OpenAI 兼容 | `http://127.0.0.1:1234/v1` | OpenAI Chat 兼容 |
+| 页签 | 用途 |
+| --- | --- |
+| `生成提示词` | 单次生成、System Prompt 预览、标签处理和 RAG 设置 |
+| `批量缓存` | LLM 批量生成或直接导入本地 Prompt |
+| `缓存库` | 筛选、选择、编辑、删除、撤销、导入和导出 |
+| `LLM 连接` | Provider、URL、模型、采样参数和凭据管理 |
+| `静态词库` | 建立索引、切换词库目录和搜索词条 |
+| `WD14 + LLM` | 图片反推标签，以及 LLM 扩写或润色 |
 
-Provider 配置档只保存 Base URL。插件会识别已经包含最终路径的 URL，避免重复拼接 `/chat/completions`、`/responses`、`/v1/messages` 或 `/api/chat`。
+### txt2img / img2img 内嵌面板
 
-请求参数会按 Provider 映射：OpenAI Responses 使用 `max_output_tokens`，OpenAI Chat 使用 `max_completion_tokens`，OpenAI 兼容接口使用 `max_tokens`，Anthropic 使用必填 `max_tokens`，Gemini 使用 `generationConfig.maxOutputTokens`，Ollama 使用 `options.num_predict`。最大输出 Token 为 `0` 时省略可选限制；Anthropic 因官方协议要求该字段，会回退到 `1024`。
+内嵌面板会捕获 Forge 原生正向提示词组件，并在负面提示词之前创建 `LLM 提示词工作室` 折叠区。
 
-官方协议依据：
+点击 `生成并写入正向提示词` 后，生成结果会同时显示在插件输出框中，并写入当前 txt2img 或 img2img 的正向提示词。
 
-- [OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)
-- [OpenAI Chat Completions API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
-- [Anthropic Messages API](https://platform.claude.com/docs/en/api/overview)
-- [Google Gemini generateContent](https://ai.google.dev/api/generate-content)
-- [OpenRouter API](https://openrouter.ai/docs/api_reference/overview)
-- [Ollama Chat API](https://docs.ollama.com/api/chat)
-- [LM Studio OpenAI Compatibility](https://lmstudio.ai/docs/developer/openai-compat)
-- [DeepSeek API](https://api-docs.deepseek.com/)
+如果 Forge 或其他扩展修改了正向提示词组件 ID，日志可能显示“未找到正向提示词组件”，此时独立管理页仍然可以正常使用。
 
-默认自定义 OpenAI 兼容地址：
+## 首次使用
 
-```text
-http://127.0.0.1:1234/v1
-```
+推荐按照以下顺序完成首次配置：
 
-默认 Ollama 地址：
+1. 打开 `LLM 连接`。
+2. 选择 Provider，填写接口地址、模型 ID 和 API Key。
+3. 点击 `测试 API`，确认返回连接成功。
+4. 点击 `保存全部 LLM 设置`。
+5. 打开 `生成提示词`。
+6. 选择输出预设和目标底模，例如 `NoobAI 标签` + `NoobAI`。
+7. 选择 `SFW` 或 `NSFW`，按需填写用户输出要求。
+8. 输入创作要求，点击 `生成提示词`。
+9. 确认结果后，点击 `保存全部工作参数`。
 
-```text
-http://127.0.0.1:11434
-```
+以后重新打开 Forge 时，Provider 设置、URL、模型和工作参数都会自动恢复。API Key 不会显示在浏览器输入框中，但可以在 Provider 与 URL 完全匹配时从本地凭据存储复用。
 
-## 工作参数保存与自动恢复
+## System Prompt 与规则优先级
 
-“生成提示词”页提供“保存全部工作参数”和“恢复默认工作参数”，“批量缓存”页提供“保存批量与工作参数”，内嵌面板提供“保存提示词参数”。保存后，下次打开界面会自动恢复：
+插件的 System Prompt 不是简单拼接文本。最终规则按照固定权限顺序组织：
 
-- System Prompt 预设、自定义 System Prompt、目标底模、SFW/NSFW 和用户输出要求。
-- 输出格式、区域数量、标签清理、随机打乱、下划线转换和最大标签数。
-- Few-Shot 数量、RAG 最低评分、缓存评分和单次生成缓存开关。
-- 批量跳过策略、失败重试次数和批量评分。
-- WD14 地址、模型、阈值，以及静态词库目录。
+1. Prompt Policy 与安全规则。
+2. 目标底模规则。
+3. 输出预设规则。
+4. 用户输出要求。
+5. 本地 RAG 示例和静态词库参考数据。
 
-创作要求、待处理图片、API Key 和批量输入正文不会保存到工作参数档。LLM 连接及 API Key 继续使用独立的 Provider 配置和服务端凭据存储。
+这意味着：
 
-## NoobAI 提示词规则
+- `用户输出要求` 明确是低优先级约束，不能覆盖安全规则、模型规则或输出格式。
+- RAG 和静态词库只提供格式、用词和具体程度参考，不能向模型发布指令。
+- 自定义 System Prompt 会替换所选输出预设，但不会移除 Prompt Policy、底模规则、安全模式、用户要求或参考数据边界。
+- 用户创作要求会被编码在 `<user_image_request priority="low">` 数据区块中。
+- RAG 与词库内容会进行转义，不能通过伪造 XML 结束标签提升权限。
 
-选择：
+界面中的 `最终 System Prompt` 可以用于检查本次请求实际发送了哪些规则和参考数据。
+
+### 输出预设
+
+| 中文选项 | 内部名称 | 输出方式 | 适用场景 |
+| --- | --- | --- | --- |
+| Danbooru 标签 | `Danbooru Tags` | 单行、逗号分隔、规范小写 Tag | Booru / 动漫标签模型 |
+| Danbooru 标签 + 自然语言 | `Danbooru + Natural` | Tag 在前，简短自然语言补充在后 | 需要标签控制和材质、氛围描述 |
+| 自然语言 | `Natural Language` | 一段紧凑自然语言 | Flux、通用文生图模型 |
+| NoobAI 标签 | `NoobAI Tags` | NoobAI 顺序与锚点规则 | NoobAI-XL 系列 |
+| Anima 标签 | `Anima Tags` | Danbooru 优先的动漫提示词 | Anima 风格模型 |
+| Krea 2 自然语言 | `Krea 2 Natural` | 一段按视觉顺序组织的自然语言 | Krea 2 |
+
+### 目标底模规则
+
+| 目标底模 | 主要约束 |
+| --- | --- |
+| 自动 / 使用底模默认规则 | 遵循输出预设，主体信息优先，不主动增加权重 |
+| Pony / Illustrious | 角色、特征、服装、动作、场景、镜头顺序；不自动增加 `score_*` 或来源标签 |
+| NoobAI | 规范 Danbooru Tag、少量质量/分级/年代/来源锚点、禁止 Pony `score_*` |
+| Flux | 直接自然语言，不使用 Danbooru Tag 堆叠和空泛质量词 |
+| Anima | 角色一致性和可读构图优先，避免冗长质量词 |
+| Krea 2 | 媒介、主体、动作、场景、构图、光线、材质和风格顺序，不使用权重 |
+
+### NoobAI 专属规则
+
+推荐组合：
 
 ```text
 System Prompt 预设：NoobAI 标签
 目标底模：NoobAI
 ```
 
-输出采用以下顺序：
+NoobAI 输出顺序：
 
-1. 精简的质量、分级、年代和来源锚点。
+1. 2-4 个兼容且不重复的质量、分级、年代或来源锚点。
 2. 人物数量与身份。
-3. 外观和角色特征。
-4. 服饰。
+3. 角色外观和辨识特征。
+4. 服装。
 5. 动作与表情。
 6. 场景和物体。
-7. 构图和镜头。
+7. 构图与镜头。
 8. 光线。
 9. 风格细节。
 
-NoobAI 模式禁止 Pony `score_*` 标签。显式权重最多三个，范围限制为 `1.05-1.20`，质量与分级标签不加权。SFW 模式使用 `safe`，禁止与 `nsfw` 或 `explicit` 混用。
+权重规则：
+
+- 最多使用三个显式 `(tag:weight)`。
+- 权重范围为 `1.05-1.20`。
+- 只为真正需要强调的视觉特征加权。
+- 质量、分级、年代和来源锚点不加权。
+- 禁止输出 Pony `score_*` 标签和虚构艺术家标签。
+
+### SFW 与 NSFW
+
+`SFW` 模式会要求模型避免成人、裸露、性行为、恋物和性化内容，并在 LLM 返回后进行本地关键词检查。命中本地阻止词时，结果不会写入提示词或缓存。
+
+`NSFW` 模式允许使用 `NSFW System Prompt 注入` 增加本地工作流约束，但仍然保留禁止未成年人、胁迫、违法内容和真实人物色情化的上层规则。NSFW 注入只在明确选择 `NSFW` 时加入最终 System Prompt。
+
+## LLM Provider 设置
+
+### 支持的 Provider
+
+| Provider | 默认 Base URL | 协议 | API Key |
+| --- | --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | Responses API | 必需 |
+| OpenAI Chat Completions | `https://api.openai.com/v1` | Chat Completions | 必需 |
+| OpenRouter | `https://openrouter.ai/api/v1` | OpenAI Chat 兼容 | 必需 |
+| Anthropic Claude | `https://api.anthropic.com` | Messages API | 必需 |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta` | generateContent | 必需 |
+| DeepSeek | `https://api.deepseek.com` | OpenAI Chat 兼容 | 必需 |
+| Ollama 本地服务 | `http://127.0.0.1:11434` | `/api/chat` | 默认不需要 |
+| LM Studio 本地服务 | `http://127.0.0.1:1234/v1` | OpenAI Chat 兼容 | 默认不需要 |
+| 自定义 OpenAI 兼容接口 | `http://127.0.0.1:1234/v1` | OpenAI Chat 兼容 | 取决于服务端 |
+
+### 设置字段
+
+- `接口地址`：填写服务的 Base URL。必须是绝对 `http://` 或 `https://` 地址，不能包含账号密码、查询字符串或 URL Fragment。
+- `模型 ID`：填写服务端实际公开的模型名称。插件不会自动枚举模型。
+- `API Key`：保存后不会回填到浏览器；以后可以留空复用。
+- `温度`：范围 `0-2`。
+- `超时秒数`：范围 `5-600`。
+- `最大输出 Token`：设为 `0` 时尽量使用 Provider 默认值。
+- `发送温度参数`：推理模型或兼容服务拒绝 temperature 时关闭。
+
+插件会识别 Base URL 是否已经包含最终 API 路径，避免重复添加 `/responses`、`/chat/completions`、`/v1/messages`、`/models/...:generateContent` 或 `/api/chat`。
+
+### Token 参数映射
+
+不同 Provider 的最大输出参数名称不同：
+
+- OpenAI Responses：`max_output_tokens`。
+- OpenAI Chat Completions：`max_completion_tokens`。
+- OpenAI 兼容、OpenRouter、DeepSeek、LM Studio：`max_tokens`。
+- Anthropic：`max_tokens`，协议必填；界面值为 `0` 时回退到 `1024`。
+- Gemini：`generationConfig.maxOutputTokens`。
+- Ollama：`options.num_predict`，并强制使用非流式返回。
+
+### Provider 设置与凭据保存
+
+每个 Provider 独立保存以下内容：
+
+- Base URL。
+- 模型 ID。
+- 温度。
+- 超时。
+- 最大输出 Token。
+- 是否发送温度。
+- 与 Provider + URL 精确绑定的 API Key。
+
+切换 Provider 时，界面会自动载入该 Provider 上次保存的设置。API Key 只有在 Provider 和标准化 URL 同时匹配时才会复用，避免把一个服务的凭据发送给另一个服务。
+
+`清除已保存的 API Key` 只删除当前 Provider 与 URL 对应的凭据。
+
+插件只读取 `llm_connections_v2`。旧 `llm_connection` 设置会在连接配置加载时自动删除，不再参与回退。旧版单凭据文件会在下一次保存 API Key 时迁移到多 Provider 格式。
+
+## 参数保存与自动恢复
+
+可用的保存按钮：
+
+- `生成提示词` 页：`保存全部工作参数`。
+- `生成提示词` 页：`恢复默认工作参数`。
+- `批量缓存` 页：`保存批量与工作参数`。
+- txt2img / img2img 内嵌面板：`保存提示词参数`。
+
+完整页保存以下内容：
+
+| 参数组 | 保存内容 |
+| --- | --- |
+| Prompt | 输出预设、自定义 System Prompt、目标底模、SFW / NSFW、NSFW 注入、用户输出要求 |
+| 结构化输出 | 普通 / Regional JSON / Regional Markdown、区域数量 |
+| 标签处理 | 移除不良标签、额外排除规则、随机打乱、下划线转换、最大标签数 |
+| RAG 与缓存 | Few-Shot 数量、最低评分、生成结果评分、是否缓存 |
+| 批量任务 | 跳过已有输入、重试次数、批量评分 |
+| WD14 | API 地址、模型、阈值 |
+| 静态词库 | 当前词库目录 |
+
+不会保存：
+
+- 创作要求正文。
+- 源标签正文。
+- 批量队列正文。
+- 待处理图片。
+- 浏览器中的 API Key 输入值。
+
+API Key 和 LLM 连接参数使用独立的凭据与 Provider 设置存储，不会混入工作参数档。
+
+## 提示词生成工作流
+
+### 单次生成
+
+1. 在 `创作要求` 中描述画面。
+2. 可选填写 `源 Danbooru 标签`。
+3. 选择输出预设、目标底模和内容模式。
+4. 按需设置用户输出要求、标签后处理、RAG 和缓存评分。
+5. 点击 `生成提示词`。
+6. 检查 `生成的提示词`、`最终 System Prompt` 和状态信息。
+
+如果填写了 `源 Danbooru 标签`，它会优先于 `创作要求` 成为本次 LLM 请求、RAG 检索、静态词库匹配和缓存源标签。当前版本不会自动把两个输入合并。
+
+### 内嵌生成并写入 Forge
+
+在 txt2img 或 img2img 中展开 `LLM 提示词工作室`：
+
+1. 输入创作要求或源标签。
+2. 选择参数。
+3. 点击 `生成并写入正向提示词`。
+
+生成成功后会覆盖当前正向提示词组件的内容。建议在生成前保存需要保留的原提示词。
+
+### LLM 扩写与润色
+
+`WD14 + LLM` 页支持两种操作：
+
+- `扩写`：保留明确事实和输出格式，增加兼容的视觉细节。
+- `润色`：提高提示词清晰度、视觉具体性和模型兼容性，不增加没有依据的事实。
+
+## 标签后处理
+
+后处理应用于 `Danbooru Tags`、`NoobAI Tags` 和 `Anima Tags` 结果。自然语言和混合预设不会执行整行 Tag 清理。
+
+### 移除不良标签
+
+默认不良标签包括：
+
+```text
+watermark, signature, text, english text, chinese text,
+speech bubble, commentary, username, artist name, logo,
+copyright name, website, translation request, sample watermark
+```
+
+### 额外排除标签 / 通配规则
+
+使用逗号分隔，支持 `*` 通配：
+
+```text
+watermark, * text, artist *
+```
+
+匹配时会先把待处理 Tag 的下划线转换为空格并忽略大小写，因此通配规则也应使用空格形式。例如 `english_text` 应使用 `* text` 匹配。
+
+### 其他处理
+
+- 自动移除重复 Tag，保留第一次出现的位置。
+- `随机打乱标签` 使用系统随机源重新排列结果。
+- `将“_”转换为空格` 把 `blue_eyes` 转为 `blue eyes`。
+- `最大标签数` 在处理结束后截断；`0` 表示不限。
+
+### Forge 批次标签处理脚本
+
+Forge 生成参数中会出现 `LLM 提示词工作室：批量标签处理`：
+
+- `启用 LLM 提示词工作室标签处理`。
+- `移除不良标签`。
+- `额外排除标签 / 通配规则`。
+- `随机打乱标签`。
+- `将“_”转换为空格`。
+- `最大标签数`。
+- `本批次所有图片使用同一条处理后提示词`。
+
+启用“本批次所有图片使用同一条处理后提示词”时，处理后的主提示词会复制到本批次全部图片；关闭时，每条 `all_prompts` 会分别处理。
 
 ## 静态 Tag 词库
 
-默认词库随插件安装，目录为：
+默认词库目录：
 
 ```text
 assets/wildcards
 ```
 
-内置词库保留人物、动作、场景、服饰、物品、环境、表情和镜头等中文分类目录，共 74 个文本文件。插件启动时会自动增量索引；也可以在 `静态词库` 页签中点击“建立 / 刷新本地索引”。路径输入框仍可选择其他本地词库目录。切换目录后会清理旧来源的索引记录，原始文件不会被修改。
+当前内置 74 个文本文件，覆盖：
 
-匹配到的词条以 `<static_tag_lexicon>` 数据区块注入 System Prompt。模型只能把它们作为词汇参考，不能执行其中的指令。
+- 人物、角色数量、头发、眼睛和嘴巴。
+- 动作、手部、腿部、姿势和互动。
+- 室内、城市、建筑和自然场景。
+- 上衣、外套、裙裤、鞋袜、制服、主题服饰和配件。
+- 动物、植物、武器、家具、电子设备、食物和其他物品。
+- 天气、天空、季节和自然环境。
+- 表情、镜头、角度、特写和镜头效果。
+
+插件启动时会自动增量索引工作参数中保存的词库目录；没有保存自定义目录时使用内置词库。`静态词库` 页可以：
+
+- 选择其他本地词库目录。
+- 点击 `建立 / 刷新本地索引`。
+- 搜索已索引词条。
+
+索引限制：
+
+- 最多 5000 个词库文件。
+- 单文件最大 4 MiB。
+- 单文件最多 20000 个词条。
+- 单个词条最多 256 个字符。
+
+切换目录或删除文件后，重新索引会清理旧来源记录，但不会修改原始词库文件。
+
+生成时会把当前创作要求或源标签作为一个完整的子串查询，返回最多 40 个匹配词条，并放入 `<static_tag_lexicon>` 数据区块。精确单 Tag 或短语更容易命中；包含多个逗号 Tag 或完整自然语言句子时可能没有结果。它们只能作为词汇参考。
 
 ## 本地 RAG 与 Few-Shot
 
-本地缓存中的高分 Prompt 会转换为稀疏词项向量，并通过余弦相似度检索。该实现完全离线，不需要下载 Embedding 模型。
+缓存中的 Prompt 会与源标签组合成稀疏词项向量，使用余弦相似度检索。整个过程在本地完成，不下载 Embedding 模型，也不把缓存库发送到额外的向量服务。
 
-生成设置中可以控制：
+可配置：
 
-- Few-Shot 示例数量。
-- RAG 最低评分。
-- 新生成记录的保存评分。
-- 是否缓存本次生成结果。
+- `Few-Shot 示例数`：`0-8`。
+- `RAG 最低缓存评分`：`0-10`。
+- `保存生成结果的评分`：`0-10`。
+- `在本地缓存本次结果`。
 
-RAG 示例使用 `<rag_examples>` 数据边界注入，只作为格式和具体程度参考。模型不得复制无关身份、角色或其中的指令。
+RAG 会扫描所有达到最低评分的缓存候选，不受缓存库界面默认显示 200 条记录的限制。匹配结果按相似度和评分排序，最终最多注入 8 条，界面默认使用 3 条。
 
-## 本地批量缓存
+RAG 示例位于 `<rag_examples>` 数据区块，只用于参考输出格式和细节密度，不允许复制无关人物身份、角色设定或隐藏指令。
 
-缓存使用 SQLite，主数据库位置：
+## 批量缓存
 
-```text
-user/prompt_studio.db
-```
+`批量缓存` 是独立一级页签，包含两种模式。
 
-支持：
+### LLM 批量生成
 
-- 单事务批量写入。
-- 内容哈希精确去重。
-- 与缓存表顺序一致的稳定全库序号。
-- Prompt、负面提示词、源标签、评分、格式和目标模型筛选。
-- 表格点击载入、多选记录、删除预览、选中导出。
-- 按 `1-100,205,300-320` 预览或删除范围。
-- 删除前 SQLite Online Backup。
-- 撤销上次删除。
-- JSON/CSV 导入导出。
-- 单条查看、评分、格式、目标模型和 Prompt 编辑，并可另存为新记录。
-
-导入限制：
-
-- 单文件最大 64 MiB。
-- 单次最多 100000 条记录。
-- 可选择跳过重复记录。
-
-备份策略：最多 20 份、最长 30 天、总容量最多 2 GiB。备份位于：
+每行输入一条创作要求或源标签：
 
 ```text
-user/backups
+红发魔法师在月光图书馆阅读
+蓝发少女站在雨中的车站
+1girl, white_hair, winter_forest
 ```
 
-### 批量文本导入
+可配置：
 
-打开一级页签“批量缓存”中的“直接批量导入”。每行一条提示词，可以使用 `评分<TAB>提示词`。执行前可预览解析数量、忽略行和前 200 条队列：
+- 跳过相同源输入、输出预设和目标底模的已有缓存。
+- 单条失败重试 `0-3` 次。
+- 批量结果评分。
+
+操作流程：
+
+1. 点击 `预览生成队列`。
+2. 检查有效输入、重复输入、空行、注释行和将被跳过的已有记录。
+3. 点击 `开始生成并缓存`。
+4. 查看处理进度、新增、重复、跳过、失败和最近状态。
+5. 需要停止时点击 `取消批量任务`。
+
+队列最多解析 10000 条有效输入；预览表最多显示前 200 条。批量生成每积累 10 条结果或到达队尾时进行事务提交。
+
+同步 HTTP 请求无法在传输中强制终止。取消会在当前 LLM 请求返回或超时后生效，已经提交的结果会保留。
+
+### 直接批量导入
+
+每行一条 Prompt。支持纯文本格式：
+
+```text
+1girl, red_hair, moonlit_library
+1boy, black_hair, city_night
+```
+
+也支持 `评分<TAB>Prompt`：
 
 ```text
 9	1girl, red_hair, moonlit_library
 8.5	1boy, black_hair, city_night
 ```
 
-### 批量 LLM 生成
+无法解析的评分会被当作 Prompt 正文。空行和以 `#` 开头的注释行会忽略。执行前可以预览解析数量和前 200 条记录。
 
-打开一级页签“批量缓存”中的“LLM 批量生成”，每行输入一条创作要求或源标签。开始前可预览去重后的队列和将被跳过的已有缓存；运行时会持续更新进度与失败清单。
+直接导入使用内容哈希去重，状态会显示新增和重复数量。
 
-- 支持跳过已经缓存的相同输入。
-- 单条失败可重试 0-3 次。
-- 每完成 10 条执行一次事务提交。
-- 支持取消任务。
-- 取消、异常或重新运行时，已经提交的结果不会丢失。
+## 缓存库管理
 
-同步 HTTP 请求发出后不能强制中断；取消会在当前请求返回或超时后生效。
+主数据库：
 
-## WD14 Tagger
+```text
+user/prompt_studio.db
+```
 
-插件通过已安装 WD14 Tagger 的 Forge API 调用：
+每条记录包含：
+
+- 内部 ID。
+- 正向 Prompt。
+- 负面 Prompt。
+- 输出格式。
+- 目标底模。
+- 评分。
+- 源标签或源输入。
+- 内容哈希。
+- 创建和更新时间。
+
+### 筛选
+
+缓存库支持：
+
+- 搜索 Prompt、负面 Prompt 和源标签。
+- 最低评分。
+- 输出格式。
+- 目标模型。
+
+点击 `应用筛选` 后，表格、多选记录列表和编辑器工作流使用同一组过滤条件。保存、另存、删除、批量导入、批量生成、文件导入和撤销后，当前筛选条件不会被静默清除。
+
+表格当前显示前 200 条记录。`全库序号` 按内部 ID 升序计算，即使筛选后也保持原始全库位置，便于使用稳定序号管理记录。
+
+### 选择、查看和编辑
+
+- 点击表格任意单元格会选择该行并载入编辑器。
+- 多选框可以选择一条或多条缓存记录。
+- 编辑器可以修改正向 Prompt、负面 Prompt、格式、目标模型、评分和源标签。
+- `保存当前记录` 更新原记录。
+- `另存为新记录` 创建新记录。
+- 保存后只有仍符合当前筛选条件的记录会继续保留在选择列表中。
+
+### 删除所选
+
+删除采用预览保护：
+
+1. 选择记录。
+2. 点击 `预览所选`。
+3. 核对记录 ID 和 Prompt 摘要。
+4. 点击 `删除所选`。
+
+如果预览后改变了选择，删除会拒绝执行，必须重新预览。
+
+### 按全库序号删除
+
+支持单个序号和范围：
+
+```text
+1-100,205,300-320
+```
+
+建议先点击预览，再执行删除。一次最多解析 10000 个全库序号。
+
+### 备份与撤销
+
+删除前会使用 SQLite Online Backup 创建数据库备份，并把删除记录写入撤销日志。
+
+备份策略：
+
+- 最多 20 份。
+- 最长保留 30 天。
+- 总容量最多 2 GiB。
+
+备份目录：
+
+```text
+user/backups
+```
+
+`撤销上次删除` 只恢复最近一次尚未撤销的删除操作。如果原 ID 已被占用，记录会以新 ID 恢复。
+
+### JSON / CSV 导入导出
+
+支持：
+
+- 导出所选记录。
+- 导出全部缓存。
+- 导入 JSON。
+- 导入 CSV。
+- 导入时跳过重复记录。
+
+限制：
+
+- 单文件最大 64 MiB。
+- 单次最多 100000 条记录。
+- 导出文件名包含秒级时间和纳秒值，避免快速连续导出发生覆盖。
+
+导出目录：
+
+```text
+user/exports
+```
+
+## WD14 Tagger 与 LLM
+
+`WD14 + LLM` 页通过已安装 WD14 Tagger 的 Forge API 调用：
 
 ```text
 POST /tagger/v1/interrogate
 ```
 
-默认地址：
+默认设置：
 
 ```text
-http://127.0.0.1:7860
+Forge WD14 API 地址：http://127.0.0.1:7860
+WD14 模型：wd14-moat-v2
+阈值：0.35
 ```
 
-默认模型：
+使用流程：
 
-```text
-wd14-moat-v2
+1. 选择图片。
+2. 确认 WD14 API 地址、模型和阈值。
+3. 点击 `调用已安装的 WD14 Tagger`。
+4. 检查返回标签。
+5. 选择 LLM 操作 `扩写` 或 `润色`。
+6. 点击 `使用 LLM 扩写 / 润色`。
+
+WD14 Tagger 未安装、端口错误、模型不存在或 API 不可用时，只会影响该页面，不影响普通提示词生成和缓存功能。
+
+## Regional Prompter 结构化输出
+
+输出格式支持：
+
+- `普通提示词`。
+- `Regional JSON`。
+- `Regional Markdown`。
+
+区域数量范围为 `1-8`。
+
+Regional JSON 示例结构：
+
+```json
+{
+  "base_prompt": "1girl, red_hair, library",
+  "regions": [
+    {
+      "id": 1,
+      "prompt": "1girl, red_hair, library",
+      "weight": 1.0
+    }
+  ],
+  "regional_prompter_hint": "Use BREAK or the extension's Prompt mode after reviewing region content."
+}
 ```
 
-WD14 Tagger 未安装或 API 不可用时，该页会显示错误，但不会影响插件的其他功能。
+当前版本会把同一个基础 Prompt 复制到各区域，作为后续编辑模板。插件不会自动判断人物空间位置，也不会直接点击或配置 Regional Prompter。请检查 JSON / Markdown 后，再转换为 Regional Prompter 的 Prompt 模式、`BREAK` 语法或其他多人布局格式。
 
-## Regional Prompter
+## 本地 API
 
-输出格式可以选择：
+插件启动时会在 Forge FastAPI 应用中注册两个端点。
 
-- 普通提示词。
-- Regional JSON。
-- Regional Markdown。
+### 访问控制
 
-结构化输出包含基础提示词、区域编号、区域提示词和权重。请检查结果后，再按照 Regional Prompter 的 Prompt 模式或 `BREAK` 语法使用。
-
-## API
+- Forge 未配置 `--api-auth` 时，只允许本机回环地址访问插件 API。
+- Forge 配置 `--api-auth` 时，插件 API 使用相同的 HTTP Basic Auth。
+- 远程客户端在没有 Forge API Auth 的情况下会收到 HTTP 403。
+- 身份验证失败时返回 HTTP 401。
 
 ### 生成提示词
 
 ```text
 POST /llm-prompt-studio/v1/generate
+Content-Type: application/json
 ```
 
-示例：
+最小请求：
+
+```json
+{
+  "request": "a red-haired mage reading in a moonlit library"
+}
+```
+
+NoobAI 请求示例：
 
 ```json
 {
@@ -267,17 +655,94 @@ POST /llm-prompt-studio/v1/generate
   "preset": "NoobAI Tags",
   "base_model": "NoobAI",
   "safety": "SFW",
-  "provider": "OpenAI Compatible",
-  "endpoint": "http://127.0.0.1:1234/v1",
-  "model": "your-model-id",
-  "max_tokens": 1024,
-  "send_temperature": true,
-  "cache_result": true,
-  "save_score": 8
+  "few_shot_count": 3,
+  "rag_min_score": 7,
+  "remove_bad": true,
+  "shuffle": false,
+  "spaces": false,
+  "max_tags": 50,
+  "structured_mode": "Plain Prompt",
+  "save_score": 8,
+  "cache_result": true
 }
 ```
 
-API 使用中文界面中当前激活并保存的 Provider、URL 和服务端凭据；请求不能覆盖 Provider、URL 或直接提交 API Key。旧字段 `backend` 已移除，提交该字段会返回 HTTP 400。生成、模型、采样、RAG、标签处理、结构化输出与缓存参数采用显式白名单，未声明字段不会透传到 Provider。未配置 Forge `--api-auth` 时，仅允许本机回环地址调用；远程调用必须启用 `--api-auth`。
+PowerShell 示例：
+
+```powershell
+$body = @{
+    request = "a red-haired mage reading in a moonlit library"
+    preset = "NoobAI Tags"
+    base_model = "NoobAI"
+    safety = "SFW"
+    cache_result = $true
+    save_score = 8
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+    -Uri "http://127.0.0.1:7860/llm-prompt-studio/v1/generate" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $body
+```
+
+使用 Forge `--api-auth user:password` 时，下面的 Header 写法兼容 Windows PowerShell 5.1 和 PowerShell 7：
+
+```powershell
+$pair = "user:password"
+$basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+Invoke-RestMethod `
+    -Uri "http://127.0.0.1:7860/llm-prompt-studio/v1/generate" `
+    -Headers @{ Authorization = "Basic $basic" } `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $body
+```
+
+### 生成接口字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `request` | string | 空 | 创作要求；`source_tags` 为空时必需 |
+| `source_tags` | string | 空 | 源 Danbooru 标签，非空时优先于 `request` |
+| `preset` | string | `Danbooru Tags` | 输出预设内部名称 |
+| `system_override` | string | 空 | 自定义输出预设，不会覆盖上层策略 |
+| `base_model` | string | `Auto / checkpoint default` | 目标底模内部名称 |
+| `safety` | string | `SFW` | 严格使用 `SFW` 或 `NSFW`，其他值返回 HTTP 400 |
+| `nsfw_injection` | string | 空 | 仅 NSFW 模式注入 |
+| `user_instruction` | string | 空 | 低优先级用户输出要求 |
+| `model` | string | 已保存模型 | 可为本次请求指定模型 ID |
+| `temperature` | number | 已保存温度 | 本次请求温度 |
+| `timeout` | integer | 已保存超时 | HTTP 超时秒数 |
+| `max_tokens` | integer | 已保存值 | 最大输出 Token |
+| `send_temperature` | boolean | 已保存值 | 是否发送温度参数 |
+| `few_shot_count` | integer | `3` | RAG 示例数量 |
+| `rag_min_score` | number | `0` | RAG 最低评分 |
+| `remove_bad` | boolean | `true` | 移除内置不良 Tag |
+| `remove_terms` | string | 空 | 逗号分隔的额外排除规则 |
+| `shuffle` | boolean | `false` | 随机打乱 Tag |
+| `spaces` | boolean | `false` | 下划线转空格 |
+| `max_tags` | integer | `0` | 最大 Tag 数，0 表示不限 |
+| `structured_mode` | string | `Plain Prompt` | `Plain Prompt`、`Regional JSON` 或 `Regional Markdown` |
+| `region_count` | integer | `1` | 区域数量，最终限制为 1-8 |
+| `save_score` | number | `0` | 缓存评分 |
+| `cache_result` | boolean | `false` | 是否写入本地缓存 |
+
+`provider` 和 `endpoint` 可以出现在请求中，但必须与中文界面当前激活并保存的连接完全一致。API 不允许切换到其他服务，也不允许提交 `api_key`。请先在界面保存凭据。
+
+除已保存的连接参数外，生成 API 不会自动套用界面中的完整工作参数。请求没有提供的生成字段使用上表所列 API 默认值。
+
+未知字段会返回 HTTP 400。旧字段 `backend` 已删除，也会返回 HTTP 400。
+
+成功响应：
+
+```json
+{
+  "prompt": "masterpiece, safe, 1girl, red_hair, library",
+  "system_prompt": "PROMPT POLICY V2 ...",
+  "status": "生成完成，使用 3 条 RAG 示例，结果已缓存"
+}
+```
 
 ### 查询缓存
 
@@ -285,11 +750,20 @@ API 使用中文界面中当前激活并保存的 Provider、URL 和服务端凭
 GET /llm-prompt-studio/v1/cache?query=mage&limit=100
 ```
 
-如果 Forge 使用了 `--api-auth`，插件 API 会继承相同的 HTTP Basic Auth。
+参数：
 
-## 本地数据和安全
+- `query`：搜索 Prompt、负面 Prompt 和源标签。
+- `limit`：返回数量，服务端限制为 `1-1000`。
 
-插件运行数据位于 `user` 目录，并已被 `.gitignore` 排除：
+PowerShell：
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:7860/llm-prompt-studio/v1/cache?query=mage&limit=100"
+```
+
+## 数据目录与安全
+
+运行数据全部位于插件目录下的 `user`，并已由 `.gitignore` 排除：
 
 ```text
 user/prompt_studio.db
@@ -298,29 +772,160 @@ user/backups/
 user/exports/
 ```
 
-API Key 保存在本机服务端凭据文件中，不会通过界面回读。凭据文件不是加密保险库，不应提交、分享或放在多人可读目录。公开部署 Forge 时，请启用访问控制并限制该扩展页面和 API。
+### 数据用途
+
+- `prompt_studio.db`：Prompt 缓存、工作参数、Provider 设置、词库索引和删除日志。
+- `llm_credentials.json`：按 Provider 与 URL 保存的 API Key。
+- `backups`：删除缓存前创建的 SQLite 数据库备份。
+- `exports`：手动导出的 JSON / CSV 文件。
+
+### 安全注意事项
+
+- API Key 不会从服务端回填到浏览器。
+- 凭据文件会尝试设置限制性文件模式，但 Windows 上的实际访问仍由文件系统 ACL 决定；它不是系统密钥环或加密保险库。
+- 不要提交、分享或同步 `user` 目录。
+- 不要把 API Key 写入 URL、查询字符串、创作要求、自定义 System Prompt 或 API 请求正文。
+- 公开部署 Forge 时必须启用 `--api-auth`，并限制扩展页面、Forge API 和文件系统访问。
+- 本地 LLM 地址同样需要确认服务端是否监听公网接口。
+
+## 项目结构
+
+```text
+sd-webui-llm-prompt-studio/
+├─ assets/wildcards/              内置 Tag 词库
+├─ scripts/llm_prompt_studio.py   Forge 扩展注册与批次脚本
+├─ scripts/prompt_studio_core.py  Prompt、Provider、数据库和凭据核心逻辑
+├─ scripts/prompt_studio_ui.py    中文 Gradio UI、WD14 和本地 API
+├─ tests/                         单元测试与 API 测试
+├─ install.py                     无额外依赖声明
+├─ PRODUCT.md                     产品界面约束
+└─ README.md
+```
 
 ## 开发与测试
 
-在 Forge Neo 虚拟环境中运行：
+在 Forge Neo 虚拟环境中执行：
 
 ```powershell
-E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+cd E:\sd-webui-forge-neo\extensions\sd-webui-llm-prompt-studio
+
+E:\sd-webui-forge-neo\venv\Scripts\python.exe -m py_compile `
+    scripts\prompt_studio_core.py `
+    scripts\prompt_studio_ui.py
+
+E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover `
+    -s tests `
+    -p "test_*.py" `
+    -v
 ```
 
-当前测试覆盖 System Prompt 优先级、NoobAI 模型规则、SFW 校验、RAG、Provider 请求/响应契约、多 Provider 设置与凭据迁移、API 访问控制、批量事务、去重、连续序号、备份恢复和 JSON/CSV 导入导出。
+当前测试覆盖：
 
-## 可选扩展
+- Prompt Policy 权限顺序和数据边界转义。
+- NoobAI 规则、权重范围和旧 SD 配置移除。
+- SFW 输出校验。
+- RAG 相似度与超过 1000 条缓存后的完整检索。
+- Provider 请求参数、URL 拼接和响应解析。
+- 多 Provider 设置、URL 自动恢复、凭据隔离和旧配置迁移。
+- API 本地访问、Forge Basic Auth、字段白名单和旧字段拒绝。
+- 批量事务、去重、稳定全库序号、筛选状态保持和多选编辑。
+- 删除预览、备份、撤销和导入导出。
+- 内置词库的可移植索引和失效来源清理。
 
-- [sd-webui-ranbooru-Forge-neo](https://github.com/Rivulet138/sd-webui-ranbooru-Forge-neo)：Booru 抓取和 Tag 缓存工作流参考。
-- [sd-webui-wd14-tagger](https://github.com/toriato/stable-diffusion-webui-wd14-tagger)：图片标签反推。
+## 常见问题
+
+### 重启后 URL 或模型没有自动恢复
+
+确认修改参数后点击了 `保存全部 LLM 设置`，而不是只点击 `测试 API`。每个 Provider 单独保存；切换 Provider 会显示该 Provider 自己的 URL 和模型。
+
+### API Key 输入框重启后是空的
+
+这是预期行为。API Key 不会回填到浏览器。如果页面状态显示已找到匹配凭据，可以留空调用。修改 URL 后必须重新填写并保存对应 API Key。
+
+### OpenAI 或推理模型返回 temperature 不支持
+
+关闭 `发送温度参数` 后重新测试。OpenAI Responses 和 OpenAI Chat 配置档默认关闭温度，兼容服务默认开启。
+
+### 连接测试返回 404
+
+检查 Base URL 是否正确。通常应填写：
+
+```text
+OpenAI / OpenAI Chat：https://api.openai.com/v1
+Anthropic：https://api.anthropic.com
+Gemini：https://generativelanguage.googleapis.com/v1beta
+Ollama：http://127.0.0.1:11434
+LM Studio：http://127.0.0.1:1234/v1
+```
+
+插件支持已经包含最终路径的 URL，但不要把模型名、API Key 或查询参数写入 URL。
+
+### 生成结果被 SFW 校验拦截
+
+SFW 模式检测到成人关键词时会拒绝结果。检查创作要求、自定义 System Prompt、RAG 示例和模型输出；只有确实需要成人工作流时才切换到 NSFW，并填写适当的本地 NSFW 约束。
+
+### RAG 没有返回示例
+
+检查：
+
+- `Few-Shot 示例数` 是否大于 0。
+- 缓存记录评分是否达到最低评分。
+- 缓存 Prompt 或源标签是否与当前输入有共同词项。
+- 是否已经把高质量结果写入缓存。
+
+### 缓存筛选后记录消失
+
+保存或编辑后，如果记录不再满足搜索词、最低评分、格式或目标模型筛选，它会从当前表格和选择列表中移除，但数据库记录仍然存在。点击 `清除筛选` 可以重新查看。
+
+### 删除按钮没有执行
+
+多选删除必须先点击 `预览所选`。预览后改变选择会使确认失效，需要重新预览。按全库序号删除也建议先预览命中记录。
+
+### 批量取消没有立即停止
+
+当前 LLM 请求是同步 HTTP 调用，无法在传输过程中安全中止。取消会在该请求返回或超时后生效，已提交记录会保留。
+
+### WD14 不可用
+
+确认：
+
+- WD14 Tagger 扩展已安装并启用。
+- Forge API 地址和端口正确。
+- `/tagger/v1/interrogate` 可访问。
+- 模型名称存在。
+- Forge 页面和插件 API 没有被代理或认证配置阻断。
+
+### 内嵌面板没有出现
+
+检查 Forge 启动日志中是否存在“未找到 txt2img/img2img 正向提示词组件”或“内嵌面板创建失败”。这通常表示 Forge Neo 或其他扩展修改了组件构建顺序。独立 `LLM 提示词工作室` 页签仍可使用。
+
+## 可选扩展与参考
+
+- [sd-webui-ranbooru-Forge-neo](https://github.com/Rivulet138/sd-webui-ranbooru-Forge-neo)：Booru 抓取、Tag 处理和缓存工作流参考。
+- [stable-diffusion-webui-wd14-tagger](https://github.com/toriato/stable-diffusion-webui-wd14-tagger)：图片标签反推。
 - [sd-webui-regional-prompter](https://github.com/hako-mikan/sd-webui-regional-prompter)：区域提示词控制。
+
+Provider 官方文档：
+
+- [OpenAI Responses](https://developers.openai.com/api/docs/guides/migrate-to-responses)
+- [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+- [Anthropic Messages API](https://platform.claude.com/docs/en/api/overview)
+- [Google Gemini generateContent](https://ai.google.dev/api/generate-content)
+- [OpenRouter API](https://openrouter.ai/docs/api_reference/overview)
+- [DeepSeek API](https://api-docs.deepseek.com/)
+- [Ollama Chat API](https://docs.ollama.com/api/chat)
+- [LM Studio OpenAI Compatibility](https://lmstudio.ai/docs/developer/openai-compat)
 
 ## 已知边界
 
-- 同步 LLM/WD14 HTTP 请求只能在请求返回或超时后响应取消。
-- Provider 或模型不支持自定义温度时，需要关闭“发送温度参数”；插件不会根据不断变化的模型名称猜测参数能力。
-- 插件验证各 Provider 的 HTTP 契约，但不会自动发现云端账号可用的模型 ID、区域或额度。
-- 本地稀疏向量适合可解释的轻量检索，但不等价于大型语义 Embedding 模型。
-- Regional JSON/Markdown 需要用户检查后再交给 Regional Prompter。
-- 自定义 System Prompt 仍受 Prompt Policy v2 和安全规则约束。
+- 插件没有自动模型发现功能，模型 ID、账号区域和额度由 Provider 决定。
+- 批量 LLM 取消会在当前请求返回或超时后生效；WD14 页面当前不提供取消功能。
+- 本地稀疏向量 RAG 不等价于大型语义 Embedding；缓存非常大时，全候选扫描会增加检索耗时。
+- 缓存库界面默认显示 200 条，缓存查询 API 单次最多返回 1000 条，但 RAG 不受这两个展示上限影响。
+- Regional JSON / Markdown 是编辑模板，不是自动空间理解或 Regional Prompter 直接控制。
+- 自定义 System Prompt 不能覆盖 Prompt Policy、底模规则和安全规则。
+- SFW 校验是本地关键词防线，不替代 Provider 自身的安全策略或人工检查。
+
+## 仓库
+
+[https://github.com/Rivulet138/sd-webui-llm-prompt-studio](https://github.com/Rivulet138/sd-webui-llm-prompt-studio)

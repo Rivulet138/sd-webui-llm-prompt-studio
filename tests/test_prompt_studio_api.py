@@ -176,6 +176,45 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("unsupported fields", response.json()["detail"])
 
+    async def test_generate_api_rejects_invalid_policy_enums(self):
+        self._install_shared("")
+        app = FastAPI()
+        ui.on_app_started(None, app)
+
+        for payload in [
+            {"request": "test", "safety": "sfw"},
+            {"request": "test", "safety": ["SFW"]},
+            {"request": "test", "preset": "Unknown"},
+            {"request": "test", "base_model": "Unknown"},
+            {"request": "test", "structured_mode": "XML"},
+        ]:
+            response = await self._request(app, "127.0.0.1", "POST", "/llm-prompt-studio/v1/generate", json=payload)
+            self.assertEqual(response.status_code, 400, payload)
+
+    async def test_inline_generation_failure_preserves_existing_prompt(self):
+        original_generate = ui._generate
+        ui._generate = lambda *args: ("", "system", "生成失败")
+        try:
+            generated, system, status, prompt_update = ui._inline_generate()
+        finally:
+            ui._generate = original_generate
+
+        self.assertEqual(generated, "")
+        self.assertEqual(system, "system")
+        self.assertEqual(status, "生成失败")
+        self.assertEqual(prompt_update.get("__type__"), "update")
+        self.assertNotIn("value", prompt_update)
+
+    async def test_app_start_indexes_saved_custom_wildcard_path(self):
+        (self.lexicon / "custom.txt").write_text("custom_saved_tag\n", encoding="utf-8")
+        ui.DB.set_setting("workflow_settings_v1", {"wildcard_path": str(self.lexicon)})
+        self._install_shared("")
+        app = FastAPI()
+
+        ui.on_app_started(None, app)
+
+        self.assertEqual(ui.DB.wildcard_matches("custom_saved"), ["custom_saved_tag"])
+
     async def test_connection_probe_uses_current_temperature_settings(self):
         captured = []
         ui.call_llm = lambda *args, **kwargs: captured.append((args, kwargs)) or "READY"

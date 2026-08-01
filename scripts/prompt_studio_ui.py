@@ -724,7 +724,7 @@ def _test_connection(provider, endpoint, model, api_key, temperature, timeout, m
 
 def _inline_generate(*values):
     generated, system, status = _generate(*values)
-    return generated, system, status, generated
+    return generated, system, status, generated if generated else gr.update()
 
 
 def _unwrap_component(component):
@@ -865,6 +865,16 @@ def _api_generate(payload: dict[str, Any]):
         raise ValueError(f"API request contains unsupported fields: {', '.join(unknown_fields)}")
     if payload.get("api_key"):
         raise ValueError("API Key cannot be supplied through the plugin API; save it in the Chinese UI")
+
+    def require_choice(field: str, choices: set[str] | dict[str, Any], label: str) -> None:
+        value = payload.get(field, defaults[field])
+        if not isinstance(value, str) or value not in choices:
+            raise ValueError(f"Unsupported {label}: {value}")
+
+    require_choice("preset", PRESETS, "prompt preset")
+    require_choice("base_model", BASE_MODEL_GUIDANCE, "base model profile")
+    require_choice("safety", {"SFW", "NSFW"}, "safety mode")
+    require_choice("structured_mode", {"Plain Prompt", "Regional JSON", "Regional Markdown"}, "structured output mode")
     if "provider" in payload and payload["provider"] != saved_connection["provider"]:
         raise ValueError("API Provider must match the active connection saved in the plugin UI")
     if "endpoint" in payload and validate_endpoint(payload["endpoint"]) != validate_endpoint(saved_connection["endpoint"]):
@@ -879,9 +889,11 @@ def _api_generate(payload: dict[str, Any]):
 
 
 def on_app_started(_, app):
-    if DEFAULT_WILDCARDS.is_dir():
+    saved_workflow = DB.get_setting("workflow_settings_v1", {}) or {}
+    wildcard_source = Path(saved_workflow.get("wildcard_path") or DEFAULT_WILDCARDS) if isinstance(saved_workflow, dict) else DEFAULT_WILDCARDS
+    if wildcard_source.is_dir():
         try:
-            files, terms = DB.index_wildcards(DEFAULT_WILDCARDS)
+            files, terms = DB.index_wildcards(wildcard_source)
             print(f"[LLM Prompt Studio] wildcard library ready: {files} updated files, {terms} terms")
         except Exception as error:
             print(f"[LLM Prompt Studio] wildcard indexing skipped: {error}")
