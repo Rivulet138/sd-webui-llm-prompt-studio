@@ -196,7 +196,7 @@ NoobAI 输出顺序：
 
 `SFW` 模式会要求模型避免成人、裸露、性行为、恋物和性化内容，并在 LLM 返回后进行本地关键词检查。命中本地阻止词时，结果不会写入提示词或缓存。
 
-`NSFW` 模式允许使用 `NSFW System Prompt 注入` 增加本地工作流约束，但仍然保留禁止未成年人、胁迫、违法内容和真实人物色情化的上层规则。NSFW 注入只在明确选择 `NSFW` 时加入最终 System Prompt。
+`NSFW` 模式允许使用 `NSFW System Prompt 注入` 增加本地工作流约束上层规则。NSFW 注入只在明确选择 `NSFW` 时加入最终 System Prompt。
 
 ## LLM Provider 设置
 
