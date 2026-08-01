@@ -10,8 +10,8 @@
 - Prompt Policy v2 固定优先级：安全策略、模型规则、输出预设、用户低优先级要求、RAG/静态词库参考数据。
 - NoobAI 专属标签顺序、质量/分级/年代/来源锚点、`score_*` 禁止规则和 `1.05-1.20` 权重限制。
 - SFW/NSFW 模式、NSFW System Prompt 注入和本地 SFW 输出校验。
-- 支持 OpenAI 兼容接口和 Ollama。
-- 持久化保存后端、接口 URL、模型 ID、温度、超时和 API Key。
+- 原生支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages、Google Gemini generateContent 和 Ollama Chat，并提供 OpenRouter、DeepSeek、LM Studio 与自定义 OpenAI 兼容配置档。
+- 按 Provider 独立持久化接口 URL、模型 ID、温度、超时、最大输出 Token、温度参数开关和 API Key。
 - 插件内置 74 个分类静态 Tag 词库文件，支持自定义目录、增量索引和失效来源清理。
 - 本地稀疏向量 RAG、高分 Prompt 检索和 Few-Shot 示例注入。
 - Ranbooru 风格标签处理：移除不良标签、额外通配排除、随机打乱、下划线转空格、最大标签数和批次共用提示词。
@@ -49,25 +49,56 @@ git pull --ff-only
 
 打开 `LLM 连接` 页签或内嵌面板中的 `LLM 连接设置`：
 
-1. 选择 `OpenAI 兼容接口` 或 `Ollama 本地服务`。
+1. 选择 Provider。
 2. 填写接口地址、模型 ID 和 API Key。
-3. 点击“测试 API”。
-4. 点击“保存全部 LLM 设置”。
+3. 设置最大输出 Token；推理模型不支持温度时，关闭“发送温度参数”。
+4. 点击“测试 API”。
+5. 点击“保存全部 LLM 设置”。
 
 保存后：
 
-- URL、后端、模型、温度和超时会在下次启动时自动回填。
+- 每个 Provider 的 URL、模型、温度、超时、最大输出 Token 和温度开关会分别保存，切换 Provider 时自动恢复。
 - API Key 不会回填到浏览器。
-- API Key 输入框留空时，仅当后端和 URL 完全匹配，服务端才会复用已保存凭据。
-- 可随时点击“清除已保存的 API Key”。
+- API Key 输入框留空时，仅当 Provider 和 URL 完全匹配，服务端才会复用对应凭据。
+- “清除已保存的 API Key”只清除当前 Provider 与 URL 的凭据，不影响其他 Provider。
+- 旧版单连接设置和凭据会自动读取；下次保存时迁移为多 Provider 格式。存在 `llm_connections_v2` 时始终以 v2 为准，旧 `llm_connection` 仅作为向后兼容镜像继续写入。
 
-默认 OpenAI 兼容地址：
+## Provider 兼容性
+
+| Provider | 默认地址 | 调用协议 |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `POST /responses` |
+| OpenAI Chat Completions | `https://api.openai.com/v1` | `POST /chat/completions` |
+| OpenRouter | `https://openrouter.ai/api/v1` | OpenAI Chat 兼容 |
+| Anthropic | `https://api.anthropic.com` | `POST /v1/messages` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta` | `POST /models/{model}:generateContent` |
+| DeepSeek | `https://api.deepseek.com` | OpenAI Chat 兼容 |
+| Ollama | `http://127.0.0.1:11434` | `POST /api/chat`，强制非流式 |
+| LM Studio | `http://127.0.0.1:1234/v1` | OpenAI Chat 兼容 |
+| 自定义 OpenAI 兼容 | `http://127.0.0.1:1234/v1` | OpenAI Chat 兼容 |
+
+Provider 配置档只保存 Base URL。插件会识别已经包含最终路径的 URL，避免重复拼接 `/chat/completions`、`/responses`、`/v1/messages` 或 `/api/chat`。
+
+请求参数会按 Provider 映射：OpenAI Responses 使用 `max_output_tokens`，OpenAI Chat 使用 `max_completion_tokens`，OpenAI 兼容接口使用 `max_tokens`，Anthropic 使用必填 `max_tokens`，Gemini 使用 `generationConfig.maxOutputTokens`，Ollama 使用 `options.num_predict`。最大输出 Token 为 `0` 时省略可选限制；Anthropic 因官方协议要求该字段，会回退到 `1024`。
+
+官方协议依据：
+
+- [OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)
+- [OpenAI Chat Completions API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+- [Anthropic Messages API](https://platform.claude.com/docs/en/api/overview)
+- [Google Gemini generateContent](https://ai.google.dev/api/generate-content)
+- [OpenRouter API](https://openrouter.ai/docs/api_reference/overview)
+- [Ollama Chat API](https://docs.ollama.com/api/chat)
+- [LM Studio OpenAI Compatibility](https://lmstudio.ai/docs/developer/openai-compat)
+- [DeepSeek API](https://api-docs.deepseek.com/)
+
+默认自定义 OpenAI 兼容地址：
 
 ```text
 http://127.0.0.1:1234/v1
 ```
 
-默认 Ollama 地址可填写：
+默认 Ollama 地址：
 
 ```text
 http://127.0.0.1:11434
@@ -221,15 +252,17 @@ POST /llm-prompt-studio/v1/generate
   "preset": "NoobAI Tags",
   "base_model": "NoobAI",
   "safety": "SFW",
-  "backend": "OpenAI Compatible",
+  "provider": "OpenAI Compatible",
   "endpoint": "http://127.0.0.1:1234/v1",
   "model": "your-model-id",
+  "max_tokens": 1024,
+  "send_temperature": true,
   "cache_result": true,
   "save_score": 8
 }
 ```
 
-API 使用中文界面中已保存的后端、URL 和服务端凭据；请求不能覆盖后端、URL 或直接提交 API Key。未配置 Forge `--api-auth` 时，仅允许本机回环地址调用；远程调用必须启用 `--api-auth`。
+API 使用中文界面中当前激活并保存的 Provider、URL 和服务端凭据；请求不能覆盖 Provider、URL 或直接提交 API Key。旧字段 `backend` 仍可作为 `provider` 的兼容别名，但值必须与当前激活配置一致。生成、模型、采样、RAG、标签处理、结构化输出与缓存参数采用显式白名单，未声明字段会返回 HTTP 400，不会透传到 Provider。未配置 Forge `--api-auth` 时，仅允许本机回环地址调用；远程调用必须启用 `--api-auth`。
 
 ### 查询缓存
 
@@ -260,7 +293,7 @@ API Key 保存在本机服务端凭据文件中，不会通过界面回读。凭
 E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-当前测试覆盖 System Prompt 优先级、NoobAI 模型规则、SFW 校验、RAG、凭据复用、批量事务、去重、连续序号、备份恢复和 JSON/CSV 导入导出。
+当前测试覆盖 System Prompt 优先级、NoobAI 模型规则、SFW 校验、RAG、Provider 请求/响应契约、多 Provider 设置与凭据迁移、API 访问控制、批量事务、去重、连续序号、备份恢复和 JSON/CSV 导入导出。
 
 ## 可选扩展
 
@@ -271,6 +304,8 @@ E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -p "
 ## 已知边界
 
 - 同步 LLM/WD14 HTTP 请求只能在请求返回或超时后响应取消。
+- Provider 或模型不支持自定义温度时，需要关闭“发送温度参数”；插件不会根据不断变化的模型名称猜测参数能力。
+- 插件验证各 Provider 的 HTTP 契约，但不会自动发现云端账号可用的模型 ID、区域或额度。
 - 本地稀疏向量适合可解释的轻量检索，但不等价于大型语义 Embedding 模型。
 - Regional JSON/Markdown 需要用户检查后再交给 Regional Prompter。
 - 自定义 System Prompt 仍受 Prompt Policy v2 和安全规则约束。

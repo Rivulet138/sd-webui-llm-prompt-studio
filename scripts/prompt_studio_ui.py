@@ -13,19 +13,22 @@ import gradio as gr
 from starlette.requests import Request
 
 from prompt_studio_core import (
-    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, CredentialStore, StudioDB, build_system_prompt,
-    build_user_message, call_llm, is_sfw_output, process_tags, regional_format, validate_endpoint,
+    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
+    build_system_prompt, build_user_message, call_llm, get_provider_profile, is_sfw_output,
+    process_tags, regional_format, validate_endpoint,
 )
 
 
 DB = StudioDB()
 CREDENTIALS = CredentialStore()
 DEFAULT_LLM_SETTINGS = {
-    "backend": "OpenAI Compatible",
+    "provider": "OpenAI Compatible",
     "endpoint": "http://127.0.0.1:1234/v1",
     "model": "",
     "temperature": 0.35,
     "timeout": 90,
+    "max_tokens": 1024,
+    "send_temperature": True,
 }
 PRESET_UI_CHOICES = [
     ("Danbooru 标签", "Danbooru Tags"),
@@ -48,7 +51,7 @@ OUTPUT_UI_CHOICES = [
     ("Regional JSON", "Regional JSON"),
     ("Regional Markdown", "Regional Markdown"),
 ]
-BACKEND_UI_CHOICES = [("OpenAI 兼容接口", "OpenAI Compatible"), ("Ollama 本地服务", "Ollama")]
+PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
 ACTION_UI_CHOICES = [("扩写", "Expand"), ("润色", "Polish")]
 _PROMPT_TARGETS: dict[str, Any] = {}
 _INLINE_SLOTS: set[str] = set()
@@ -68,6 +71,73 @@ def _refresh_cache(query: str = ""):
 
 def _safe_error(error: Exception) -> str:
     return html.escape(str(error), quote=False)
+
+
+def _connection_store() -> dict[str, Any]:
+    stored = DB.get_setting("llm_connections_v2", {}) or {}
+    if isinstance(stored, dict) and isinstance(stored.get("providers"), dict):
+        return stored
+    legacy = DB.get_setting("llm_connection", {}) or {}
+    provider = str(legacy.get("provider") or legacy.get("backend") or DEFAULT_LLM_SETTINGS["provider"])
+    if provider not in PROVIDER_PROFILES:
+        provider = DEFAULT_LLM_SETTINGS["provider"]
+    return {"version": 2, "active_provider": provider, "providers": {provider: {
+        "endpoint": legacy.get("endpoint") or get_provider_profile(provider)["default_endpoint"],
+        "model": legacy.get("model") or "",
+        "temperature": legacy.get("temperature", DEFAULT_LLM_SETTINGS["temperature"]),
+        "timeout": legacy.get("timeout", DEFAULT_LLM_SETTINGS["timeout"]),
+        "max_tokens": legacy.get("max_tokens", DEFAULT_LLM_SETTINGS["max_tokens"]),
+        "send_temperature": legacy.get("send_temperature", get_provider_profile(provider)["send_temperature"]),
+    }}}
+
+
+def _connection_settings(provider: str | None = None) -> dict[str, Any]:
+    store = _connection_store()
+    provider = str(provider or store.get("active_provider") or DEFAULT_LLM_SETTINGS["provider"])
+    if provider not in PROVIDER_PROFILES:
+        provider = DEFAULT_LLM_SETTINGS["provider"]
+    profile = get_provider_profile(provider)
+    saved = store.get("providers", {}).get(provider, {})
+    if not isinstance(saved, dict):
+        saved = {}
+    try:
+        temperature = max(0.0, min(float(saved.get("temperature", DEFAULT_LLM_SETTINGS["temperature"])), 2.0))
+    except (TypeError, ValueError):
+        temperature = DEFAULT_LLM_SETTINGS["temperature"]
+    try:
+        timeout = max(5, min(int(saved.get("timeout", DEFAULT_LLM_SETTINGS["timeout"])), 600))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_LLM_SETTINGS["timeout"]
+    try:
+        max_tokens = max(0, min(int(saved.get("max_tokens", DEFAULT_LLM_SETTINGS["max_tokens"])), 262144))
+    except (TypeError, ValueError):
+        max_tokens = DEFAULT_LLM_SETTINGS["max_tokens"]
+    return {
+        "provider": provider,
+        "endpoint": str(saved.get("endpoint") or profile["default_endpoint"]),
+        "model": str(saved.get("model") or ""),
+        "temperature": temperature,
+        "timeout": timeout,
+        "max_tokens": max_tokens,
+        "send_temperature": bool(saved.get("send_temperature", profile["send_temperature"])),
+    }
+
+
+def _credential_status(provider: str, endpoint: str) -> str:
+    if CREDENTIALS.has_matching(provider, endpoint):
+        return "已找到该 Provider 与 URL 对应的服务端 API Key。"
+    if get_provider_profile(provider).get("requires_api_key"):
+        return "该 Provider 需要 API Key；保存后输入框可留空。"
+    return "该 Provider 默认不要求 API Key；如代理服务要求认证仍可填写。"
+
+
+def _load_provider_settings(provider):
+    settings = _connection_settings(provider)
+    return (
+        settings["endpoint"], settings["model"], settings["temperature"], settings["timeout"],
+        settings["max_tokens"], settings["send_temperature"],
+        _credential_status(settings["provider"], settings["endpoint"]),
+    )
 
 
 def _load_record(record_id):
@@ -169,7 +239,7 @@ def _cancel_batch_generation():
 def _batch_generate(
     source_text, skip_existing, retries, batch_score,
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-    backend, endpoint, model, api_key, temperature, timeout, few_shot_count, rag_min_score,
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
 ):
     sources = []
@@ -212,7 +282,7 @@ def _batch_generate(
             for _attempt in range(max(0, min(int(retries or 0), 3)) + 1):
                 generated, _system, last_status = _generate(
                     source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-                    backend, endpoint, model, api_key, temperature, timeout, few_shot_count, rag_min_score,
+                    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     batch_score, False,
                 )
@@ -246,26 +316,50 @@ def _search_wildcards(query):
     return gr.update(value=DB.wildcard_matches(query))
 
 
-def _save_llm_settings(backend, endpoint, model, api_key, temperature, timeout):
-    DB.set_setting("llm_connection", {
-        "backend": backend,
-        "endpoint": str(endpoint or "").strip(),
-        "model": str(model or "").strip(),
-        "temperature": float(temperature or DEFAULT_LLM_SETTINGS["temperature"]),
-        "timeout": int(timeout or DEFAULT_LLM_SETTINGS["timeout"]),
-    })
-    key_saved = CREDENTIALS.save(backend, endpoint, api_key)
-    key_available = key_saved or CREDENTIALS.has_matching(backend, endpoint)
-    return "LLM 设置已保存。" + ("API Key 已保存在服务端，下次可留空。" if key_available else "本次未保存 API Key。")
+def _save_llm_settings(provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
+    provider = str(provider or DEFAULT_LLM_SETTINGS["provider"])
+    if provider not in PROVIDER_PROFILES:
+        return "保存失败：不支持的 Provider。", gr.update()
+    try:
+        endpoint = validate_endpoint(endpoint)
+        settings = {
+            "endpoint": endpoint,
+            "model": str(model or "").strip(),
+            "temperature": max(0.0, min(float(temperature), 2.0)),
+            "timeout": max(5, min(int(timeout), 600)),
+            "max_tokens": max(0, min(int(max_tokens), 262144)),
+            "send_temperature": bool(send_temperature),
+        }
+    except (TypeError, ValueError) as error:
+        return f"保存失败：{_safe_error(error)}", gr.update()
+    store = _connection_store()
+    providers = dict(store.get("providers", {}))
+    providers[provider] = settings
+    DB.set_setting("llm_connections_v2", {"version": 2, "active_provider": provider, "providers": providers})
+    DB.set_setting("llm_connection", {"backend": provider, **settings})
+    key_saved = CREDENTIALS.save(provider, endpoint, api_key)
+    key_available = key_saved or CREDENTIALS.has_matching(provider, endpoint)
+    message = f"{provider} 设置已保存，URL、模型和生成参数下次会自动恢复。"
+    if key_available:
+        message += " API Key 已按 Provider 与 URL 保存在服务端，下次可留空。"
+    elif get_provider_profile(provider).get("requires_api_key"):
+        message += " 尚未保存 API Key，调用前必须填写。"
+    else:
+        message += " 当前未保存 API Key。"
+    return message, gr.update(value=endpoint)
 
 
-def _clear_llm_credentials():
-    return "已清除保存的 API Key。" if CREDENTIALS.clear() else "当前没有已保存的 API Key。"
+def _clear_llm_credentials(provider, endpoint):
+    try:
+        cleared = CREDENTIALS.clear(provider, validate_endpoint(endpoint))
+    except ValueError as error:
+        return f"清除失败：{_safe_error(error)}"
+    return "已清除当前 Provider 与 URL 对应的 API Key。" if cleared else "当前连接没有已保存的 API Key。"
 
 
 def _generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-    backend, endpoint, model, api_key, temperature, timeout, few_shot_count, rag_min_score,
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     save_score, cache_result,
 ):
@@ -276,8 +370,8 @@ def _generate(
     static_tags = DB.wildcard_matches(source, 40)
     system = build_system_prompt(preset, base_model, safety, nsfw_injection, user_instruction, examples, static_tags, system_override)
     try:
-        resolved_key = CREDENTIALS.resolve(api_key, backend, endpoint)
-        result = call_llm(backend, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90))
+        resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
+        result = call_llm(provider, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0), bool(send_temperature))
     except Exception as error:
         return "", system, f"生成失败：{_safe_error(error)}"
     if safety == "SFW" and not is_sfw_output(result):
@@ -291,21 +385,24 @@ def _generate(
     return result, system, f"生成完成，使用 {len(examples)} 条 RAG 示例" + ("，结果已缓存" if cache_result else "")
 
 
-def _expand_or_polish(source, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, backend, endpoint, model, api_key, temperature, timeout):
+def _expand_or_polish(source, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
     instruction = "Expand this while keeping all explicit facts and the requested output format." if action == "Expand" else "Polish this for clarity, visual specificity, and model compatibility without adding unsupported facts."
     system = build_system_prompt(preset, base_model, safety, nsfw_injection, f"{user_instruction}\n{instruction}", [], system_override=system_override)
     try:
-        resolved_key = CREDENTIALS.resolve(api_key, backend, endpoint)
-        return call_llm(backend, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90)), "LLM 提示词处理完成"
+        resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
+        return call_llm(provider, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0), bool(send_temperature)), "LLM 提示词处理完成"
     except Exception as error:
         return "", f"处理失败：{_safe_error(error)}"
 
 
-def _test_connection(backend, endpoint, model, api_key, timeout):
+def _test_connection(provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
     try:
-        resolved_key = CREDENTIALS.resolve(api_key, backend, endpoint)
-        output = call_llm(backend, endpoint, model, resolved_key, "Reply exactly: READY", "Connection test", 0, int(timeout or 30))
-        return f"连接成功：{output[:160]}"
+        resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
+        output = call_llm(
+            provider, endpoint, model, resolved_key, "Reply exactly: READY", "Connection test",
+            float(temperature or 0), int(timeout or 30), max(16, min(int(max_tokens or 64), 64)), bool(send_temperature),
+        )
+        return f"{provider} 连接成功：{output[:160]}"
     except Exception as error:
         return f"连接失败：{_safe_error(error)}"
 
@@ -350,7 +447,7 @@ def inject_inline_before_negative(component, **kwargs):
 
 
 def _create_inline_panel(slot, prompt_target):
-    settings = {**DEFAULT_LLM_SETTINGS, **(DB.get_setting("llm_connection", {}) or {})}
+    settings = _connection_settings()
     with gr.Accordion("LLM 提示词工作室", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
         gr.Markdown("生成结果会直接写入上方正向提示词。系统策略和模型规则优先于用户要求；RAG 与静态词库仅作为参考数据。")
         with gr.Row():
@@ -368,18 +465,20 @@ def _create_inline_panel(slot, prompt_target):
                 region_count = gr.Slider(label="区域数量", minimum=1, maximum=8, value=2, step=1)
         with gr.Accordion("LLM 连接设置", open=False):
             with gr.Row():
-                backend = gr.Radio(label="后端", choices=BACKEND_UI_CHOICES, value=settings["backend"])
+                provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=settings["provider"])
                 endpoint = gr.Textbox(label="接口地址", value=settings["endpoint"])
                 model = gr.Textbox(label="模型 ID", value=settings["model"])
                 api_key = gr.Textbox(label="API Key（留空则使用已保存凭据）", type="password")
-                temperature = gr.Slider(label="温度", minimum=0, maximum=1.5, value=settings["temperature"], step=0.05)
-                timeout = gr.Slider(label="超时秒数", minimum=10, maximum=300, value=settings["timeout"], step=5)
+                temperature = gr.Slider(label="温度", minimum=0, maximum=2, value=settings["temperature"], step=0.05)
+                timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=settings["timeout"], step=5)
             with gr.Row():
+                max_tokens = gr.Number(label="最大输出 Token（0 表示使用 Provider 默认值）", value=settings["max_tokens"], precision=0)
+                send_temperature = gr.Checkbox(label="发送温度参数（推理模型不支持时关闭）", value=settings["send_temperature"])
+            with gr.Row():
+                test = gr.Button("测试 API")
                 save_connection = gr.Button("保存全部 LLM 设置")
                 clear_credentials = gr.Button("清除已保存的 API Key")
-            connection_status = gr.Markdown(
-                "已找到可复用的 API Key。" if CREDENTIALS.has_matching(settings["backend"], settings["endpoint"]) else ""
-            )
+            connection_status = gr.Markdown(_credential_status(settings["provider"], settings["endpoint"]))
         with gr.Accordion("标签处理与 RAG", open=False):
             with gr.Row():
                 remove_bad = gr.Checkbox(label="移除不良标签", value=True)
@@ -396,10 +495,12 @@ def _create_inline_panel(slot, prompt_target):
         output = gr.Textbox(label="生成的提示词", lines=5)
         system_preview = gr.Textbox(label="最终 System Prompt 与策略", lines=8)
         status = gr.Markdown()
-        inputs = [request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, backend, endpoint, model, api_key, temperature, timeout, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result]
+        inputs = [request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result]
         generate.click(_inline_generate, inputs=inputs, outputs=[output, system_preview, status, prompt_target])
-        save_connection.click(_save_llm_settings, inputs=[backend, endpoint, model, api_key, temperature, timeout], outputs=connection_status)
-        clear_credentials.click(_clear_llm_credentials, outputs=connection_status)
+        provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, connection_status])
+        test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=connection_status)
+        save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[connection_status, endpoint])
+        clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=connection_status)
 
 
 def _wd14_interrogate(image, endpoint, model, threshold):
@@ -423,25 +524,35 @@ def _wd14_interrogate(image, endpoint, model, threshold):
 
 
 def _api_generate(payload: dict[str, Any]):
-    saved_connection = {**DEFAULT_LLM_SETTINGS, **(DB.get_setting("llm_connection", {}) or {})}
+    saved_connection = _connection_settings()
     defaults = {
         "preset": "Danbooru Tags", "system_override": "", "base_model": "Auto / checkpoint default", "safety": "SFW",
-        "backend": saved_connection["backend"], "endpoint": saved_connection["endpoint"], "model": saved_connection["model"], "api_key": "",
-        "temperature": 0.35, "timeout": 90, "few_shot_count": 3, "rag_min_score": 0,
+        "provider": saved_connection["provider"], "endpoint": saved_connection["endpoint"], "model": saved_connection["model"], "api_key": "",
+        "temperature": saved_connection["temperature"], "timeout": saved_connection["timeout"],
+        "max_tokens": saved_connection["max_tokens"], "send_temperature": saved_connection["send_temperature"],
+        "few_shot_count": 3, "rag_min_score": 0,
         "remove_bad": True, "remove_terms": "", "shuffle": False, "spaces": False, "max_tags": 0,
         "structured_mode": "Plain Prompt", "region_count": 1, "save_score": 0, "cache_result": False,
         "nsfw_injection": "", "user_instruction": "", "source_tags": "",
     }
-    payload = payload or {}
+    payload = dict(payload or {})
+    allowed_fields = set(defaults) | {"request", "backend"}
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    if unknown_fields:
+        raise ValueError(f"API request contains unsupported fields: {', '.join(unknown_fields)}")
+    if "backend" in payload:
+        if "provider" in payload and payload["provider"] != payload["backend"]:
+            raise ValueError("API provider and legacy backend values conflict")
+        payload["provider"] = payload.pop("backend")
     if payload.get("api_key"):
         raise ValueError("API Key cannot be supplied through the plugin API; save it in the Chinese UI")
-    if "backend" in payload and payload["backend"] != saved_connection["backend"]:
-        raise ValueError("API backend must match the connection saved in the plugin UI")
+    if "provider" in payload and payload["provider"] != saved_connection["provider"]:
+        raise ValueError("API Provider must match the active connection saved in the plugin UI")
     if "endpoint" in payload and validate_endpoint(payload["endpoint"]) != validate_endpoint(saved_connection["endpoint"]):
         raise ValueError("API endpoint must match the connection saved in the plugin UI")
     values = {**defaults, **(payload or {})}
     generated, system, status = _generate(values.get("request", ""), *[values[key] for key in [
-        "source_tags", "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction", "backend", "endpoint", "model", "api_key", "temperature", "timeout", "few_shot_count", "rag_min_score", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags", "structured_mode", "region_count", "save_score", "cache_result"
+        "source_tags", "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction", "provider", "endpoint", "model", "api_key", "temperature", "timeout", "max_tokens", "send_temperature", "few_shot_count", "rag_min_score", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags", "structured_mode", "region_count", "save_score", "cache_result"
     ]])
     if not generated:
         raise ValueError(status)
@@ -497,7 +608,7 @@ def on_app_started(_, app):
 
 
 def on_ui_tabs():
-    llm_settings = {**DEFAULT_LLM_SETTINGS, **(DB.get_setting("llm_connection", {}) or {})}
+    llm_settings = _connection_settings()
     with gr.Blocks(analytics_enabled=False, elem_id="llm_prompt_studio") as ui:
         gr.Markdown("## LLM 提示词工作室\n本地静态词库、RAG Few-Shot、提示词缓存与 Forge 扩展集成。")
         with gr.Tabs():
@@ -531,19 +642,19 @@ def on_ui_tabs():
                 system_preview = gr.Textbox(label="最终 System Prompt", lines=12)
                 status = gr.Markdown()
             with gr.Tab("LLM 连接"):
-                backend = gr.Radio(label="后端", choices=BACKEND_UI_CHOICES, value=llm_settings["backend"])
+                provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=llm_settings["provider"])
                 endpoint = gr.Textbox(label="接口地址", value=llm_settings["endpoint"])
                 model = gr.Textbox(label="模型 ID", value=llm_settings["model"], placeholder="填写服务端暴露的模型名称")
                 api_key = gr.Textbox(label="API Key（留空则使用已保存凭据）", type="password")
-                temperature = gr.Slider(label="温度", minimum=0, maximum=1.5, value=llm_settings["temperature"], step=0.05)
-                timeout = gr.Slider(label="超时秒数", minimum=10, maximum=300, value=llm_settings["timeout"], step=5)
+                temperature = gr.Slider(label="温度", minimum=0, maximum=2, value=llm_settings["temperature"], step=0.05)
+                timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=llm_settings["timeout"], step=5)
+                max_tokens = gr.Number(label="最大输出 Token（0 表示使用 Provider 默认值）", value=llm_settings["max_tokens"], precision=0)
+                send_temperature = gr.Checkbox(label="发送温度参数（推理模型不支持时关闭）", value=llm_settings["send_temperature"])
                 test = gr.Button("测试 API")
                 with gr.Row():
                     save_connection = gr.Button("保存全部 LLM 设置")
                     clear_credentials = gr.Button("清除已保存的 API Key")
-                test_status = gr.Markdown(
-                    "已找到可复用的 API Key。" if CREDENTIALS.has_matching(llm_settings["backend"], llm_settings["endpoint"]) else ""
-                )
+                test_status = gr.Markdown(_credential_status(llm_settings["provider"], llm_settings["endpoint"]))
             with gr.Tab("静态词库"):
                 wildcard_path = gr.Textbox(label="静态词库目录", value=str(DEFAULT_WILDCARDS))
                 index = gr.Button("建立 / 刷新本地索引")
@@ -604,14 +715,15 @@ def on_ui_tabs():
                         export_format = gr.Radio(label="导出格式", choices=["JSON", "CSV"], value="JSON")
                         export_button = gr.Button("导出全部缓存")
                     export_file = gr.File(label="导出文件", interactive=False)
-        generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, backend, endpoint, model, api_key, temperature, timeout, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
-        test.click(_test_connection, inputs=[backend, endpoint, model, api_key, timeout], outputs=test_status)
-        save_connection.click(_save_llm_settings, inputs=[backend, endpoint, model, api_key, temperature, timeout], outputs=test_status)
-        clear_credentials.click(_clear_llm_credentials, outputs=test_status)
+        generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
+        provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
+        test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
+        save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint])
+        clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
         index.click(_index_wildcards, inputs=wildcard_path, outputs=[wildcard_status, wildcard_results])
         wildcard_query.change(_search_wildcards, inputs=wildcard_query, outputs=wildcard_results)
         interrogate.click(_wd14_interrogate, inputs=[image, wd_endpoint, wd_model, wd_threshold], outputs=[wd_tags, wd_status])
-        transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, backend, endpoint, model, api_key, temperature, timeout], outputs=[transform_output, wd_status])
+        transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[transform_output, wd_status])
         refresh.click(_refresh_cache, inputs=cache_query, outputs=[table, cache_status])
         cache_query.submit(_refresh_cache, inputs=cache_query, outputs=[table, cache_status])
         load.click(_load_record, inputs=record_id, outputs=[record_prompt, record_negative, record_score, record_tags, cache_status])
@@ -620,7 +732,7 @@ def on_ui_tabs():
         bulk_import_button.click(_bulk_cache, inputs=[bulk_import, preset, base_model, record_score], outputs=[cache_status, table])
         batch_generate.click(
             _batch_generate,
-            inputs=[batch_sources, batch_skip_existing, batch_retries, batch_score, preset, system_override, base_model, safety, nsfw_injection, user_instruction, backend, endpoint, model, api_key, temperature, timeout, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count],
+            inputs=[batch_sources, batch_skip_existing, batch_retries, batch_score, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count],
             outputs=[cache_status, table],
         )
         batch_cancel.click(_cancel_batch_generation, outputs=cache_status)

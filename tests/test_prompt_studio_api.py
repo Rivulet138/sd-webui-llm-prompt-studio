@@ -93,6 +93,95 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 401)
         self.assertEqual(valid.status_code, 200)
 
+    async def test_provider_settings_and_keys_are_restored_independently(self):
+        message, _ = ui._save_llm_settings(
+            "Anthropic", "https://api.anthropic.com/", "claude-test", "anthropic-key", 0.2, 120, 2048, False,
+        )
+        self.assertIn("Anthropic 设置已保存", message)
+        message, _ = ui._save_llm_settings(
+            "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-test", "gemini-key", 0.6, 80, 4096, True,
+        )
+        self.assertIn("Google Gemini 设置已保存", message)
+
+        anthropic = ui._connection_settings("Anthropic")
+        gemini = ui._connection_settings("Google Gemini")
+        self.assertEqual(anthropic["endpoint"], "https://api.anthropic.com")
+        self.assertEqual(anthropic["model"], "claude-test")
+        self.assertFalse(anthropic["send_temperature"])
+        self.assertEqual(gemini["max_tokens"], 4096)
+        self.assertEqual(ui.CREDENTIALS.resolve("", "Anthropic", anthropic["endpoint"]), "anthropic-key")
+        self.assertEqual(ui.CREDENTIALS.resolve("", "Google Gemini", gemini["endpoint"]), "gemini-key")
+
+        ui._clear_llm_credentials("Anthropic", anthropic["endpoint"])
+        self.assertEqual(ui.CREDENTIALS.resolve("", "Anthropic", anthropic["endpoint"]), "")
+        self.assertEqual(ui.CREDENTIALS.resolve("", "Google Gemini", gemini["endpoint"]), "gemini-key")
+
+    async def test_provider_ui_choices_are_derived_from_registry(self):
+        self.assertEqual(
+            [provider for _, provider in ui.PROVIDER_UI_CHOICES],
+            list(ui.PROVIDER_PROFILES),
+        )
+        self.assertTrue(all(label == ui.PROVIDER_PROFILES[provider]["ui_label"] for label, provider in ui.PROVIDER_UI_CHOICES))
+
+    async def test_v2_connection_settings_take_priority_over_legacy_mirror(self):
+        ui.DB.set_setting("llm_connection", {
+            "backend": "OpenAI Compatible",
+            "endpoint": "http://127.0.0.1:9999/v1",
+            "model": "stale-legacy-model",
+        })
+        ui.DB.set_setting("llm_connections_v2", {
+            "version": 2,
+            "active_provider": "Anthropic",
+            "providers": {
+                "Anthropic": {
+                    "endpoint": "https://api.anthropic.com",
+                    "model": "current-v2-model",
+                    "temperature": 0.1,
+                    "timeout": 120,
+                    "max_tokens": 2048,
+                    "send_temperature": False,
+                }
+            },
+        })
+
+        settings = ui._connection_settings()
+        self.assertEqual(settings["provider"], "Anthropic")
+        self.assertEqual(settings["model"], "current-v2-model")
+        self.assertEqual(settings["endpoint"], "https://api.anthropic.com")
+
+    async def test_generate_api_rejects_unknown_fields(self):
+        self._install_shared("")
+        app = FastAPI()
+        ui.on_app_started(None, app)
+
+        response = await self._request(
+            app,
+            "127.0.0.1",
+            "POST",
+            "/llm-prompt-studio/v1/generate",
+            json={"request": "red-haired girl", "future_internal_secret": "blocked"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("unsupported fields", response.json()["detail"])
+
+    async def test_connection_probe_uses_current_temperature_settings(self):
+        captured = []
+        ui.call_llm = lambda *args, **kwargs: captured.append((args, kwargs)) or "READY"
+
+        result = ui._test_connection(
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.7, 45, 512, True,
+        )
+
+        self.assertIn("连接成功", result)
+        args, kwargs = captured[0]
+        self.assertFalse(kwargs)
+        self.assertEqual(args[6], 0.7)
+        self.assertEqual(args[7], 45)
+        self.assertEqual(args[8], 64)
+        self.assertTrue(args[9])
+
 
 if __name__ == "__main__":
     unittest.main()

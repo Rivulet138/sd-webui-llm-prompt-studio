@@ -1,10 +1,17 @@
+import json
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from prompt_studio_core import BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, CredentialStore, StudioDB, build_system_prompt, build_user_message, is_sfw_output, process_tags, regional_format, validate_endpoint
+from prompt_studio_core import (
+    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
+    build_provider_request, build_system_prompt, build_user_message, call_llm, extract_provider_text,
+    is_sfw_output, process_tags, regional_format, validate_endpoint,
+)
 
 
 class PromptStudioCoreTests(unittest.TestCase):
@@ -125,6 +132,28 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertTrue(store.clear())
             self.assertFalse(store.has_matching("OpenAI Compatible", "http://127.0.0.1:1234/v1"))
 
+    def test_credentials_preserve_multiple_provider_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = CredentialStore(Path(directory) / "credentials.json")
+            self.assertTrue(store.save("OpenAI", "https://api.openai.com/v1", "openai-key"))
+            self.assertTrue(store.save("Anthropic", "https://api.anthropic.com", "anthropic-key"))
+            self.assertEqual(store.resolve("", "OpenAI", "https://api.openai.com/v1"), "openai-key")
+            self.assertEqual(store.resolve("", "Anthropic", "https://api.anthropic.com"), "anthropic-key")
+            self.assertTrue(store.clear("OpenAI", "https://api.openai.com/v1"))
+            self.assertEqual(store.resolve("", "OpenAI", "https://api.openai.com/v1"), "")
+            self.assertEqual(store.resolve("", "Anthropic", "https://api.anthropic.com"), "anthropic-key")
+
+    def test_legacy_credential_file_is_migrated_on_next_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.json"
+            path.write_text('{"backend":"OpenAI Compatible","endpoint":"http://localhost:1234/v1","api_key":"legacy"}', encoding="utf-8")
+            store = CredentialStore(path)
+            self.assertEqual(store.resolve("", "OpenAI Compatible", "http://localhost:1234/v1"), "legacy")
+            store.save("Anthropic", "https://api.anthropic.com", "new-key")
+            self.assertEqual(store.load()["version"], 2)
+            self.assertEqual(store.resolve("", "OpenAI Compatible", "http://localhost:1234/v1"), "legacy")
+            self.assertEqual(store.resolve("", "Anthropic", "https://api.anthropic.com"), "new-key")
+
     def test_regional_json_is_structured(self):
         self.assertIn('"regions"', regional_format("hero", "Regional JSON", 2))
 
@@ -168,9 +197,129 @@ class PromptStudioCoreTests(unittest.TestCase):
 
     def test_endpoint_validation_rejects_unsafe_url_shapes(self):
         self.assertEqual(validate_endpoint("http://127.0.0.1:1234/v1/"), "http://127.0.0.1:1234/v1")
-        for endpoint in ["file:///etc/passwd", "localhost:1234", "http://user:pass@localhost/v1", "http://localhost/v1#fragment"]:
+        for endpoint in ["file:///etc/passwd", "localhost:1234", "http://user:pass@localhost/v1", "http://localhost/v1?key=secret", "http://localhost/v1#fragment"]:
             with self.assertRaises(ValueError):
                 validate_endpoint(endpoint)
+
+    def test_major_provider_request_contracts(self):
+        self.assertIn("OpenAI", PROVIDER_PROFILES)
+        url, payload, headers = build_provider_request(
+            "OpenAI", "https://api.openai.com/v1", "gpt-test", "key", "system", "user", 0.4, 500, False,
+        )
+        self.assertEqual(url, "https://api.openai.com/v1/responses")
+        self.assertEqual(payload["instructions"], "system")
+        self.assertEqual(payload["max_output_tokens"], 500)
+        self.assertNotIn("temperature", payload)
+        self.assertEqual(headers["Authorization"], "Bearer key")
+        self.assertEqual(
+            build_provider_request("OpenAI", "https://api.openai.com", "gpt-test", "key", "s", "u", 0, 0, False)[0],
+            "https://api.openai.com/v1/responses",
+        )
+
+        url, payload, _ = build_provider_request(
+            "OpenAI Chat Completions", "https://api.openai.com/v1/chat/completions", "gpt-test", "key", "system", "user", 0.4, 600, False,
+        )
+        self.assertEqual(url, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(payload["max_completion_tokens"], 600)
+
+        url, payload, headers = build_provider_request(
+            "OpenRouter", "https://openrouter.ai/api/v1", "vendor/model", "key", "system", "user", 0.5, 700, True,
+        )
+        self.assertEqual(url, "https://openrouter.ai/api/v1/chat/completions")
+        self.assertEqual(payload["max_tokens"], 700)
+        self.assertEqual(payload["temperature"], 0.5)
+        self.assertEqual(headers["X-OpenRouter-Title"], "LLM Prompt Studio")
+
+        url, payload, headers = build_provider_request(
+            "Anthropic", "https://api.anthropic.com", "claude-test", "key", "system", "user", 0.2, 800, False,
+        )
+        self.assertEqual(url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(payload["system"], "system")
+        self.assertEqual(payload["max_tokens"], 800)
+        self.assertNotIn("temperature", payload)
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        self.assertEqual(
+            build_provider_request("Anthropic", "https://api.anthropic.com/v1", "claude-test", "key", "s", "u", 0, 10, False)[0],
+            "https://api.anthropic.com/v1/messages",
+        )
+
+        url, payload, headers = build_provider_request(
+            "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", "models/gemini-test", "key", "system", "user", 0.3, 900, True,
+        )
+        self.assertEqual(url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent")
+        self.assertEqual(payload["system_instruction"]["parts"][0]["text"], "system")
+        self.assertEqual(payload["generationConfig"]["maxOutputTokens"], 900)
+        self.assertEqual(headers["x-goog-api-key"], "key")
+
+        url, payload, _ = build_provider_request(
+            "Ollama", "http://127.0.0.1:11434", "qwen-test", "", "system", "user", 0.6, 1000, True,
+        )
+        self.assertEqual(url, "http://127.0.0.1:11434/api/chat")
+        self.assertFalse(payload["stream"])
+        self.assertEqual(payload["options"], {"num_predict": 1000, "temperature": 0.6})
+        self.assertEqual(
+            build_provider_request("Ollama", "http://127.0.0.1:11434/api", "qwen-test", "", "s", "u", 0, 0, False)[0],
+            "http://127.0.0.1:11434/api/chat",
+        )
+
+    def test_major_provider_response_contracts(self):
+        self.assertEqual(extract_provider_text("OpenAI", {"output": [{"type": "message", "content": [{"type": "output_text", "text": "openai"}]}]}), "openai")
+        self.assertEqual(extract_provider_text("OpenRouter", {"choices": [{"message": {"content": "openrouter"}}]}), "openrouter")
+        self.assertEqual(extract_provider_text("Anthropic", {"content": [{"type": "text", "text": "anthropic"}]}), "anthropic")
+        self.assertEqual(extract_provider_text("Google Gemini", {"candidates": [{"content": {"parts": [{"text": "gemini"}]}}]}), "gemini")
+        self.assertEqual(extract_provider_text("Ollama", {"message": {"content": "ollama"}}), "ollama")
+        with self.assertRaisesRegex(RuntimeError, "SAFETY"):
+            extract_provider_text("Google Gemini", {"promptFeedback": {"blockReason": "SAFETY"}})
+
+    def test_provider_http_round_trip_uses_wire_adapters(self):
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                received.append({"path": self.path, "headers": {key.lower(): value for key, value in self.headers.items()}, "body": body})
+                if self.path == "/v1/responses":
+                    response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": "openai"}]}]}
+                elif self.path == "/v1/messages":
+                    response = {"content": [{"type": "text", "text": "anthropic"}]}
+                elif self.path.startswith("/models/"):
+                    response = {"candidates": [{"content": {"parts": [{"text": "gemini"}]}}]}
+                elif self.path == "/api/chat":
+                    response = {"message": {"content": "ollama"}}
+                else:
+                    response = {"choices": [{"message": {"content": "compatible"}}]}
+                encoded = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, _format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            self.assertEqual(call_llm("OpenAI", base, "gpt-test", "key", "system", "user", max_tokens=32, send_temperature=False), "openai")
+            self.assertEqual(call_llm("OpenRouter", base, "vendor/model", "key", "system", "user", max_tokens=32), "compatible")
+            self.assertEqual(call_llm("Anthropic", base, "claude-test", "key", "system", "user", max_tokens=32, send_temperature=False), "anthropic")
+            self.assertEqual(call_llm("Google Gemini", base, "gemini-test", "key", "system", "user", max_tokens=32), "gemini")
+            self.assertEqual(call_llm("Ollama", base, "qwen-test", "", "system", "user", max_tokens=32), "ollama")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual([item["path"] for item in received], [
+            "/v1/responses", "/chat/completions", "/v1/messages", "/models/gemini-test:generateContent", "/api/chat",
+        ])
+        self.assertEqual(received[0]["headers"]["authorization"], "Bearer key")
+        self.assertEqual(received[2]["headers"]["anthropic-version"], "2023-06-01")
+        self.assertEqual(received[3]["headers"]["x-goog-api-key"], "key")
 
 
 if __name__ == "__main__":

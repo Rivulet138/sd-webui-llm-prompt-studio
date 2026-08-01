@@ -65,6 +65,84 @@ BASE_MODEL_GUIDANCE = {
     "Krea 2": "Use one compact natural-language description in this order: medium, subject count/identity, appearance/clothing, action, scene/objects, framing, time/weather/light, color/material, one style anchor. Do not use tag dumps, score tags, quality filler, or explicit weights.",
 }
 
+PROVIDER_PROFILES = {
+    "OpenAI": {
+        "ui_label": "OpenAI（Responses，官方推荐）",
+        "protocol": "openai_responses",
+        "default_endpoint": "https://api.openai.com/v1",
+        "requires_api_key": True,
+        "send_temperature": False,
+    },
+    "OpenAI Chat Completions": {
+        "ui_label": "OpenAI Chat Completions",
+        "protocol": "openai_chat",
+        "default_endpoint": "https://api.openai.com/v1",
+        "requires_api_key": True,
+        "send_temperature": False,
+        "token_parameter": "max_completion_tokens",
+    },
+    "OpenRouter": {
+        "ui_label": "OpenRouter",
+        "protocol": "openai_chat",
+        "default_endpoint": "https://openrouter.ai/api/v1",
+        "requires_api_key": True,
+        "send_temperature": True,
+        "token_parameter": "max_tokens",
+    },
+    "Anthropic": {
+        "ui_label": "Anthropic Claude",
+        "protocol": "anthropic_messages",
+        "default_endpoint": "https://api.anthropic.com",
+        "requires_api_key": True,
+        "send_temperature": False,
+    },
+    "Google Gemini": {
+        "ui_label": "Google Gemini",
+        "protocol": "gemini_generate_content",
+        "default_endpoint": "https://generativelanguage.googleapis.com/v1beta",
+        "requires_api_key": True,
+        "send_temperature": True,
+    },
+    "DeepSeek": {
+        "ui_label": "DeepSeek",
+        "protocol": "openai_chat",
+        "default_endpoint": "https://api.deepseek.com",
+        "requires_api_key": True,
+        "send_temperature": True,
+        "token_parameter": "max_tokens",
+    },
+    "Ollama": {
+        "ui_label": "Ollama 本地服务",
+        "protocol": "ollama_chat",
+        "default_endpoint": "http://127.0.0.1:11434",
+        "requires_api_key": False,
+        "send_temperature": True,
+    },
+    "LM Studio": {
+        "ui_label": "LM Studio 本地服务",
+        "protocol": "openai_chat",
+        "default_endpoint": "http://127.0.0.1:1234/v1",
+        "requires_api_key": False,
+        "send_temperature": True,
+        "token_parameter": "max_tokens",
+    },
+    "OpenAI Compatible": {
+        "ui_label": "自定义 OpenAI 兼容接口",
+        "protocol": "openai_chat",
+        "default_endpoint": "http://127.0.0.1:1234/v1",
+        "requires_api_key": False,
+        "send_temperature": True,
+        "token_parameter": "max_tokens",
+    },
+}
+
+
+def get_provider_profile(provider: str) -> dict[str, Any]:
+    provider = str(provider or "OpenAI Compatible").strip()
+    if provider not in PROVIDER_PROFILES:
+        raise ValueError(f"Unsupported LLM Provider: {provider}")
+    return PROVIDER_PROFILES[provider]
+
 
 def _tokens(text: str) -> Counter[str]:
     return Counter(re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]{1,4}", (text or "").lower()))
@@ -438,15 +516,36 @@ class StudioDB:
 
 
 class CredentialStore:
-    """Server-side API-key storage; keys are never returned to the browser."""
+    """Versioned server-side API-key storage; keys are never returned to the browser."""
 
     def __init__(self, path: Path = CREDENTIALS_PATH):
         self.path = path
         self.lock = threading.RLock()
 
     @staticmethod
-    def _service_key(backend: str, endpoint: str) -> tuple[str, str]:
-        return str(backend or "").strip(), str(endpoint or "").strip().rstrip("/")
+    def _service_key(provider: str, endpoint: str) -> tuple[str, str]:
+        return str(provider or "").strip(), str(endpoint or "").strip().rstrip("/")
+
+    @classmethod
+    def _service_id(cls, provider: str, endpoint: str) -> str:
+        normalized = "\x1f".join(cls._service_key(provider, endpoint))
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _entries(cls, data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        entries = data.get("credentials") if isinstance(data, dict) else None
+        if isinstance(entries, dict):
+            return {str(key): value for key, value in entries.items() if isinstance(value, dict)}
+        if isinstance(data, dict) and data.get("api_key"):
+            provider = data.get("provider") or data.get("backend") or "OpenAI Compatible"
+            endpoint = data.get("endpoint") or ""
+            return {cls._service_id(provider, endpoint): {
+                "provider": provider,
+                "endpoint": endpoint,
+                "api_key": data.get("api_key"),
+                "updated_at": data.get("updated_at") or 0,
+            }}
+        return {}
 
     def load(self) -> dict[str, Any]:
         with self.lock:
@@ -456,44 +555,63 @@ class CredentialStore:
                 return {}
         return data if isinstance(data, dict) else {}
 
-    def save(self, backend: str, endpoint: str, api_key: str) -> bool:
+    def _write(self, payload: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temporary, self.path)
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+
+    def save(self, provider: str, endpoint: str, api_key: str) -> bool:
         api_key = str(api_key or "").strip()
         if not api_key:
             return False
-        backend, endpoint = self._service_key(backend, endpoint)
-        payload = {"backend": backend, "endpoint": endpoint, "api_key": api_key, "updated_at": int(time.time())}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        provider, endpoint = self._service_key(provider, endpoint)
         with self.lock:
-            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            try:
-                temporary.chmod(0o600)
-            except OSError:
-                pass
-            os.replace(temporary, self.path)
-            try:
-                self.path.chmod(0o600)
-            except OSError:
-                pass
+            entries = self._entries(self.load())
+            entries[self._service_id(provider, endpoint)] = {
+                "provider": provider,
+                "endpoint": endpoint,
+                "api_key": api_key,
+                "updated_at": int(time.time()),
+            }
+            self._write({"version": 2, "credentials": entries})
         return True
 
-    def resolve(self, entered_key: str, backend: str, endpoint: str) -> str:
+    def resolve(self, entered_key: str, provider: str, endpoint: str) -> str:
         entered_key = str(entered_key or "").strip()
         if entered_key:
             return entered_key
-        expected = self._service_key(backend, endpoint)
-        saved = self.load()
-        actual = self._service_key(saved.get("backend", ""), saved.get("endpoint", ""))
-        return str(saved.get("api_key") or "").strip() if actual == expected else ""
+        expected = self._service_key(provider, endpoint)
+        entry = self._entries(self.load()).get(self._service_id(*expected), {})
+        actual = self._service_key(entry.get("provider", ""), entry.get("endpoint", ""))
+        return str(entry.get("api_key") or "").strip() if actual == expected else ""
 
-    def has_matching(self, backend: str, endpoint: str) -> bool:
-        return bool(self.resolve("", backend, endpoint))
+    def has_matching(self, provider: str, endpoint: str) -> bool:
+        return bool(self.resolve("", provider, endpoint))
 
-    def clear(self) -> bool:
+    def clear(self, provider: str | None = None, endpoint: str | None = None) -> bool:
         with self.lock:
             if not self.path.exists():
                 return False
-            self.path.unlink()
+            if provider is None or endpoint is None:
+                self.path.unlink()
+                return True
+            entries = self._entries(self.load())
+            removed = entries.pop(self._service_id(provider, endpoint), None)
+            if not removed:
+                return False
+            if entries:
+                self._write({"version": 2, "credentials": entries})
+            else:
+                self.path.unlink()
             return True
 
 
@@ -573,33 +691,192 @@ def validate_endpoint(endpoint: str) -> str:
     parsed = urllib.parse.urlsplit(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("LLM endpoint must be an absolute HTTP or HTTPS URL")
-    if parsed.username or parsed.password or parsed.fragment:
-        raise ValueError("LLM endpoint cannot contain credentials or a URL fragment")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("LLM endpoint cannot contain credentials, a query string, or a URL fragment")
     try:
         parsed.port
     except ValueError as error:
         raise ValueError("LLM endpoint contains an invalid port") from error
-    return endpoint
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
 
 
-def _request_json(url: str, payload: dict[str, Any], api_key: str = "", timeout: int = 90) -> dict[str, Any]:
-    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {api_key}"} if api_key else {})}, method="POST")
+def build_provider_request(provider: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 0.35, max_tokens: int = 1024, send_temperature: bool = True) -> tuple[str, dict[str, Any], dict[str, str]]:
+    profile = get_provider_profile(provider)
+    protocol = profile["protocol"]
+    endpoint = validate_endpoint(endpoint)
+    model = str(model or "").strip()
+    api_key = str(api_key or "").strip()
+    if not model:
+        raise ValueError("LLM model ID is required")
+    if profile.get("requires_api_key") and not api_key:
+        raise ValueError(f"{provider} requires an API Key")
+    headers = {"Content-Type": "application/json"}
+    limit = max(0, int(max_tokens or 0))
+
+    if protocol == "openai_responses":
+        if endpoint.lower().endswith("/responses"):
+            url = endpoint
+        else:
+            url = endpoint + ("/v1/responses" if not urllib.parse.urlsplit(endpoint).path else "/responses")
+        headers["Authorization"] = f"Bearer {api_key}"
+        payload = {"model": model, "instructions": system, "input": user}
+        if limit:
+            payload["max_output_tokens"] = limit
+        if send_temperature:
+            payload["temperature"] = float(temperature)
+        return url, payload, headers
+
+    if protocol == "openai_chat":
+        if endpoint.lower().endswith("/chat/completions"):
+            url = endpoint
+        elif provider == "OpenAI Chat Completions" and not urllib.parse.urlsplit(endpoint).path:
+            url = endpoint + "/v1/chat/completions"
+        else:
+            url = endpoint + "/chat/completions"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if provider == "OpenRouter":
+            headers["X-OpenRouter-Title"] = "LLM Prompt Studio"
+        payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        if limit:
+            payload[profile.get("token_parameter", "max_tokens")] = limit
+        if send_temperature:
+            payload["temperature"] = float(temperature)
+        return url, payload, headers
+
+    if protocol == "anthropic_messages":
+        if endpoint.lower().endswith("/v1/messages"):
+            url = endpoint
+        elif endpoint.lower().endswith("/v1"):
+            url = endpoint + "/messages"
+        else:
+            url = endpoint + "/v1/messages"
+        headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+        payload = {"model": model, "max_tokens": limit or 1024, "system": system, "messages": [{"role": "user", "content": user}]}
+        if send_temperature:
+            payload["temperature"] = float(temperature)
+        return url, payload, headers
+
+    if protocol == "gemini_generate_content":
+        clean_model = model.removeprefix("models/")
+        suffix = f"/models/{urllib.parse.quote(clean_model, safe='-._')}:generateContent"
+        url = endpoint if endpoint.lower().endswith(":generatecontent") else endpoint + suffix
+        headers["x-goog-api-key"] = api_key
+        generation = {}
+        if limit:
+            generation["maxOutputTokens"] = limit
+        if send_temperature:
+            generation["temperature"] = float(temperature)
+        payload = {
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+        }
+        if generation:
+            payload["generationConfig"] = generation
+        return url, payload, headers
+
+    if protocol == "ollama_chat":
+        if endpoint.lower().endswith("/api/chat"):
+            url = endpoint
+        elif endpoint.lower().endswith("/api"):
+            url = endpoint + "/chat"
+        else:
+            url = endpoint + "/api/chat"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        options = {}
+        if limit:
+            options["num_predict"] = limit
+        if send_temperature:
+            options["temperature"] = float(temperature)
+        payload = {"model": model, "stream": False, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        if options:
+            payload["options"] = options
+        return url, payload, headers
+
+    raise ValueError(f"Unsupported provider protocol: {protocol}")
+
+
+def _extract_error_message(body: bytes) -> str:
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return ""
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("type") or "")[:500]
+    if isinstance(error, str):
+        return error[:500]
+    if isinstance(data, dict):
+        return str(data.get("message") or "")[:500]
+    return ""
+
+
+def _request_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 90) -> dict[str, Any]:
+    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers or {"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
-            return json.loads(response.read().decode("utf-8"))
+            body = response.read(4 * 1024 * 1024 + 1)
+            if len(body) > 4 * 1024 * 1024:
+                raise RuntimeError("LLM response exceeds 4 MiB")
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError("LLM returned an invalid JSON response") from error
+            if not isinstance(data, dict):
+                raise RuntimeError("LLM returned a non-object JSON response")
+            return data
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"LLM HTTP {error.code}: {error.reason}") from error
+        detail = _extract_error_message(error.read(64 * 1024))
+        suffix = f": {detail}" if detail else f": {error.reason}"
+        raise RuntimeError(f"LLM HTTP {error.code}{suffix}") from error
     except urllib.error.URLError as error:
         raise RuntimeError(f"LLM connection failed: {error.reason}") from error
 
 
-def call_llm(backend: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 0.35, timeout: int = 90) -> str:
-    endpoint = validate_endpoint(endpoint)
-    if backend == "Ollama":
-        data = _request_json(endpoint + "/api/chat", {"model": model, "stream": False, "options": {"temperature": temperature}, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, timeout=timeout)
-        return str(data.get("message", {}).get("content", "")).strip()
-    data = _request_json(endpoint + "/chat/completions", {"model": model, "temperature": temperature, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, api_key=api_key, timeout=timeout)
-    return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+def extract_provider_text(provider: str, data: dict[str, Any]) -> str:
+    if data.get("error"):
+        error = data["error"]
+        message = error.get("message") or error.get("type") if isinstance(error, dict) else error
+        raise RuntimeError(f"{provider} error: {message}")
+    protocol = get_provider_profile(provider)["protocol"]
+    chunks = []
+    if protocol == "openai_responses":
+        for item in data.get("output", []):
+            if isinstance(item, dict) and item.get("type") == "message":
+                for content in item.get("content", []):
+                    if isinstance(content, dict) and content.get("type") == "output_text":
+                        chunks.append(str(content.get("text") or ""))
+    elif protocol == "openai_chat":
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            chunks.extend(str(part.get("text") or "") for part in content if isinstance(part, dict))
+        else:
+            chunks.append(str(content or ""))
+    elif protocol == "anthropic_messages":
+        chunks.extend(str(block.get("text") or "") for block in data.get("content", []) if isinstance(block, dict) and block.get("type") == "text")
+    elif protocol == "gemini_generate_content":
+        candidates = data.get("candidates") or []
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            chunks.extend(str(part.get("text") or "") for part in parts if isinstance(part, dict))
+            if not chunks and candidates[0].get("finishReason"):
+                raise RuntimeError(f"Gemini returned no text: {candidates[0]['finishReason']}")
+        elif data.get("promptFeedback"):
+            reason = data["promptFeedback"].get("blockReason") or "unknown safety reason"
+            raise RuntimeError(f"Gemini blocked the prompt: {reason}")
+    elif protocol == "ollama_chat":
+        chunks.append(str(data.get("message", {}).get("content", "")))
+    text = "".join(chunks).strip()
+    if not text:
+        raise RuntimeError(f"{provider} response did not contain assistant text")
+    return text
+
+
+def call_llm(provider: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 0.35, timeout: int = 90, max_tokens: int = 1024, send_temperature: bool = True) -> str:
+    url, payload, headers = build_provider_request(provider, endpoint, model, api_key, system, user, temperature, max_tokens, send_temperature)
+    return extract_provider_text(provider, _request_json(url, payload, headers=headers, timeout=timeout))
 
 
 def regional_format(prompt: str, mode: str, regions: int) -> str:
