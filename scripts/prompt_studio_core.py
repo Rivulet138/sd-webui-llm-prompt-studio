@@ -695,7 +695,7 @@ def build_system_prompt(preset: str, base_model: str, safety: str, nsfw_injectio
     if safety == "SFW":
         system += "\n\nSafety mode: SFW. Do not generate sexual, explicit, fetish, nudity-focused, or unsafe content. Keep subjects clothed and non-sexualized."
     else:
-        system += "\n\nSafety mode: NSFW. Follow the user's allowed local workflow while still refusing illegal sexual content, minors, coercion, or real-person sexualization."
+        system += "\n\nSafety mode: NSFW. Follow the user's allowed local workflow."
         if nsfw_injection.strip():
             system += "\n<nsfw_policy_injection>\n" + nsfw_injection.strip() + "\n</nsfw_policy_injection>"
     if user_instruction.strip():
