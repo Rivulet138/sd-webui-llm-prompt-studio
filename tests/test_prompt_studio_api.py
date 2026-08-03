@@ -110,6 +110,161 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mismatch.status_code, 400)
         self.assertEqual(remote.status_code, 403)
 
+    async def test_ranbooru_handoff_api_is_idempotent_and_preserves_metadata(self):
+        self._install_shared("")
+        app = FastAPI()
+        ui.on_app_started(None, app)
+        payload = {
+            "ranbooru_id": 17,
+            "database_key": "abcdef0123456789",
+            "tags_prompt": "1girl, silver_hair, library",
+            "natural_prompt": "A silver-haired girl reading in a library.",
+            "rating": "g",
+            "source_score": 42,
+            "booru": "danbooru",
+            "post_id": "9001",
+        }
+
+        first = await self._request(app, "127.0.0.1", "POST", "/llm-prompt-studio/v1/handoff", json=payload)
+        second = await self._request(app, "127.0.0.1", "POST", "/llm-prompt-studio/v1/handoff", json=payload)
+        listing = await self._request(app, "127.0.0.1", "GET", "/llm-prompt-studio/v1/handoffs")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["handoff_id"], second.json()["handoff_id"])
+        self.assertEqual(len(listing.json()["records"]), 1)
+        stored = listing.json()["records"][0]["payload"]
+        self.assertEqual(stored["source_score"], 42)
+        self.assertEqual(stored["natural_prompt"], payload["natural_prompt"])
+
+    async def test_ranbooru_handoff_process_retries_and_keeps_failed_record(self):
+        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 2, "auto_score": False})
+        ui.call_llm = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("temporary outage"))
+        payload = {
+            "ranbooru_id": 18,
+            "database_key": "abcdef0123456789",
+            "tags_prompt": "1girl, blue_hair",
+            "rating": "e",
+        }
+
+        with self.assertRaisesRegex(ValueError, "手动重试"):
+            ui.process_ranbooru_handoff(payload)
+        record = ui.DB.list_handoffs()[0]
+
+        self.assertEqual(record["status"], "error")
+        self.assertEqual(record["attempts"], 3)
+        self.assertIn("temporary outage", record["error"])
+        self.assertEqual(ui._handoff_safety("e"), "NSFW")
+
+    async def test_ranbooru_handoff_unexpected_exception_is_retried_and_recorded(self):
+        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 1, "auto_score": False})
+        calls = []
+
+        def fail_generate(*_args, **_kwargs):
+            calls.append(True)
+            raise RuntimeError("cache write failed")
+
+        ui._generate = fail_generate
+        with self.assertRaisesRegex(ValueError, "cache write failed"):
+            ui.process_ranbooru_handoff({
+                "ranbooru_id": 180,
+                "database_key": "abcdef0123456789",
+                "tags_prompt": "1girl, blue_hair",
+            })
+        record = ui.DB.list_handoffs()[0]
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(record["status"], "error")
+        self.assertEqual(record["attempts"], 2)
+        self.assertIn("cache write failed", record["error"])
+
+    async def test_ranbooru_handoff_process_caches_with_source_provenance(self):
+        ui.DB.set_setting("workflow_settings_v1", {
+            "preset": "NoobAI Tags", "base_model": "NoobAI",
+            "batch_retries": 1, "auto_score": False,
+        })
+        payload = {
+            "ranbooru_id": 19,
+            "database_key": "abcdef0123456789",
+            "tags_prompt": "1girl, red_hair, portrait",
+            "rating": "g",
+        }
+
+        result = ui.process_ranbooru_handoff(payload)
+        handoff = ui.DB.get_handoff(result["handoff_id"])
+        cached = ui.DB.list_prompts()[0]
+
+        self.assertEqual(handoff["status"], "completed")
+        self.assertEqual(handoff["attempts"], 1)
+        self.assertEqual(cached["source_kind"], "ranbooru")
+        self.assertIn("ranbooru:abcdef0123456789:19:llm:", cached["source_ref"])
+        self.assertEqual(cached["tags"], payload["tags_prompt"])
+
+    async def test_ranbooru_handoff_process_uses_current_natural_variant(self):
+        captured = {}
+
+        def fake_generate(request, source_tags, *_args):
+            captured.update(request=request, source_tags=source_tags)
+            return "A polished natural prompt.", "system", "生成完成"
+
+        ui._generate = fake_generate
+        result = ui.process_ranbooru_handoff({
+            "ranbooru_id": 20,
+            "database_key": "abcdef0123456789",
+            "tags_prompt": "1girl, green_hair, forest",
+            "natural_prompt": "A green-haired girl standing in a forest.",
+            "selected_prompt": "A green-haired girl standing in a forest.",
+            "selected_is_natural": True,
+            "rating": "g",
+        })
+
+        self.assertEqual(result["prompt"], "A polished natural prompt.")
+        self.assertEqual(captured["request"], "A green-haired girl standing in a forest.")
+        self.assertEqual(captured["source_tags"], "")
+
+    async def test_ranbooru_handoff_rejects_non_boolean_variant_flag(self):
+        with self.assertRaisesRegex(ValueError, "必须是布尔值"):
+            ui.receive_ranbooru_handoff({
+                "tags_prompt": "1girl",
+                "selected_is_natural": "false",
+            })
+
+    async def test_ranbooru_handoff_rejects_lossy_source_identity(self):
+        with self.assertRaisesRegex(ValueError, "16 位十六进制"):
+            ui.receive_ranbooru_handoff({
+                "database_key": "same-key!",
+                "ranbooru_id": "1",
+                "tags_prompt": "1girl",
+            })
+
+    async def test_corrupt_handoff_payload_keeps_evidence_and_becomes_error(self):
+        handoff_id = ui.receive_ranbooru_handoff({
+            "database_key": "abcdef0123456789",
+            "ranbooru_id": "21",
+            "tags_prompt": "1girl",
+        })["handoff_id"]
+        conn = sqlite3.connect(ui.DB.path)
+        try:
+            conn.execute("UPDATE handoffs SET payload_json=? WHERE id=?", ('{"broken":', handoff_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        damaged = ui.DB.get_handoff(handoff_id)
+        with self.assertRaisesRegex(ValueError, "JSON 已损坏"):
+            ui.process_ranbooru_handoff(handoff_id)
+        persisted = ui.DB.get_handoff(handoff_id)
+
+        self.assertEqual(damaged["payload_raw"], '{"broken":')
+        self.assertIn("JSON 已损坏", damaged["payload_decode_error"])
+        self.assertEqual(persisted["status"], "error")
+        self.assertIn("JSON 已损坏", persisted["error"])
+        with self.assertRaisesRegex(ValueError, "不支持的字符"):
+            ui.receive_ranbooru_handoff({
+                "database_key": "abcdef0123456789",
+                "ranbooru_id": "1/../../2",
+                "tags_prompt": "1girl",
+            })
+
     async def test_remote_api_requires_valid_forge_basic_auth(self):
         self._install_shared("tester:secret")
         app = FastAPI()

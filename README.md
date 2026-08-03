@@ -21,6 +21,7 @@
 - 插件内置 74 个分类 Tag 词库文件，也支持选择其他本地词库目录。
 - 本地 SQLite 高分 Prompt 库、LLM 质量评分与评分溯源、稀疏向量 RAG 和 Few-Shot 示例注入。
 - 自动发现并只读同步 `sd-webui-ranbooru-reforge` 的 Tag 与自然语言缓存，支持分级、源评分、数量限制、幂等更新和来源溯源。
+- 接收 Ranbooru 当前缓存记录的实时结构化交接，可直接载入生成页，或使用已保存的 LLM 参数处理、评分并缓存。
 - Ranbooru 风格标签处理：移除不良标签、自定义通配排除、去重、随机打乱、下划线转空格和最大标签数量。
 - 独立的批量缓存页面，支持 LLM 批量生成、直接批量导入、队列预览、自动重试、错误后跳过、问题汇总、勾选手动重试、取消和进度记录。
 - 独立的缓存库页面，支持筛选、多选、查看、编辑、另存、删除预览、撤销和 JSON / CSV 导入导出。
@@ -513,6 +514,19 @@ Ranbooru 的站点评分只是帖子热度或来源评分，不会冒充 Prompt 
 
 手动编辑并保存联动记录会清除 Ranbooru 来源绑定，把它变成独立的本地手动记录。后续同步不会覆盖这个手动版本；如果源记录仍存在，会重新建立一条新的联动记录。
 
+### 实时交接与直接处理
+
+安装兼容版本的 Ranbooru 后，它的 `Tag 缓存管理` 面板会增加两个按钮：
+
+- `发送到 LLM 提示词工作室`：把当前取出的完整缓存记录放入本插件的 `Ranbooru 实时交接箱`。
+- `使用 LLM 处理并缓存`：立即使用本插件已经保存的 Provider、URL、模型和工作参数生成结果，并写入 Prompt 缓存；启用自动评分时会继续执行 LLM 质量评价。
+
+交接数据包含 Ranbooru 缓存 ID、原 Tag Prompt、有效自然语言 Prompt、分级、站点源评分、Booru、Post ID 和来源地址。`g/general/safe/sensitive` 自动映射为 SFW，`q/questionable/e/explicit/nsfw` 自动映射为 NSFW；未知分级沿用本插件保存的内容模式。
+
+直接处理会使用 `失败重试次数`，最多重试三次。最终失败的记录不会丢失，而是以 `处理失败` 状态保留在实时交接箱中；用户可以统一查看错误，选择记录后再次点击 `使用 LLM 处理并缓存`。不准备处理的记录可以标记为 `已跳过`，失败记录不会被“清理已完成 / 已跳过”删除。
+
+重复发送同一个 Ranbooru 源记录会更新同一条交接记录，不会无限增加重复项。LLM 结果使用独立的 Ranbooru 来源标识，不会与只读同步得到的原始 Tag / 自然语言记录互相覆盖。Ranbooru 站点 `score` 只作为来源元数据；只有本插件 LLM 评价成功产生的评分才能进入高分 RAG。
+
 ## 缓存库管理
 
 主数据库：
@@ -681,7 +695,7 @@ Regional JSON 示例结构：
 
 ## 本地 API
 
-插件启动时会在 Forge FastAPI 应用中注册两个端点。
+插件启动时会在 Forge FastAPI 应用中注册生成、缓存和 Ranbooru 交接端点。
 
 ### 访问控制
 
@@ -821,6 +835,43 @@ PowerShell：
 ```powershell
 Invoke-RestMethod "http://127.0.0.1:7860/llm-prompt-studio/v1/cache?query=mage&limit=100"
 ```
+
+### Ranbooru 实时交接 API
+
+写入交接箱：
+
+```text
+POST /llm-prompt-studio/v1/handoff
+```
+
+立即使用已保存的 LLM 与工作参数处理并缓存：
+
+```text
+POST /llm-prompt-studio/v1/handoff/process
+```
+
+查询最近交接记录：
+
+```text
+GET /llm-prompt-studio/v1/handoffs?limit=100
+```
+
+请求示例：
+
+```json
+{
+  "ranbooru_id": 123,
+  "database_key": "0123456789abcdef",
+  "tags_prompt": "1girl, red_hair, library",
+  "natural_prompt": "A red-haired girl reading in a library.",
+  "rating": "g",
+  "source_score": 42,
+  "booru": "danbooru",
+  "post_id": "9001"
+}
+```
+
+交接 API 与其他插件 API 使用相同的回环地址 / Forge `--api-auth` 访问控制。`/handoff/process` 不接收 API Key，也不允许从请求切换 Provider；它只使用中文界面已保存的连接与工作参数。
 
 ## 数据目录与安全
 
@@ -993,7 +1044,7 @@ Provider 官方文档：
 - 批量 LLM 取消会在当前请求返回或超时后生效；WD14 页面当前不提供取消功能。
 - 本地稀疏向量 RAG 不等价于大型语义 Embedding；缓存非常大时，全候选扫描会增加检索耗时。
 - 缓存库界面默认显示 200 条，缓存查询 API 单次最多返回 1000 条，但 RAG 不受这两个展示上限影响。
-- Ranbooru 联动是单向只读同步；源库中删除的记录不会自动从本插件缓存删除，需要在缓存库中手动选择并删除。
+- Ranbooru 批量同步仍以只读方式访问源库；源库中删除的记录不会自动从本插件缓存删除。实时交接是独立入口，不会修改 Ranbooru 数据库。
 - Regional JSON / Markdown 是编辑模板，不是自动空间理解或 Regional Prompter 直接控制。
 - 自定义 System Prompt 不能覆盖 Prompt Policy、底模规则和安全规则。
 - SFW 校验是本地关键词防线，不替代 Provider 自身的安全策略或人工检查。

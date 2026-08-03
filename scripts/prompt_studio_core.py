@@ -362,6 +362,20 @@ class StudioDB:
                 CREATE TABLE IF NOT EXISTS deletion_journal (
                     id INTEGER PRIMARY KEY, deleted_at INTEGER NOT NULL, reason TEXT DEFAULT '', records_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS handoffs (
+                    id INTEGER PRIMARY KEY,
+                    source_kind TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT 'send',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT NOT NULL DEFAULT '',
+                    result_prompt TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(source_kind, source_ref)
+                );
             """)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(prompts)").fetchall()}
             if "content_hash" not in columns:
@@ -386,6 +400,7 @@ class StudioDB:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_prompts_external_source "
                 "ON prompts(source_kind, source_ref) WHERE source_kind != '' AND source_ref != ''"
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_handoffs_status_updated ON handoffs(status, updated_at DESC)")
 
     @staticmethod
     def _record_hash(record: dict[str, Any]) -> str:
@@ -402,6 +417,12 @@ class StudioDB:
         record = {"prompt": prompt, "negative_prompt": negative, "output_mode": output_mode, "base_model": base_model, "tags": tags}
         content_hash = self._record_hash(record)
         with self.lock, self._connection() as conn:
+            if not record_id and source_kind and source_ref:
+                existing = conn.execute(
+                    "SELECT id FROM prompts WHERE source_kind=? AND source_ref=? LIMIT 1",
+                    (str(source_kind), str(source_ref)),
+                ).fetchone()
+                record_id = int(existing["id"]) if existing else None
             if record_id:
                 if source_kind is None and source_ref is None:
                     conn.execute(
@@ -614,6 +635,112 @@ class StudioDB:
         with self.lock, self._connection() as conn:
             row = conn.execute(f"SELECT 1 FROM prompts WHERE {' AND '.join(clauses)} LIMIT 1", params).fetchone()
         return bool(row)
+
+    def save_handoff(
+        self,
+        payload: dict[str, Any],
+        source_kind: str,
+        source_ref: str,
+        action: str = "send",
+    ) -> int:
+        source_kind = re.sub(r"[^a-zA-Z0-9_.-]+", "", str(source_kind or ""))[:80]
+        source_ref = str(source_ref or "").strip()[:500]
+        if not source_kind or not source_ref:
+            raise ValueError("Handoff source_kind and source_ref are required")
+        action = str(action or "send").strip()
+        if action not in {"send", "process_and_cache"}:
+            raise ValueError(f"Unsupported handoff action: {action}")
+        now = int(time.time())
+        payload_json = json.dumps(dict(payload or {}), ensure_ascii=False, separators=(",", ":"))
+        with self.lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO handoffs(
+                    source_kind, source_ref, payload_json, action, status, attempts,
+                    error, result_prompt, created_at, updated_at
+                ) VALUES(?,?,?,?,'pending',0,'','',?,?)
+                ON CONFLICT(source_kind, source_ref) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    action=excluded.action,
+                    status='pending',
+                    attempts=0,
+                    error='',
+                    result_prompt='',
+                    updated_at=excluded.updated_at
+                """,
+                (source_kind, source_ref, payload_json, action, now, now),
+            )
+            row = conn.execute(
+                "SELECT id FROM handoffs WHERE source_kind=? AND source_ref=?",
+                (source_kind, source_ref),
+            ).fetchone()
+        return int(row["id"])
+
+    def get_handoff(self, handoff_id: int) -> dict[str, Any] | None:
+        with self.lock, self._connection() as conn:
+            row = conn.execute("SELECT * FROM handoffs WHERE id=?", (int(handoff_id),)).fetchone()
+        return self._decode_handoff(row)
+
+    def list_handoffs(self, limit: int = 200, statuses: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        allowed = {"pending", "processing", "completed", "error", "skipped"}
+        selected = sorted({str(value) for value in (statuses or []) if str(value) in allowed})
+        where = ""
+        params: list[Any] = []
+        if selected:
+            where = f"WHERE status IN ({','.join('?' for _ in selected)})"
+            params.extend(selected)
+        params.append(max(1, min(int(limit or 200), 1000)))
+        with self.lock, self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM handoffs {where} ORDER BY updated_at DESC, id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        decoded = [self._decode_handoff(row) for row in rows]
+        return [record for record in decoded if record is not None]
+
+    @staticmethod
+    def _decode_handoff(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        record = dict(row)
+        raw_payload = str(record.pop("payload_json") or "")
+        try:
+            record["payload"] = json.loads(raw_payload)
+        except (json.JSONDecodeError, TypeError) as error:
+            record["payload"] = {}
+            record["payload_decode_error"] = f"交接 JSON 已损坏：{error}"
+            record["payload_raw"] = raw_payload[:2000]
+        return record
+
+    def update_handoff(
+        self,
+        handoff_id: int,
+        status: str,
+        attempts: int | None = None,
+        error: str = "",
+        result_prompt: str = "",
+    ) -> bool:
+        if status not in {"pending", "processing", "completed", "error", "skipped"}:
+            raise ValueError(f"Unsupported handoff status: {status}")
+        fields = ["status=?", "error=?", "result_prompt=?", "updated_at=?"]
+        params: list[Any] = [status, str(error or "")[:2000], str(result_prompt or ""), int(time.time())]
+        if attempts is not None:
+            fields.append("attempts=?")
+            params.append(max(0, int(attempts)))
+        params.append(int(handoff_id))
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(f"UPDATE handoffs SET {','.join(fields)} WHERE id=?", params)
+        return cursor.rowcount > 0
+
+    def delete_handoffs(self, statuses: Iterable[str]) -> int:
+        allowed = {"completed", "error", "skipped"}
+        selected = sorted({str(value) for value in statuses if str(value) in allowed})
+        if not selected:
+            return 0
+        placeholders = ",".join("?" for _ in selected)
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(f"DELETE FROM handoffs WHERE status IN ({placeholders})", selected)
+        return cursor.rowcount
 
     @staticmethod
     def parse_positions(value: str, total: int | None = None, max_selection: int = 10000) -> list[int]:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import ipaddress
 import json
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -1036,7 +1038,7 @@ def _generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-    save_score, cache_result, auto_score,
+    save_score, cache_result, auto_score, source_kind="", source_ref="",
 ):
     source = str(source_tags or request or "").strip()
     if not source:
@@ -1066,6 +1068,7 @@ def _generate(
         DB.save_prompt(
             result, "", preset, base_model, score, source,
             score_source=score_source, score_reason=score_reason, score_model=model if score_source == "llm" else "",
+            source_kind=source_kind or None, source_ref=source_ref or None,
         )
     status = f"生成完成，使用 {len(examples)} 条 RAG 示例" + ("，结果已缓存" if cache_result else "")
     if score_status:
@@ -1265,6 +1268,221 @@ def _api_generate(payload: dict[str, Any]):
     return {"prompt": generated, "system_prompt": system, "status": status}
 
 
+HANDOFF_STATUS_LABELS = {
+    "pending": "待处理",
+    "processing": "处理中",
+    "completed": "已完成",
+    "error": "处理失败",
+    "skipped": "已跳过",
+}
+
+
+def _normalize_ranbooru_handoff(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(payload or {})
+    allowed = {
+        "ranbooru_id", "database_key", "tags_prompt", "natural_prompt", "selected_prompt",
+        "selected_is_natural", "rating", "source_score", "booru", "post_id", "source_url",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"Ranbooru 交接包含不支持的字段：{', '.join(unknown)}")
+    if "selected_is_natural" in payload and type(payload["selected_is_natural"]) is not bool:
+        raise ValueError("Ranbooru 交接字段 selected_is_natural 必须是布尔值")
+    tags_prompt = str(payload.get("tags_prompt") or "").strip()
+    natural_prompt = str(payload.get("natural_prompt") or "").strip()
+    selected_prompt = str(payload.get("selected_prompt") or "").strip()
+    if max(len(tags_prompt), len(natural_prompt), len(selected_prompt)) > 100000:
+        raise ValueError("Ranbooru 交接 Prompt 超过 100000 字符上限")
+    selected_is_natural = bool(payload.get("selected_is_natural"))
+    if not tags_prompt and selected_prompt and not selected_is_natural:
+        tags_prompt = selected_prompt
+    if not natural_prompt and selected_prompt and selected_is_natural:
+        natural_prompt = selected_prompt
+    if not tags_prompt and not natural_prompt:
+        raise ValueError("Ranbooru 交接没有可用的 Tag Prompt 或自然语言 Prompt")
+    database_key = str(payload.get("database_key") or "").strip().lower()
+    if database_key and not re.fullmatch(r"[0-9a-f]{16}", database_key):
+        raise ValueError("Ranbooru 交接字段 database_key 必须是 16 位十六进制字符串")
+    if not database_key:
+        database_key = hashlib.sha256((tags_prompt or natural_prompt).encode("utf-8")).hexdigest()[:16]
+    source_id = str(payload.get("ranbooru_id") or "").strip()
+    if source_id and not re.fullmatch(r"[a-zA-Z0-9_.-]{1,120}", source_id):
+        raise ValueError("Ranbooru 交接字段 ranbooru_id 包含不支持的字符或长度")
+    if not source_id:
+        source_id = hashlib.sha256((tags_prompt or natural_prompt).encode("utf-8")).hexdigest()[:16]
+    try:
+        source_score = int(float(payload.get("source_score") or 0))
+    except (TypeError, ValueError, OverflowError):
+        source_score = 0
+    return {
+        "ranbooru_id": source_id,
+        "database_key": database_key,
+        "tags_prompt": tags_prompt,
+        "natural_prompt": natural_prompt,
+        "selected_prompt": selected_prompt or natural_prompt or tags_prompt,
+        "selected_is_natural": selected_is_natural,
+        "rating": str(payload.get("rating") or "").strip().lower()[:32],
+        "source_score": source_score,
+        "booru": str(payload.get("booru") or "").strip()[:80],
+        "post_id": str(payload.get("post_id") or "").strip()[:120],
+        "source_url": str(payload.get("source_url") or "").strip()[:1000],
+    }
+
+
+def _handoff_source_ref(payload: dict[str, Any]) -> str:
+    return f"ranbooru:{payload['database_key']}:{payload['ranbooru_id']}"
+
+
+def _handoff_safety(rating: str, fallback: str = "SFW") -> str:
+    value = str(rating or "").strip().lower()
+    if value in {"q", "questionable", "e", "explicit", "nsfw"}:
+        return "NSFW"
+    if value in {"g", "general", "safe", "s", "sensitive"}:
+        return "SFW"
+    return fallback if fallback in {"SFW", "NSFW"} else "SFW"
+
+
+def receive_ranbooru_handoff(payload: dict[str, Any], action: str = "send") -> dict[str, Any]:
+    normalized = _normalize_ranbooru_handoff(payload)
+    handoff_id = DB.save_handoff(normalized, "ranbooru", _handoff_source_ref(normalized), action)
+    return {
+        "handoff_id": handoff_id,
+        "status": "已发送到 LLM 提示词工作室。" if action == "send" else "已加入 LLM 处理队列。",
+    }
+
+
+def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
+    if record.get("payload_decode_error"):
+        message = str(record["payload_decode_error"])
+        DB.update_handoff(record["id"], "error", attempts=0, error=message)
+        raise ValueError(message)
+    payload = record.get("payload") or {}
+    workflow = _workflow_settings()
+    connection = _connection_settings()
+    preset = workflow["preset"]
+    base_model = workflow["base_model"]
+    safety = _handoff_safety(payload.get("rating", ""), workflow["safety"])
+    selected_prompt = str(payload.get("selected_prompt") or "").strip()
+    natural_prompt = str(payload.get("natural_prompt") or "").strip()
+    selected_is_natural = bool(payload.get("selected_is_natural") and natural_prompt)
+    source_tags = "" if selected_is_natural else str(payload.get("tags_prompt") or "").strip()
+    request = natural_prompt if selected_is_natural else str(natural_prompt or selected_prompt).strip()
+    if not source_tags and not request:
+        raise ValueError("交接记录没有可处理的 Prompt")
+    profile_key = hashlib.sha256(f"{preset}\x1f{base_model}".encode("utf-8")).hexdigest()[:12]
+    prompt_source_ref = f"{record['source_ref']}:llm:{profile_key}"
+    retries = max(0, min(int(workflow.get("batch_retries") or 0), 3))
+    DB.update_handoff(record["id"], "processing", attempts=0)
+    generated = system = status = ""
+    for attempt in range(1, retries + 2):
+        try:
+            generated, system, status = _generate(
+                request, source_tags, preset, workflow["system_override"], base_model, safety,
+                workflow["nsfw_injection"], workflow["user_instruction"],
+                connection["provider"], connection["endpoint"], connection["model"], "",
+                connection["temperature"], connection["timeout"], connection["max_tokens"],
+                connection["send_temperature"], workflow["few_shot_count"], workflow["rag_min_score"],
+                workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
+                workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
+                workflow["save_score"], True, workflow["auto_score"], "ranbooru", prompt_source_ref,
+            )
+            if generated:
+                DB.update_handoff(record["id"], "completed", attempts=attempt, result_prompt=generated)
+                return {
+                    "handoff_id": record["id"], "prompt": generated, "system_prompt": system,
+                    "status": f"Ranbooru 实时处理完成（尝试 {attempt} 次）：{status}",
+                }
+        except Exception as error:
+            generated = ""
+            status = f"未预期异常：{error}"
+    DB.update_handoff(record["id"], "error", attempts=retries + 1, error=status)
+    raise ValueError(f"Ranbooru 实时处理失败，已记录并可手动重试：{status}")
+
+
+def process_ranbooru_handoff(payload_or_id: dict[str, Any] | int | str) -> dict[str, Any]:
+    if isinstance(payload_or_id, dict):
+        received = receive_ranbooru_handoff(payload_or_id, "process_and_cache")
+        record = DB.get_handoff(received["handoff_id"])
+    else:
+        try:
+            record = DB.get_handoff(int(payload_or_id))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("请选择有效的 Ranbooru 交接记录") from error
+    if not record:
+        raise ValueError("Ranbooru 交接记录不存在或已被清理")
+    return _process_handoff_record(record)
+
+
+def _handoff_views(selected=None):
+    records = DB.list_handoffs()
+    rows, choices = [], []
+    for record in records:
+        payload = record.get("payload") or {}
+        preview = " ".join(str(payload.get("selected_prompt") or payload.get("tags_prompt") or "").split())
+        if len(preview) > 72:
+            preview = preview[:69] + "..."
+        label = HANDOFF_STATUS_LABELS.get(record["status"], record["status"])
+        choices.append((f"#{record['id']} | {label} | {preview}", str(record["id"])))
+        rows.append([
+            record["id"], label, record["attempts"], payload.get("ranbooru_id", ""),
+            payload.get("rating", ""), payload.get("source_score", 0),
+            payload.get("tags_prompt", ""), payload.get("natural_prompt", ""),
+            record.get("error") or record.get("payload_decode_error", ""), record.get("result_prompt", ""),
+        ])
+    available = {value for _, value in choices}
+    selected_value = str(selected or "")
+    retained = selected_value if selected_value in available else (choices[0][1] if choices else None)
+    status = f"实时交接箱共 {len(records)} 条；失败和跳过记录会保留，支持统一查看后手动重试。"
+    return gr.update(value=rows), gr.update(choices=choices, value=retained), status
+
+
+def _load_handoff_into_generation(handoff_id):
+    record = DB.get_handoff(int(handoff_id)) if str(handoff_id or "").isdigit() else None
+    if not record:
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), "请选择一条交接记录。"
+    payload = record.get("payload") or {}
+    has_tags = bool(str(payload.get("tags_prompt") or "").strip())
+    preset = "NoobAI Tags" if has_tags else "Krea 2 Natural"
+    base_model = "NoobAI" if has_tags else "Krea 2"
+    workflow = _workflow_settings()
+    return (
+        payload.get("natural_prompt") or payload.get("selected_prompt") or "",
+        payload.get("tags_prompt") or "",
+        preset,
+        base_model,
+        _handoff_safety(payload.get("rating", ""), workflow["safety"]),
+        f"已载入 Ranbooru 交接 #{record['id']}，可在“生成提示词”页继续编辑。",
+    )
+
+
+def _process_selected_handoff(handoff_id, query="", min_score=0, output_mode="全部", base_model="全部"):
+    try:
+        result = process_ranbooru_handoff(handoff_id)
+        message = result["status"]
+        prompt = result["prompt"]
+        system = result["system_prompt"]
+    except Exception as error:
+        message = f"处理失败：{_safe_error(error)}"
+        prompt = system = ""
+    handoff_table, handoff_choices, _ = _handoff_views(handoff_id)
+    cache_table, cache_choices = _filtered_cache_updates(query, min_score, output_mode, base_model)
+    return prompt, system, message, handoff_table, handoff_choices, cache_table, cache_choices
+
+
+def _skip_selected_handoff(handoff_id):
+    if not str(handoff_id or "").isdigit() or not DB.update_handoff(int(handoff_id), "skipped", error="用户手动跳过"):
+        table, choices, _ = _handoff_views(handoff_id)
+        return "请选择有效的交接记录。", table, choices
+    table, choices, _ = _handoff_views(handoff_id)
+    return f"已跳过交接 #{handoff_id}；记录仍保留，可稍后手动重试。", table, choices
+
+
+def _clear_finished_handoffs():
+    deleted = DB.delete_handoffs({"completed", "skipped"})
+    table, choices, _ = _handoff_views()
+    return f"已清理 {deleted} 条已完成或已跳过的交接记录；失败记录仍保留。", table, choices
+
+
 def on_app_started(_, app):
     saved_workflow = DB.get_setting("workflow_settings_v1", {}) or {}
     wildcard_source = Path(saved_workflow.get("wildcard_path") or DEFAULT_WILDCARDS) if isinstance(saved_workflow, dict) else DEFAULT_WILDCARDS
@@ -1311,6 +1529,24 @@ def on_app_started(_, app):
         @app.get("/llm-prompt-studio/v1/cache", dependencies=api_dependencies)
         def prompt_studio_cache(query: str = "", limit: int = 100):
             return {"records": DB.list_prompts(query, limit)}
+
+        @app.post("/llm-prompt-studio/v1/handoff", dependencies=api_dependencies)
+        def prompt_studio_handoff(payload: dict[str, Any]):
+            try:
+                return receive_ranbooru_handoff(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.post("/llm-prompt-studio/v1/handoff/process", dependencies=api_dependencies)
+        def prompt_studio_handoff_process(payload: dict[str, Any]):
+            try:
+                return process_ranbooru_handoff(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.get("/llm-prompt-studio/v1/handoffs", dependencies=api_dependencies)
+        def prompt_studio_handoffs(limit: int = 100):
+            return {"records": DB.list_handoffs(limit)}
     except Exception as error:
         print(f"[LLM Prompt Studio] API registration failed: {error}")
 
@@ -1320,6 +1556,7 @@ def on_ui_tabs():
     workflow = _workflow_settings()
     ranbooru_link = _ranbooru_link_settings()
     initial_records = DB.list_prompts()
+    initial_handoff_table, initial_handoff_choices, initial_handoff_status = _handoff_views()
     with gr.Blocks(analytics_enabled=False, elem_id="llm_prompt_studio") as ui:
         gr.Markdown("## LLM 提示词工作室\n本地静态词库、RAG Few-Shot、提示词缓存与 Forge 扩展集成。")
         with gr.Tabs():
@@ -1491,6 +1728,28 @@ def on_ui_tabs():
                         datatype=["number", "str", "str", "number", "str", "str", "str", "str"],
                         interactive=False, wrap=True, label="Ranbooru 同步预览",
                     )
+                    with gr.Accordion("Ranbooru 实时交接箱", open=True):
+                        handoff_selection = gr.Dropdown(
+                            label="选择交接记录",
+                            choices=initial_handoff_choices.get("choices", []),
+                            value=initial_handoff_choices.get("value"),
+                        )
+                        with gr.Row():
+                            handoff_refresh = gr.Button("刷新交接箱")
+                            handoff_load = gr.Button("载入到生成页")
+                            handoff_process = gr.Button("使用 LLM 处理并缓存", variant="primary")
+                            handoff_skip = gr.Button("跳过所选")
+                            handoff_clear_finished = gr.Button("清理已完成 / 已跳过")
+                        handoff_status = gr.Markdown(initial_handoff_status)
+                        handoff_table = gr.Dataframe(
+                            value=initial_handoff_table.get("value", []),
+                            headers=[
+                                "交接 ID", "状态", "尝试次数", "Ranbooru ID", "分级", "源评分",
+                                "Tag Prompt", "自然语言 Prompt", "错误", "LLM 结果",
+                            ],
+                            datatype=["number", "str", "number", "str", "str", "number", "str", "str", "str", "str"],
+                            interactive=False, wrap=True, label="实时交接、错误与跳过汇总",
+                        )
                 with gr.Accordion("JSON / CSV 导入导出", open=False):
                     with gr.Row():
                         import_file = gr.File(label="导入文件", file_types=[".json", ".csv"], type="filepath")
@@ -1569,6 +1828,27 @@ def on_ui_tabs():
             _sync_ranbooru_link,
             inputs=[*ranbooru_inputs, *cache_filter_inputs],
             outputs=[ranbooru_status, table, selected_records],
+        )
+        handoff_refresh.click(
+            _handoff_views, inputs=handoff_selection,
+            outputs=[handoff_table, handoff_selection, handoff_status],
+        )
+        handoff_load.click(
+            _load_handoff_into_generation, inputs=handoff_selection,
+            outputs=[request, source_tags, preset, base_model, safety, handoff_status],
+        )
+        handoff_process.click(
+            _process_selected_handoff,
+            inputs=[handoff_selection, *cache_filter_inputs],
+            outputs=[output, system_preview, handoff_status, handoff_table, handoff_selection, table, selected_records],
+        )
+        handoff_skip.click(
+            _skip_selected_handoff, inputs=handoff_selection,
+            outputs=[handoff_status, handoff_table, handoff_selection],
+        )
+        handoff_clear_finished.click(
+            _clear_finished_handoffs,
+            outputs=[handoff_status, handoff_table, handoff_selection],
         )
         refresh.click(_refresh_cache, inputs=cache_filter_inputs, outputs=[table, selected_records, cache_status])
         cache_query.submit(_refresh_cache, inputs=cache_filter_inputs, outputs=[table, selected_records, cache_status])
