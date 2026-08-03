@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -10,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_provider_request, build_system_prompt, build_user_message, call_llm, extract_provider_text,
-    is_sfw_output, process_tags, regional_format, validate_endpoint,
+    is_sfw_output, parse_prompt_evaluation, process_tags, regional_format, validate_endpoint,
 )
 
 
@@ -22,18 +23,57 @@ class PromptStudioCoreTests(unittest.TestCase):
     def test_local_vector_rag_prefers_matching_high_score_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
-            db.save_prompt("red-haired mage in moonlit library", score=9, tags="mage library")
+            db.save_prompt("red-haired mage in moonlit library", score=9, tags="mage library", score_source="llm")
             db.save_prompt("sports car in rain", score=10, tags="vehicle")
             self.assertEqual(db.retrieve("mage reading in library", 1, 7)[0]["prompt"], "red-haired mage in moonlit library")
+
+    def test_rag_excludes_high_manual_scores_without_llm_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            db.save_prompt("manual mage library", score=10, tags="mage library")
+            db.save_prompt("evaluated mage library", score=8.5, tags="mage library", score_source="llm", score_reason="Well structured")
+
+            matches = db.retrieve("mage library", 5, 7)
+
+            self.assertEqual([item["prompt"] for item in matches], ["evaluated mage library"])
+            self.assertEqual(matches[0]["score_reason"], "Well structured")
+
+    def test_rag_can_filter_llm_examples_by_output_mode_and_base_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            db.save_prompt(
+                "noobai mage", output_mode="NoobAI Tags", base_model="NoobAI", score=9,
+                tags="mage", score_source="llm",
+            )
+            db.save_prompt(
+                "krea mage", output_mode="Krea 2 Natural", base_model="Krea 2", score=10,
+                tags="mage", score_source="llm",
+            )
+
+            matches = db.retrieve("mage", 3, 7, "NoobAI Tags", "NoobAI")
+
+            self.assertEqual([item["prompt"] for item in matches], ["noobai mage"])
+
+    def test_prompt_evaluation_parser_accepts_fenced_json_and_clamps_score(self):
+        evaluation = parse_prompt_evaluation('```json\n{"score": 12.4, "reason": " clear   structure "}\n```')
+
+        self.assertEqual(evaluation, {"score": 10.0, "reason": "clear structure"})
+        with self.assertRaisesRegex(ValueError, "numeric score"):
+            parse_prompt_evaluation('{"score": true}')
+
+    def test_prompt_evaluation_parser_rejects_non_finite_and_string_scores(self):
+        for score in ("NaN", "Infinity", "-Infinity", "1e309", "9" * 400, '"8.5"'):
+            with self.subTest(score=score), self.assertRaises(ValueError):
+                parse_prompt_evaluation(f'{{"score": {score}, "reason": "invalid"}}')
 
     def test_local_vector_rag_searches_records_beyond_ui_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
             db.save_prompts_batch([
-                {"prompt": f"filler cache record {index}", "score": 9, "tags": "unrelated"}
+                {"prompt": f"filler cache record {index}", "score": 9, "score_source": "llm", "tags": "unrelated"}
                 for index in range(1000)
-            ])
-            db.save_prompt("moonlit archive needle", score=9, tags="celestial librarian")
+            ], trust_score_metadata=True)
+            db.save_prompt("moonlit archive needle", score=9, tags="celestial librarian", score_source="llm")
 
             matches = db.retrieve("moonlit celestial librarian", 1, 7)
 
@@ -50,6 +90,68 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertEqual(stats["inserted"], 2)
             self.assertEqual(stats["duplicates"], 1)
             self.assertTrue(db.has_source_prompt("source one"))
+
+    def test_llm_batch_score_upgrades_an_existing_manual_duplicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            record_id = db.save_prompt(
+                "same prompt", output_mode="Danbooru Tags", base_model="NoobAI", score=9, tags="same source",
+            )
+
+            stats = db.save_prompts_batch([{
+                "prompt": "same prompt", "output_mode": "Danbooru Tags", "base_model": "NoobAI",
+                "score": 8.4, "score_source": "llm",
+                "score_reason": "Verified quality", "score_model": "judge", "tags": "same source",
+            }], trust_score_metadata=True)
+            record = db.get_prompt(record_id)
+
+            self.assertEqual(stats["inserted"], 0)
+            self.assertEqual(stats["duplicates"], 1)
+            self.assertEqual(stats["updated"], 1)
+            self.assertEqual(record["score"], 8.4)
+            self.assertEqual(record["score_source"], "llm")
+
+    def test_untrusted_batch_import_cannot_claim_llm_score_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+
+            db.save_prompts_batch([{
+                "prompt": "imported prompt", "score": 10, "score_source": "llm",
+                "score_reason": "forged", "score_model": "forged-model", "tags": "source",
+            }])
+            record = db.list_prompts()[0]
+
+            self.assertEqual(record["score_source"], "manual")
+            self.assertEqual(record["score_reason"], "")
+            self.assertEqual(record["score_model"], "")
+            self.assertEqual(db.retrieve("source", 3, 7), [])
+
+    def test_existing_database_migrates_score_provenance_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript("""
+                    CREATE TABLE prompts (
+                        id INTEGER PRIMARY KEY, prompt TEXT NOT NULL, negative_prompt TEXT DEFAULT '',
+                        output_mode TEXT DEFAULT 'Danbooru Tags', base_model TEXT DEFAULT '', score REAL DEFAULT 0,
+                        tags TEXT DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE wildcard_files (path TEXT PRIMARY KEY, modified_at REAL NOT NULL, terms_json TEXT NOT NULL);
+                    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE deletion_journal (id INTEGER PRIMARY KEY, deleted_at INTEGER NOT NULL, reason TEXT DEFAULT '', records_json TEXT NOT NULL);
+                    INSERT INTO prompts(prompt, score, tags, created_at, updated_at) VALUES('legacy prompt', 10, 'legacy', 1, 1);
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+
+            db = StudioDB(path)
+            record = db.list_prompts()[0]
+
+            self.assertEqual(record["score_source"], "manual")
+            self.assertEqual(record["score_reason"], "")
+            self.assertEqual(db.retrieve("legacy", 3, 7), [])
 
     def test_cache_listing_filters_keep_stable_full_library_positions(self):
         with tempfile.TemporaryDirectory() as directory:
