@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import sys
@@ -11,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_provider_request, build_system_prompt, build_user_message, call_llm, extract_provider_text,
-    is_sfw_output, parse_prompt_evaluation, process_tags, regional_format, validate_endpoint,
+    is_sfw_output, load_ranbooru_cache, parse_prompt_evaluation, process_tags, regional_format,
+    validate_endpoint,
 )
 
 
@@ -151,7 +153,162 @@ class PromptStudioCoreTests(unittest.TestCase):
 
             self.assertEqual(record["score_source"], "manual")
             self.assertEqual(record["score_reason"], "")
+            self.assertEqual(record["source_kind"], "")
+            self.assertEqual(record["source_ref"], "")
             self.assertEqual(db.retrieve("legacy", 3, 7), [])
+
+    def test_ranbooru_cache_reader_maps_tags_natural_prompts_and_ratings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tag_cache.db"
+            first_tags = "1girl, red_hair, library"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript("""
+                    CREATE TABLE tags (
+                        id INTEGER PRIMARY KEY, tags TEXT NOT NULL, tags_prompt TEXT, tags_raw TEXT,
+                        natural_prompt TEXT, natural_source_hash TEXT, score INTEGER, rating TEXT
+                    );
+                """)
+                conn.executemany(
+                    "INSERT INTO tags VALUES(?,?,?,?,?,?,?,?)",
+                    [
+                        (1, first_tags, first_tags, first_tags, "A red-haired girl reading in a library.", hashlib.sha256(first_tags.encode()).hexdigest(), 42, "g"),
+                        (2, "1girl, blue_hair", "1girl, blue_hair", "1girl, blue_hair", "Stale natural prompt", "stale", 7, "q"),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = load_ranbooru_cache(path, content_mode="both")
+            sfw = load_ranbooru_cache(path, content_mode="tags", rating_filter="sfw")
+            nsfw = load_ranbooru_cache(path, content_mode="tags", rating_filter="nsfw")
+
+            self.assertEqual(result["total_sources"], 2)
+            self.assertEqual(result["mapped_records"], 3)
+            self.assertEqual(result["natural_available"], 1)
+            self.assertEqual(result["stale_natural"], 1)
+            self.assertEqual(len(result["invalid_source_refs"]), 1)
+            self.assertEqual([record["_ranbooru_variant"] for record in result["records"]], ["tags", "natural", "tags"])
+            self.assertEqual(sfw["loaded_sources"], 1)
+            self.assertEqual(nsfw["loaded_sources"], 1)
+            self.assertEqual(sfw["invalid_source_refs"], [])
+
+    def test_ranbooru_cache_reader_supports_legacy_tags_only_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy_tag_cache.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("CREATE TABLE tags (id INTEGER PRIMARY KEY, tags TEXT NOT NULL)")
+                conn.execute("INSERT INTO tags VALUES(1, '1girl, legacy_tag')")
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = load_ranbooru_cache(path, content_mode="tags")
+
+            self.assertEqual(result["mapped_records"], 1)
+            self.assertEqual(result["records"][0]["prompt"], "1girl, legacy_tag")
+
+    def test_ranbooru_sync_is_idempotent_and_invalidates_changed_source_score(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            record = {
+                "prompt": "1girl, red_hair", "output_mode": "NoobAI Tags", "base_model": "NoobAI",
+                "tags": "1girl, red_hair", "source_kind": "ranbooru",
+                "source_ref": "ranbooru:test:1:tags", "score_reason": "Ranbooru import",
+            }
+
+            first = db.sync_external_prompts([record])
+            record_id = first["ids"][0]
+            imported = db.get_prompt(record_id)
+            db.save_prompt(
+                imported["prompt"], output_mode=imported["output_mode"], base_model=imported["base_model"],
+                score=9, tags=imported["tags"], record_id=record_id, score_source="llm",
+                score_reason="Verified", score_model="judge",
+            )
+            unchanged = db.sync_external_prompts([record])
+            changed_record = {**record, "prompt": "1girl, red_hair, library", "tags": "1girl, red_hair, library"}
+            changed = db.sync_external_prompts([changed_record])
+            updated = db.get_prompt(record_id)
+
+            self.assertEqual(first["inserted"], 1)
+            self.assertEqual(unchanged["unchanged"], 1)
+            self.assertEqual(changed["updated"], 1)
+            self.assertEqual(updated["score"], 0)
+            self.assertEqual(updated["score_source"], "unrated")
+            self.assertEqual(updated["source_kind"], "ranbooru")
+            self.assertEqual(db.retrieve("library", 3, 0, "NoobAI Tags", "NoobAI"), [])
+
+    def test_stale_ranbooru_natural_prompt_invalidates_existing_llm_score(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "tag_cache.db"
+            tags = "1girl, red_hair"
+            conn = sqlite3.connect(source_path)
+            try:
+                conn.execute("""
+                    CREATE TABLE tags (
+                        id INTEGER PRIMARY KEY, tags TEXT NOT NULL, tags_prompt TEXT,
+                        natural_prompt TEXT, natural_source_hash TEXT, score INTEGER, rating TEXT
+                    )
+                """)
+                conn.execute(
+                    "INSERT INTO tags VALUES(?,?,?,?,?,?,?)",
+                    (1, tags, tags, "A red-haired girl.", hashlib.sha256(tags.encode()).hexdigest(), 20, "g"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            db = StudioDB(Path(directory) / "studio.db")
+            first = load_ranbooru_cache(source_path, content_mode="natural")
+            record_id = db.sync_external_prompts(first["records"])["ids"][0]
+            record = db.get_prompt(record_id)
+            db.save_prompt(
+                record["prompt"], output_mode=record["output_mode"], base_model=record["base_model"],
+                score=9, tags=record["tags"], record_id=record_id, score_source="llm",
+                score_reason="Verified", score_model="judge",
+            )
+            conn = sqlite3.connect(source_path)
+            try:
+                conn.execute("UPDATE tags SET natural_prompt='', natural_source_hash='' WHERE id=1")
+                conn.commit()
+            finally:
+                conn.close()
+
+            stale = load_ranbooru_cache(source_path, content_mode="natural")
+            invalidated = db.invalidate_external_prompts("ranbooru", stale["invalid_source_refs"], "stale")
+            updated = db.get_prompt(record_id)
+            invalidated_again = db.invalidate_external_prompts("ranbooru", stale["invalid_source_refs"], "stale")
+            unchanged = db.get_prompt(record_id)
+
+            self.assertEqual(stale["records"], [])
+            self.assertEqual(invalidated, 1)
+            self.assertEqual(invalidated_again, 0)
+            self.assertEqual(updated["score"], 0)
+            self.assertEqual(updated["score_source"], "unrated")
+            self.assertEqual(unchanged["updated_at"], updated["updated_at"])
+            self.assertEqual(db.retrieve("red-haired", 3, 0, "Krea 2 Natural", "Krea 2"), [])
+
+    def test_undo_detaches_restored_ranbooru_record_when_source_was_resynced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            source = {
+                "prompt": "1girl, library", "output_mode": "NoobAI Tags", "base_model": "NoobAI",
+                "tags": "1girl, library", "source_kind": "ranbooru", "source_ref": "ranbooru:test:1:tags",
+            }
+            original_id = db.sync_external_prompts([source])["ids"][0]
+            db.delete_prompts([original_id])
+            synced_id = db.sync_external_prompts([source])["ids"][0]
+
+            restored = db.undo_last_delete()
+            records = db.list_prompts()
+
+            self.assertEqual(restored, 1)
+            self.assertEqual(len(records), 2)
+            self.assertIn(synced_id, {record["id"] for record in records})
+            self.assertEqual(len({record["id"] for record in records}), 2)
+            self.assertEqual(sum(record["source_kind"] == "ranbooru" for record in records), 1)
 
     def test_cache_listing_filters_keep_stable_full_library_positions(self):
         with tempfile.TemporaryDirectory() as directory:

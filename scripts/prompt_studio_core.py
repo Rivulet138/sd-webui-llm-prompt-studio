@@ -28,6 +28,10 @@ DATA_DIR = ROOT / "user"
 DB_PATH = DATA_DIR / "prompt_studio.db"
 CREDENTIALS_PATH = DATA_DIR / "credentials" / "llm_credentials.json"
 DEFAULT_WILDCARDS = ROOT / "assets" / "wildcards"
+DEFAULT_RANBOORU_CACHE = ROOT.parent / "sd-webui-ranbooru-reforge" / "user" / "cache" / "tag_cache.db"
+RANBOORU_CONTENT_MODES = {"tags", "natural", "both"}
+RANBOORU_RATING_FILTERS = {"all", "sfw", "nsfw"}
+MAX_RANBOORU_SOURCE_RECORDS = 100000
 
 BAD_TAGS = {
     "watermark", "signature", "text", "english text", "chinese text",
@@ -137,6 +141,160 @@ PROVIDER_PROFILES = {
 }
 
 
+def discover_ranbooru_cache() -> Path:
+    candidates = [DEFAULT_RANBOORU_CACHE]
+    try:
+        for extension in ROOT.parent.iterdir():
+            if extension.is_dir() and "ranbooru" in extension.name.lower():
+                candidates.append(extension / "user" / "cache" / "tag_cache.db")
+    except OSError:
+        pass
+    for candidate in dict.fromkeys(path.resolve() for path in candidates):
+        if candidate.is_file():
+            return candidate
+    return DEFAULT_RANBOORU_CACHE
+
+
+def load_ranbooru_cache(
+    database_path: str | Path,
+    content_mode: str = "both",
+    rating_filter: str = "all",
+    min_source_score: int = 0,
+    source_limit: int = 0,
+    tag_output_mode: str = "NoobAI Tags",
+    tag_base_model: str = "NoobAI",
+    natural_output_mode: str = "Krea 2 Natural",
+    natural_base_model: str = "Krea 2",
+) -> dict[str, Any]:
+    mode = str(content_mode or "both").strip().lower()
+    rating_mode = str(rating_filter or "all").strip().lower()
+    if mode not in RANBOORU_CONTENT_MODES:
+        raise ValueError(f"Unsupported Ranbooru content mode: {content_mode}")
+    if rating_mode not in RANBOORU_RATING_FILTERS:
+        raise ValueError(f"Unsupported Ranbooru rating filter: {rating_filter}")
+    if tag_output_mode not in PRESETS or natural_output_mode not in PRESETS:
+        raise ValueError("Ranbooru target prompt preset is not supported")
+    if tag_base_model not in BASE_MODEL_GUIDANCE or natural_base_model not in BASE_MODEL_GUIDANCE:
+        raise ValueError("Ranbooru target base model is not supported")
+
+    path = Path(str(database_path or "").strip().strip('"')).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"Ranbooru cache database does not exist: {path}")
+    minimum = max(0, int(min_source_score or 0))
+    requested_limit = max(0, min(int(source_limit or 0), MAX_RANBOORU_SOURCE_RECORDS))
+    connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tags'"
+        ).fetchone()
+        if not table:
+            raise ValueError("Ranbooru cache database does not contain a tags table")
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(tags)").fetchall()}
+        prompt_columns = {"tags_prompt", "tags_raw", "tags"} & columns
+        if not prompt_columns:
+            raise ValueError("Ranbooru tags table does not contain a supported prompt column")
+        if rating_mode != "all" and "rating" not in columns:
+            raise ValueError("Ranbooru cache does not contain rating data required by this filter")
+
+        available = [
+            column for column in (
+                "id", "tags_prompt", "tags_raw", "tags", "natural_prompt", "natural_source_hash",
+                "score", "rating", "booru", "post_id", "search_query",
+            ) if column in columns
+        ]
+        select_id = "id" if "id" in columns else "rowid AS id"
+        select_fields = [select_id, *[column for column in available if column != "id"]]
+        clauses, params = [], []
+        if "score" in columns and minimum:
+            clauses.append("CAST(COALESCE(score, 0) AS INTEGER) >= ?")
+            params.append(minimum)
+        elif minimum:
+            clauses.append("0 >= ?")
+            params.append(minimum)
+        if rating_mode == "sfw":
+            clauses.append("LOWER(COALESCE(rating, '')) IN ('g', 'general', 'safe', 's')")
+        elif rating_mode == "nsfw":
+            clauses.append("LOWER(COALESCE(rating, '')) IN ('q', 'questionable', 'e', 'explicit', 'nsfw')")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        total_sources = int(connection.execute(f"SELECT COUNT(*) FROM tags{where}", params).fetchone()[0])
+        effective_limit = requested_limit or MAX_RANBOORU_SOURCE_RECORDS
+        rows = connection.execute(
+            f"SELECT {', '.join(select_fields)} FROM tags{where} ORDER BY id ASC LIMIT ?",
+            (*params, effective_limit),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    database_key = hashlib.sha256(os.path.normcase(str(path)).encode("utf-8")).hexdigest()[:16]
+    records, invalid_source_refs, natural_available, stale_natural = [], [], 0, 0
+    for raw_row in rows:
+        row = dict(raw_row)
+        tags_prompt = str(row.get("tags_prompt") or row.get("tags_raw") or row.get("tags") or "").strip()
+        if not tags_prompt:
+            continue
+        source_id = str(row.get("id") or hashlib.sha256(tags_prompt.encode("utf-8")).hexdigest()[:16])
+        try:
+            source_score = int(float(row.get("score") or 0))
+        except (TypeError, ValueError, OverflowError):
+            source_score = 0
+        rating = str(row.get("rating") or "")
+        common = {
+            "negative_prompt": "",
+            "score": 0,
+            "score_source": "unrated",
+            "score_reason": f"从 Ranbooru 同步（源评分 {source_score}，分级 {rating or '未知'}）；需要 LLM 重新评价",
+            "score_model": "",
+            "tags": tags_prompt,
+            "source_kind": "ranbooru",
+            "_ranbooru_id": source_id,
+            "_ranbooru_score": source_score,
+            "_ranbooru_rating": rating,
+        }
+        if mode in {"tags", "both"}:
+            records.append({
+                **common,
+                "prompt": tags_prompt,
+                "output_mode": tag_output_mode,
+                "base_model": tag_base_model,
+                "source_ref": f"ranbooru:{database_key}:{source_id}:tags",
+                "_ranbooru_variant": "tags",
+            })
+
+        natural_prompt = str(row.get("natural_prompt") or "").strip()
+        natural_hash = str(row.get("natural_source_hash") or "").strip()
+        natural_ref = f"ranbooru:{database_key}:{source_id}:natural"
+        if natural_prompt and natural_hash and natural_hash != hashlib.sha256(tags_prompt.encode("utf-8")).hexdigest():
+            natural_prompt = ""
+            stale_natural += 1
+        if natural_prompt:
+            natural_available += 1
+            if mode in {"natural", "both"}:
+                records.append({
+                    **common,
+                    "prompt": natural_prompt,
+                    "output_mode": natural_output_mode,
+                    "base_model": natural_base_model,
+                    "source_ref": natural_ref,
+                    "_ranbooru_variant": "natural",
+                })
+        elif mode in {"natural", "both"}:
+            invalid_source_refs.append(natural_ref)
+
+    return {
+        "path": str(path),
+        "total_sources": total_sources,
+        "loaded_sources": len(rows),
+        "mapped_records": len(records),
+        "natural_available": natural_available,
+        "stale_natural": stale_natural,
+        "invalid_source_refs": invalid_source_refs,
+        "truncated": total_sources > len(rows),
+        "records": records,
+    }
+
+
 def get_provider_profile(provider: str) -> dict[str, Any]:
     provider = str(provider or "OpenAI Compatible").strip()
     if provider not in PROVIDER_PROFILES:
@@ -194,7 +352,8 @@ class StudioDB:
                     id INTEGER PRIMARY KEY, prompt TEXT NOT NULL, negative_prompt TEXT DEFAULT '',
                     output_mode TEXT DEFAULT 'Danbooru Tags', base_model TEXT DEFAULT '', score REAL DEFAULT 0,
                     score_source TEXT DEFAULT 'manual', score_reason TEXT DEFAULT '', score_model TEXT DEFAULT '',
-                    tags TEXT DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                    tags TEXT DEFAULT '', source_kind TEXT DEFAULT '', source_ref TEXT DEFAULT '',
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS wildcard_files (
                     path TEXT PRIMARY KEY, modified_at REAL NOT NULL, terms_json TEXT NOT NULL
@@ -213,12 +372,20 @@ class StudioDB:
                 conn.execute("ALTER TABLE prompts ADD COLUMN score_reason TEXT DEFAULT ''")
             if "score_model" not in columns:
                 conn.execute("ALTER TABLE prompts ADD COLUMN score_model TEXT DEFAULT ''")
+            if "source_kind" not in columns:
+                conn.execute("ALTER TABLE prompts ADD COLUMN source_kind TEXT DEFAULT ''")
+            if "source_ref" not in columns:
+                conn.execute("ALTER TABLE prompts ADD COLUMN source_ref TEXT DEFAULT ''")
             rows = conn.execute("SELECT * FROM prompts WHERE content_hash IS NULL OR content_hash='' ").fetchall()
             for row in rows:
                 record = dict(row)
                 conn.execute("UPDATE prompts SET content_hash=? WHERE id=?", (self._record_hash(record), record["id"]))
             conn.execute("CREATE INDEX IF NOT EXISTS idx_prompts_content_hash ON prompts(content_hash)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_prompts_score_updated ON prompts(score DESC, updated_at DESC)")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_prompts_external_source "
+                "ON prompts(source_kind, source_ref) WHERE source_kind != '' AND source_ref != ''"
+            )
 
     @staticmethod
     def _record_hash(record: dict[str, Any]) -> str:
@@ -229,21 +396,33 @@ class StudioDB:
     def save_prompt(
         self, prompt: str, negative: str = "", output_mode: str = "", base_model: str = "", score: float = 0,
         tags: str = "", record_id: int | None = None, score_source: str = "manual", score_reason: str = "",
-        score_model: str = "",
+        score_model: str = "", source_kind: str | None = None, source_ref: str | None = None,
     ) -> int:
         now = int(time.time())
         record = {"prompt": prompt, "negative_prompt": negative, "output_mode": output_mode, "base_model": base_model, "tags": tags}
         content_hash = self._record_hash(record)
         with self.lock, self._connection() as conn:
             if record_id:
-                conn.execute(
-                    "UPDATE prompts SET prompt=?, negative_prompt=?, output_mode=?, base_model=?, score=?, score_source=?, score_reason=?, score_model=?, tags=?, content_hash=?, updated_at=? WHERE id=?",
-                    (prompt, negative, output_mode, base_model, score, score_source, score_reason, score_model, tags, content_hash, now, record_id),
-                )
+                if source_kind is None and source_ref is None:
+                    conn.execute(
+                        "UPDATE prompts SET prompt=?, negative_prompt=?, output_mode=?, base_model=?, score=?, score_source=?, score_reason=?, score_model=?, tags=?, content_hash=?, updated_at=? WHERE id=?",
+                        (prompt, negative, output_mode, base_model, score, score_source, score_reason, score_model, tags, content_hash, now, record_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE prompts SET prompt=?, negative_prompt=?, output_mode=?, base_model=?, score=?, score_source=?, score_reason=?, score_model=?, tags=?, source_kind=?, source_ref=?, content_hash=?, updated_at=? WHERE id=?",
+                        (
+                            prompt, negative, output_mode, base_model, score, score_source, score_reason, score_model,
+                            tags, str(source_kind or ""), str(source_ref or ""), content_hash, now, record_id,
+                        ),
+                    )
                 return record_id
             cursor = conn.execute(
-                "INSERT INTO prompts(prompt, negative_prompt, output_mode, base_model, score, score_source, score_reason, score_model, tags, content_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (prompt, negative, output_mode, base_model, score, score_source, score_reason, score_model, tags, content_hash, now, now),
+                "INSERT INTO prompts(prompt, negative_prompt, output_mode, base_model, score, score_source, score_reason, score_model, tags, source_kind, source_ref, content_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    prompt, negative, output_mode, base_model, score, score_source, score_reason, score_model, tags,
+                    str(source_kind or ""), str(source_ref or ""), content_hash, now, now,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -301,6 +480,93 @@ class StudioDB:
                 seen.add(content_hash)
         return {"requested": len(prepared), "inserted": inserted, "duplicates": duplicates, "updated": updated, "ids": ids}
 
+    def sync_external_prompts(self, records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+        prepared = {}
+        now = int(time.time())
+        for item in records:
+            source_kind = re.sub(r"[^a-zA-Z0-9_.-]+", "", str(item.get("source_kind") or ""))[:80]
+            source_ref = str(item.get("source_ref") or "").strip()[:500]
+            prompt = str(item.get("prompt") or "").strip()
+            if not source_kind or not source_ref or not prompt:
+                continue
+            record = {
+                "prompt": prompt,
+                "negative_prompt": str(item.get("negative_prompt") or item.get("negative") or "").strip(),
+                "output_mode": str(item.get("output_mode") or "Danbooru Tags"),
+                "base_model": str(item.get("base_model") or ""),
+                "tags": str(item.get("tags") or item.get("source_tags") or "").strip(),
+                "source_kind": source_kind,
+                "source_ref": source_ref,
+                "score_reason": str(item.get("score_reason") or "Imported external prompt; LLM evaluation required")[:1000],
+            }
+            record["content_hash"] = self._record_hash(record)
+            prepared[(source_kind, source_ref)] = record
+
+        inserted, updated, unchanged, ids = 0, 0, 0, []
+        with self.lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for record in prepared.values():
+                existing = conn.execute(
+                    "SELECT * FROM prompts WHERE source_kind=? AND source_ref=? LIMIT 1",
+                    (record["source_kind"], record["source_ref"]),
+                ).fetchone()
+                if existing:
+                    record_id = int(existing["id"])
+                    fields = ("prompt", "negative_prompt", "output_mode", "base_model", "tags")
+                    if all(str(existing[field] or "") == str(record[field] or "") for field in fields):
+                        unchanged += 1
+                        ids.append(record_id)
+                        continue
+                    conn.execute(
+                        "UPDATE prompts SET prompt=?, negative_prompt=?, output_mode=?, base_model=?, score=0, score_source='unrated', score_reason=?, score_model='', tags=?, content_hash=?, updated_at=? WHERE id=?",
+                        (
+                            record["prompt"], record["negative_prompt"], record["output_mode"],
+                            record["base_model"], record["score_reason"], record["tags"],
+                            record["content_hash"], now, record_id,
+                        ),
+                    )
+                    updated += 1
+                    ids.append(record_id)
+                    continue
+                cursor = conn.execute(
+                    "INSERT INTO prompts(prompt, negative_prompt, output_mode, base_model, score, score_source, score_reason, score_model, tags, source_kind, source_ref, content_hash, created_at, updated_at) VALUES(?,?,?,?,0,'unrated',?,'',?,?,?,?,?,?)",
+                    (
+                        record["prompt"], record["negative_prompt"], record["output_mode"], record["base_model"],
+                        record["score_reason"], record["tags"], record["source_kind"], record["source_ref"],
+                        record["content_hash"], now, now,
+                    ),
+                )
+                inserted += 1
+                ids.append(int(cursor.lastrowid))
+        return {
+            "requested": len(prepared), "inserted": inserted, "updated": updated,
+            "unchanged": unchanged, "ids": ids,
+        }
+
+    def invalidate_external_prompts(
+        self, source_kind: str, source_refs: Iterable[str], reason: str = "External source is stale",
+    ) -> int:
+        refs = sorted({str(item or "").strip()[:500] for item in source_refs if str(item or "").strip()})
+        if not source_kind or not refs:
+            return 0
+        updated = 0
+        now = int(time.time())
+        reason_text = str(reason or "External source is stale")[:1000]
+        with self.lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for offset in range(0, len(refs), 500):
+                chunk = refs[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = conn.execute(
+                    f"UPDATE prompts SET score=0, score_source='unrated', score_reason=?, score_model='', updated_at=? "
+                    f"WHERE source_kind=? AND source_ref IN ({placeholders}) "
+                    "AND (COALESCE(score, 0) != 0 OR COALESCE(score_source, '') != 'unrated' "
+                    "OR COALESCE(score_reason, '') != ? OR COALESCE(score_model, '') != '')",
+                    (reason_text, now, str(source_kind), *chunk, reason_text),
+                )
+                updated += cursor.rowcount
+        return updated
+
     def list_prompts(
         self,
         query: str = "",
@@ -311,9 +577,9 @@ class StudioDB:
     ) -> list[dict[str, Any]]:
         clauses, params = [], []
         if query.strip():
-            clauses.append("(prompt LIKE ? OR negative_prompt LIKE ? OR tags LIKE ?)")
+            clauses.append("(prompt LIKE ? OR negative_prompt LIKE ? OR tags LIKE ? OR source_kind LIKE ? OR source_ref LIKE ?)")
             needle = f"%{query.strip()}%"
-            params.extend([needle, needle, needle])
+            params.extend([needle, needle, needle, needle, needle])
         if float(min_score or 0) > 0:
             clauses.append("score>=?")
             params.append(float(min_score))
@@ -443,7 +709,16 @@ class StudioDB:
             payload = json.loads(journal["records_json"])
             restored = 0
             for record in payload.get("records", []):
-                fields = ["id", "prompt", "negative_prompt", "output_mode", "base_model", "score", "score_source", "score_reason", "score_model", "tags", "content_hash", "created_at", "updated_at"]
+                record = dict(record)
+                if record.get("source_kind") and record.get("source_ref"):
+                    source_exists = conn.execute(
+                        "SELECT 1 FROM prompts WHERE source_kind=? AND source_ref=? LIMIT 1",
+                        (record["source_kind"], record["source_ref"]),
+                    ).fetchone()
+                    if source_exists:
+                        record["source_kind"] = ""
+                        record["source_ref"] = ""
+                fields = ["id", "prompt", "negative_prompt", "output_mode", "base_model", "score", "score_source", "score_reason", "score_model", "tags", "source_kind", "source_ref", "content_hash", "created_at", "updated_at"]
                 try:
                     conn.execute(f"INSERT INTO prompts({','.join(fields)}) VALUES({','.join('?' for _ in fields)})", tuple(record.get(field) for field in fields))
                 except sqlite3.IntegrityError:
@@ -472,7 +747,7 @@ class StudioDB:
         if file_format == "json":
             path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
         else:
-            fields = ["prompt", "negative_prompt", "output_mode", "base_model", "score", "score_source", "score_reason", "score_model", "tags", "created_at", "updated_at"]
+            fields = ["prompt", "negative_prompt", "output_mode", "base_model", "score", "score_source", "score_reason", "score_model", "tags", "source_kind", "source_ref", "created_at", "updated_at"]
             with path.open("w", encoding="utf-8-sig", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
                 writer.writeheader()

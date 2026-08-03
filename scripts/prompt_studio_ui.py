@@ -4,7 +4,6 @@ import base64
 import html
 import ipaddress
 import json
-import sys
 import threading
 import uuid
 from pathlib import Path
@@ -16,7 +15,8 @@ from starlette.requests import Request
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_system_prompt, build_user_message, call_llm, get_provider_profile, is_sfw_output,
-    evaluate_prompt_quality, process_tags, regional_format, validate_endpoint,
+    discover_ranbooru_cache, evaluate_prompt_quality, load_ranbooru_cache, process_tags,
+    regional_format, validate_endpoint,
 )
 
 
@@ -54,6 +54,27 @@ OUTPUT_UI_CHOICES = [
 ]
 PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
 ACTION_UI_CHOICES = [("扩写", "Expand"), ("润色", "Polish")]
+RANBOORU_CONTENT_CHOICES = [
+    ("Tag Prompt", "tags"),
+    ("自然语言 Prompt", "natural"),
+    ("Tag 与自然语言分别导入", "both"),
+]
+RANBOORU_RATING_CHOICES = [
+    ("全部分级", "all"),
+    ("仅 SFW（g / general / safe / sensitive）", "sfw"),
+    ("仅 NSFW（q / questionable / e / explicit）", "nsfw"),
+]
+RANBOORU_LINK_DEFAULTS = {
+    "database_path": str(discover_ranbooru_cache()),
+    "content_mode": "both",
+    "rating_filter": "all",
+    "min_source_score": 0,
+    "source_limit": 0,
+    "tag_output_mode": "NoobAI Tags",
+    "tag_base_model": "NoobAI",
+    "natural_output_mode": "Krea 2 Natural",
+    "natural_base_model": "Krea 2",
+}
 WORKFLOW_DEFAULTS = {
     "preset": "Danbooru Tags",
     "system_override": "",
@@ -93,10 +114,12 @@ _BATCH_ACTIVE_TASK_ID = ""
 
 def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
     labels = {"llm": "LLM", "manual": "手动", "unrated": "未评分"}
+    source_labels = {"ranbooru": "Ranbooru"}
     return [[
         row.get("visible_position", ""), row["id"], row["score"], labels.get(row.get("score_source"), "手动"),
         row.get("score_model", ""), row["output_mode"], row["base_model"], row["prompt"],
         row["negative_prompt"], row["tags"], row.get("score_reason", ""),
+        source_labels.get(row.get("source_kind"), row.get("source_kind", "")), row.get("source_ref", ""),
     ] for row in records]
 
 
@@ -145,6 +168,58 @@ def _clear_cache_filters():
 
 def _safe_error(error: Exception) -> str:
     return html.escape(str(error), quote=False)
+
+
+def _ranbooru_link_settings() -> dict[str, Any]:
+    stored = DB.get_setting("ranbooru_link_v1", {}) or {}
+    values = {**RANBOORU_LINK_DEFAULTS, **(stored if isinstance(stored, dict) else {})}
+    if values["content_mode"] not in {value for _, value in RANBOORU_CONTENT_CHOICES}:
+        values["content_mode"] = RANBOORU_LINK_DEFAULTS["content_mode"]
+    if values["rating_filter"] not in {value for _, value in RANBOORU_RATING_CHOICES}:
+        values["rating_filter"] = RANBOORU_LINK_DEFAULTS["rating_filter"]
+    for key in ("tag_output_mode", "natural_output_mode"):
+        if values[key] not in PRESETS:
+            values[key] = RANBOORU_LINK_DEFAULTS[key]
+    for key in ("tag_base_model", "natural_base_model"):
+        if values[key] not in BASE_MODEL_GUIDANCE:
+            values[key] = RANBOORU_LINK_DEFAULTS[key]
+    try:
+        values["min_source_score"] = max(0, int(values["min_source_score"] or 0))
+    except (TypeError, ValueError):
+        values["min_source_score"] = 0
+    try:
+        values["source_limit"] = max(0, min(int(values["source_limit"] or 0), DB.MAX_IMPORT_RECORDS))
+    except (TypeError, ValueError):
+        values["source_limit"] = 0
+    values["database_path"] = str(values.get("database_path") or discover_ranbooru_cache())
+    return values
+
+
+def _save_ranbooru_link_settings(
+    database_path, content_mode, rating_filter, min_source_score, source_limit,
+    tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+):
+    values = {
+        "version": 1,
+        "database_path": str(database_path or discover_ranbooru_cache()),
+        "content_mode": content_mode,
+        "rating_filter": rating_filter,
+        "min_source_score": max(0, int(min_source_score or 0)),
+        "source_limit": max(0, min(int(source_limit or 0), DB.MAX_IMPORT_RECORDS)),
+        "tag_output_mode": tag_output_mode,
+        "tag_base_model": tag_base_model,
+        "natural_output_mode": natural_output_mode,
+        "natural_base_model": natural_base_model,
+    }
+    DB.set_setting("ranbooru_link_v1", values)
+    return "Ranbooru 联动参数已保存，下次打开界面会自动填入。"
+
+
+def _detect_ranbooru_cache():
+    path = discover_ranbooru_cache()
+    if path.is_file():
+        return str(path), f"已检测到 Ranbooru 缓存：{path}"
+    return str(path), f"未检测到 Ranbooru 缓存，请检查路径：{path}"
 
 
 def _workflow_settings() -> dict[str, Any]:
@@ -368,7 +443,10 @@ def _save_record(record_id, prompt, negative, output_mode, base_model, score, ta
         parsed_id = None
     if not str(prompt).strip():
         return "提示词不能为空", gr.update(), gr.update()
-    saved_id = DB.save_prompt(str(prompt).strip(), str(negative or ""), output_mode, base_model, float(score or 0), str(tags or ""), parsed_id)
+    saved_id = DB.save_prompt(
+        str(prompt).strip(), str(negative or ""), output_mode, base_model, float(score or 0),
+        str(tags or ""), parsed_id, source_kind="", source_ref="",
+    )
     table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model, [str(saved_id)])
     return f"已保存缓存记录 #{saved_id}", table, choices
 
@@ -564,6 +642,86 @@ def _import_cache(file_value, dedupe, query="", min_score=0, output_mode="全部
         )
     except Exception as error:
         return f"导入失败：{_safe_error(error)}", gr.update(), gr.update()
+
+
+def _ranbooru_load(
+    database_path, content_mode, rating_filter, min_source_score, source_limit,
+    tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+):
+    return load_ranbooru_cache(
+        database_path, content_mode, rating_filter, int(min_source_score or 0), int(source_limit or 0),
+        tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+    )
+
+
+def _preview_ranbooru_link(
+    database_path, content_mode, rating_filter, min_source_score, source_limit,
+    tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+):
+    try:
+        _save_ranbooru_link_settings(
+            database_path, content_mode, rating_filter, min_source_score, source_limit,
+            tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+        )
+        result = _ranbooru_load(
+            database_path, content_mode, rating_filter, min_source_score, source_limit,
+            tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+        )
+        rows = [[
+            index,
+            record.get("_ranbooru_id", ""),
+            "Tag" if record.get("_ranbooru_variant") == "tags" else "自然语言",
+            record.get("_ranbooru_score", 0),
+            record.get("_ranbooru_rating", ""),
+            record["output_mode"],
+            record["base_model"],
+            record["prompt"],
+        ] for index, record in enumerate(result["records"][:200], start=1)]
+        message = (
+            f"Ranbooru 缓存预览：源记录 {result['loaded_sources']}/{result['total_sources']}，"
+            f"可同步 Prompt {result['mapped_records']}，有效自然语言 {result['natural_available']}。"
+        )
+        if result["stale_natural"]:
+            message += f" 已跳过源 Tag 已变化的自然语言缓存 {result['stale_natural']} 条。"
+        if result["truncated"]:
+            message += " 当前受“最多读取源记录”限制，仅预览和同步前一部分。"
+        if len(result["records"]) > 200:
+            message += " 表格仅显示前 200 条。"
+        return gr.update(value=rows), message
+    except Exception as error:
+        return gr.update(value=[]), f"Ranbooru 缓存预览失败：{_safe_error(error)}"
+
+
+def _sync_ranbooru_link(
+    database_path, content_mode, rating_filter, min_source_score, source_limit,
+    tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+    query="", min_score=0, filter_output_mode="全部", filter_base_model="全部",
+):
+    try:
+        _save_ranbooru_link_settings(
+            database_path, content_mode, rating_filter, min_source_score, source_limit,
+            tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+        )
+        result = _ranbooru_load(
+            database_path, content_mode, rating_filter, min_source_score, source_limit,
+            tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+        )
+        stats = DB.sync_external_prompts(result["records"])
+        invalidated = DB.invalidate_external_prompts(
+            "ranbooru", result["invalid_source_refs"],
+            "Ranbooru 自然语言缓存已失效：源 Tag 已变化，需要重新转换并由 LLM 评价",
+        )
+        table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
+        message = (
+            f"Ranbooru 同步完成：新增 {stats['inserted']}，源内容更新 {stats['updated']}，"
+            f"未变化 {stats['unchanged']}，失效评分 {invalidated}。新记录和发生变化的记录均为未评分，"
+            "需要在缓存库选择后执行 LLM 评分才能进入高分 RAG。"
+        )
+        if result["stale_natural"]:
+            message += f" 跳过失效自然语言缓存 {result['stale_natural']} 条。"
+        return message, table, choices
+    except Exception as error:
+        return f"Ranbooru 同步失败：{_safe_error(error)}", gr.update(), gr.update()
 
 
 def _cancel_batch_generation(task_id=""):
@@ -1160,6 +1318,7 @@ def on_app_started(_, app):
 def on_ui_tabs():
     llm_settings = _connection_settings()
     workflow = _workflow_settings()
+    ranbooru_link = _ranbooru_link_settings()
     initial_records = DB.list_prompts()
     with gr.Blocks(analytics_enabled=False, elem_id="llm_prompt_studio") as ui:
         gr.Markdown("## LLM 提示词工作室\n本地静态词库、RAG Few-Shot、提示词缓存与 Forge 扩展集成。")
@@ -1243,7 +1402,7 @@ def on_ui_tabs():
 
             with gr.Tab("缓存库"):
                 with gr.Row():
-                    cache_query = gr.Textbox(label="搜索 Prompt、负面词或源标签", scale=4)
+                    cache_query = gr.Textbox(label="搜索 Prompt、负面词、源标签或外部来源", scale=4)
                     cache_min_score = gr.Slider(label="最低评分", minimum=0, maximum=10, value=0, step=0.5, scale=2)
                     cache_output_filter = gr.Dropdown(label="格式", choices=["全部"] + PRESET_UI_CHOICES, value="全部", scale=2)
                     cache_model_filter = gr.Dropdown(label="目标模型", choices=["全部"] + MODEL_UI_CHOICES, value="全部", scale=2)
@@ -1262,8 +1421,8 @@ def on_ui_tabs():
                 selection_preview = gr.Textbox(label="选择 / 删除预览", lines=6, interactive=False)
                 table = gr.Dataframe(
                     value=_as_rows(initial_records), label="已缓存 Prompt",
-                    headers=["全库序号", "内部 ID", "评分", "评分来源", "评分模型", "格式", "目标模型", "正向提示词", "负面提示词", "源标签", "评分理由"],
-                    datatype=["number", "number", "number", "str", "str", "str", "str", "str", "str", "str", "str"],
+                    headers=["全库序号", "内部 ID", "评分", "评分来源", "评分模型", "格式", "目标模型", "正向提示词", "负面提示词", "源标签", "评分理由", "外部来源", "来源标识"],
+                    datatype=["number", "number", "number", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str"],
                     interactive=False, wrap=True,
                 )
                 with gr.Accordion("记录编辑器", open=True):
@@ -1283,6 +1442,55 @@ def on_ui_tabs():
                     with gr.Row():
                         preview_positions = gr.Button("预览这些序号")
                         delete_positions = gr.Button("删除这些序号", variant="stop")
+                with gr.Accordion("Ranbooru 缓存联动", open=True):
+                    ranbooru_database_path = gr.Textbox(
+                        label="Ranbooru tag_cache.db 路径", value=ranbooru_link["database_path"],
+                    )
+                    with gr.Row():
+                        ranbooru_detect = gr.Button("自动检测路径")
+                        ranbooru_content_mode = gr.Radio(
+                            label="同步内容", choices=RANBOORU_CONTENT_CHOICES,
+                            value=ranbooru_link["content_mode"],
+                        )
+                        ranbooru_rating_filter = gr.Dropdown(
+                            label="内容分级筛选", choices=RANBOORU_RATING_CHOICES,
+                            value=ranbooru_link["rating_filter"],
+                        )
+                    with gr.Row():
+                        ranbooru_min_source_score = gr.Number(
+                            label="Ranbooru 最低源评分", value=ranbooru_link["min_source_score"], precision=0,
+                        )
+                        ranbooru_source_limit = gr.Number(
+                            label="最多读取源记录（0 表示安全上限 100000）", value=ranbooru_link["source_limit"], precision=0,
+                        )
+                    with gr.Row():
+                        ranbooru_tag_output_mode = gr.Dropdown(
+                            label="Tag 数据输出预设", choices=PRESET_UI_CHOICES,
+                            value=ranbooru_link["tag_output_mode"],
+                        )
+                        ranbooru_tag_base_model = gr.Dropdown(
+                            label="Tag 数据目标底模", choices=MODEL_UI_CHOICES,
+                            value=ranbooru_link["tag_base_model"],
+                        )
+                    with gr.Row():
+                        ranbooru_natural_output_mode = gr.Dropdown(
+                            label="自然语言数据输出预设", choices=PRESET_UI_CHOICES,
+                            value=ranbooru_link["natural_output_mode"],
+                        )
+                        ranbooru_natural_base_model = gr.Dropdown(
+                            label="自然语言数据目标底模", choices=MODEL_UI_CHOICES,
+                            value=ranbooru_link["natural_base_model"],
+                        )
+                    with gr.Row():
+                        ranbooru_save = gr.Button("保存联动参数")
+                        ranbooru_preview_button = gr.Button("预览 Ranbooru 缓存")
+                        ranbooru_sync_button = gr.Button("同步到本插件缓存", variant="primary")
+                    ranbooru_status = gr.Markdown("已自动填入上次保存的 Ranbooru 联动参数。")
+                    ranbooru_preview = gr.Dataframe(
+                        headers=["序号", "Ranbooru ID", "内容类型", "源评分", "分级", "输出预设", "目标底模", "Prompt"],
+                        datatype=["number", "str", "str", "number", "str", "str", "str", "str"],
+                        interactive=False, wrap=True, label="Ranbooru 同步预览",
+                    )
                 with gr.Accordion("JSON / CSV 导入导出", open=False):
                     with gr.Row():
                         import_file = gr.File(label="导入文件", file_types=[".json", ".csv"], type="filepath")
@@ -1346,6 +1554,22 @@ def on_ui_tabs():
         interrogate.click(_wd14_interrogate, inputs=[image, wd_endpoint, wd_model, wd_threshold], outputs=[wd_tags, wd_status])
         transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[transform_output, wd_status])
         cache_filter_inputs = [cache_query, cache_min_score, cache_output_filter, cache_model_filter]
+        ranbooru_inputs = [
+            ranbooru_database_path, ranbooru_content_mode, ranbooru_rating_filter,
+            ranbooru_min_source_score, ranbooru_source_limit,
+            ranbooru_tag_output_mode, ranbooru_tag_base_model,
+            ranbooru_natural_output_mode, ranbooru_natural_base_model,
+        ]
+        ranbooru_detect.click(_detect_ranbooru_cache, outputs=[ranbooru_database_path, ranbooru_status])
+        ranbooru_save.click(_save_ranbooru_link_settings, inputs=ranbooru_inputs, outputs=ranbooru_status)
+        ranbooru_preview_button.click(
+            _preview_ranbooru_link, inputs=ranbooru_inputs, outputs=[ranbooru_preview, ranbooru_status],
+        )
+        ranbooru_sync_button.click(
+            _sync_ranbooru_link,
+            inputs=[*ranbooru_inputs, *cache_filter_inputs],
+            outputs=[ranbooru_status, table, selected_records],
+        )
         refresh.click(_refresh_cache, inputs=cache_filter_inputs, outputs=[table, selected_records, cache_status])
         cache_query.submit(_refresh_cache, inputs=cache_filter_inputs, outputs=[table, selected_records, cache_status])
         clear_filters.click(_clear_cache_filters, outputs=[cache_query, cache_min_score, cache_output_filter, cache_model_filter, table, selected_records, cache_status])

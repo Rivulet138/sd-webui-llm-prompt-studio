@@ -1,3 +1,5 @@
+import hashlib
+import sqlite3
 import sys
 import tempfile
 import types
@@ -19,6 +21,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        self.root = root
         self.lexicon = root / "lexicon"
         self.lexicon.mkdir()
         self.originals = {
@@ -348,6 +351,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         record_id = ui.DB.save_prompt(
             "evaluated prompt", output_mode="NoobAI Tags", base_model="NoobAI", score=9, tags="source",
             score_source="llm", score_reason="Original evaluation", score_model="judge-model",
+            source_kind="ranbooru", source_ref="ranbooru:test:1:tags",
         )
 
         ui._save_record(
@@ -359,6 +363,64 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["score_source"], "manual")
         self.assertEqual(record["score_reason"], "")
         self.assertEqual(record["score_model"], "")
+        self.assertEqual(record["source_kind"], "")
+        self.assertEqual(record["source_ref"], "")
+
+    async def test_ranbooru_link_preview_sync_and_settings_are_idempotent(self):
+        path = self.root / "ranbooru_tag_cache.db"
+        tags = "1girl, silver_hair, library"
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("""
+                CREATE TABLE tags (
+                    id INTEGER PRIMARY KEY, tags TEXT NOT NULL, tags_prompt TEXT,
+                    natural_prompt TEXT, natural_source_hash TEXT, score INTEGER, rating TEXT
+                )
+            """)
+            conn.execute(
+                "INSERT INTO tags VALUES(?,?,?,?,?,?,?)",
+                (1, tags, tags, "A silver-haired girl in a library.", hashlib.sha256(tags.encode()).hexdigest(), 25, "g"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        link_args = (
+            str(path), "both", "sfw", 10, 0,
+            "NoobAI Tags", "NoobAI", "Krea 2 Natural", "Krea 2",
+        )
+        preview, preview_status = ui._preview_ranbooru_link(*link_args)
+        first_status, _table, _choices = ui._sync_ranbooru_link(*link_args)
+        second_status, _table, _choices = ui._sync_ranbooru_link(*link_args)
+        records = ui.DB.list_prompts()
+        natural = next(record for record in records if record["output_mode"] == "Krea 2 Natural")
+        ui.DB.save_prompt(
+            natural["prompt"], output_mode=natural["output_mode"], base_model=natural["base_model"],
+            score=9, tags=natural["tags"], record_id=natural["id"], score_source="llm",
+            score_reason="Verified", score_model="judge",
+        )
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("UPDATE tags SET tags='1girl, blue_hair', tags_prompt='1girl, blue_hair' WHERE id=1")
+            conn.commit()
+        finally:
+            conn.close()
+        stale_status, _table, _choices = ui._sync_ranbooru_link(*link_args)
+        stale_again_status, _table, _choices = ui._sync_ranbooru_link(*link_args)
+        invalidated = ui.DB.get_prompt(natural["id"])
+        saved = ui._ranbooru_link_settings()
+
+        self.assertEqual(len(preview["value"]), 2)
+        self.assertIn("可同步 Prompt 2", preview_status)
+        self.assertIn("新增 2", first_status)
+        self.assertIn("未变化 2", second_status)
+        self.assertIn("失效评分 1", stale_status)
+        self.assertIn("失效评分 0", stale_again_status)
+        self.assertEqual(invalidated["score_source"], "unrated")
+        self.assertEqual({record["source_kind"] for record in records}, {"ranbooru"})
+        self.assertEqual({record["score_source"] for record in records}, {"unrated"})
+        self.assertEqual(saved["database_path"], str(path))
+        self.assertEqual(saved["natural_base_model"], "Krea 2")
 
     async def test_batch_and_direct_import_previews_report_queue_shape(self):
         queue, status = ui._preview_batch_sources(

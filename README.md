@@ -1,6 +1,6 @@
 # LLM 提示词工作室 for Stable Diffusion WebUI Forge Neo
 
-面向 Stable Diffusion WebUI Forge Neo 的本地优先提示词扩展。插件把 LLM 提示词生成、模型专属规则、静态 Danbooru Tag 词库、本地高分 Prompt RAG、Few-Shot、批量缓存、WD14 Tagger 和区域提示词结构化输出整合到同一套中文界面中。
+面向 Stable Diffusion WebUI Forge Neo 的本地优先提示词扩展。插件把 LLM 提示词生成、模型专属规则、静态 Danbooru Tag 词库、本地高分 Prompt RAG、Few-Shot、Ranbooru 缓存联动、批量缓存、WD14 Tagger 和区域提示词结构化输出整合到同一套中文界面中。
 
 插件提供两个入口：
 
@@ -20,6 +20,7 @@
 - 完整工作参数保存与自动恢复，重新打开 Forge 后无需重复填写。
 - 插件内置 74 个分类 Tag 词库文件，也支持选择其他本地词库目录。
 - 本地 SQLite 高分 Prompt 库、LLM 质量评分与评分溯源、稀疏向量 RAG 和 Few-Shot 示例注入。
+- 自动发现并只读同步 `sd-webui-ranbooru-reforge` 的 Tag 与自然语言缓存，支持分级、源评分、数量限制、幂等更新和来源溯源。
 - Ranbooru 风格标签处理：移除不良标签、自定义通配排除、去重、随机打乱、下划线转空格和最大标签数量。
 - 独立的批量缓存页面，支持 LLM 批量生成、直接批量导入、队列预览、自动重试、错误后跳过、问题汇总、勾选手动重试、取消和进度记录。
 - 独立的缓存库页面，支持筛选、多选、查看、编辑、另存、删除预览、撤销和 JSON / CSV 导入导出。
@@ -40,6 +41,7 @@
 - [静态 Tag 词库](#静态-tag-词库)
 - [本地 RAG 与 Few-Shot](#本地-rag-与-few-shot)
 - [批量缓存](#批量缓存)
+- [Ranbooru 缓存联动](#ranbooru-缓存联动)
 - [缓存库管理](#缓存库管理)
 - [WD14 Tagger 与 LLM](#wd14-tagger-与-llm)
 - [Regional Prompter 结构化输出](#regional-prompter-结构化输出)
@@ -80,6 +82,7 @@ git pull --ff-only
 - Stable Diffusion WebUI Forge Neo。
 - 一个可以访问的 LLM 服务及其模型 ID。
 - 使用 WD14 功能时，需要另外安装并启用 WD14 Tagger 扩展。
+- 使用 Ranbooru 缓存联动时，需要安装 `sd-webui-ranbooru-reforge`，或提供兼容的 `tag_cache.db` 路径。
 - 使用区域提示词时，Regional Prompter 是可选扩展；本插件只负责生成结构化结果，不会直接控制 Regional Prompter 的界面。
 
 ## 界面入口
@@ -276,6 +279,8 @@ NoobAI 输出顺序：
 | WD14 | API 地址、模型、阈值 |
 | 静态词库 | 当前词库目录 |
 
+Ranbooru 联动参数使用独立设置保存，包括数据库路径、同步内容、分级、最低源评分、读取上限，以及 Tag / 自然语言各自的输出预设和目标底模。点击 `保存联动参数`、`预览 Ranbooru 缓存` 或 `同步到本插件缓存` 都会保存当前值。
+
 不会保存：
 
 - 创作要求正文。
@@ -460,6 +465,54 @@ RAG 示例位于 `<rag_examples>` 数据区块，只用于参考输出格式和�
 
 直接导入使用内容哈希去重，状态会显示新增和重复数量。直接导入的评分来源为 `manual`，需要在缓存库选择记录并执行 `使用 LLM 评分所选` 后才会进入高分 RAG。
 
+## Ranbooru 缓存联动
+
+缓存库页面内置 `Ranbooru 缓存联动` 面板。默认自动检测：
+
+```text
+extensions/sd-webui-ranbooru-reforge/user/cache/tag_cache.db
+```
+
+也可以填写其他 Ranbooru `tag_cache.db`。插件使用 SQLite 只读模式打开源数据库，不修改 Ranbooru 的记录、游标、元数据、备份或筛选状态，也不会复制或替换 Ranbooru 数据库文件。
+
+### 支持的源数据
+
+当前 Ranbooru 字段：
+
+- `tags_prompt`，并兼容 `tags_raw` 和旧版 `tags`。
+- `natural_prompt` 与 `natural_source_hash`。
+- Ranbooru 站点源评分 `score`。
+- 内容分级 `rating`。
+- Ranbooru 内部记录 ID。
+
+自然语言缓存被清空，或 `natural_source_hash` 与当前 Tag 不一致时，说明转换结果已经不可用，该自然语言记录会被跳过；当同步内容包含自然语言时，本插件中已经同步的对应记录会立即重置为 `0 / unrated`，避免旧 LLM 高分继续进入 RAG。仅含 `id + tags` 的旧版数据库仍可同步 Tag Prompt。
+
+### 联动参数
+
+| 参数 | 作用 |
+| --- | --- |
+| `同步内容` | 仅 Tag、仅自然语言，或两种内容分别同步为独立记录 |
+| `内容分级筛选` | 全部、仅 SFW，或仅 NSFW |
+| `Ranbooru 最低源评分` | 按 Ranbooru 原始站点评分过滤源记录，不等同于本插件 LLM 质量评分 |
+| `最多读取源记录` | `0` 表示使用 100000 条安全上限；其他值用于分批预览和同步 |
+| `Tag 数据输出预设 / 目标底模` | 默认映射为 `NoobAI Tags / NoobAI` |
+| `自然语言数据输出预设 / 目标底模` | 默认映射为 `Krea 2 Natural / Krea 2` |
+
+点击 `预览 Ranbooru 缓存` 会显示最多 200 条映射结果和完整数量统计，不写入本插件数据库。点击 `同步到本插件缓存` 后才会写入 `user/prompt_studio.db`。
+
+### 同步、去重和评分
+
+每条联动记录保存独立的 `source_kind=ranbooru` 和稳定来源标识。重复同步同一数据库时：
+
+- 源内容没有变化：保留本插件记录和已有 LLM 评分，计入“未变化”。
+- 源 Tag、自然语言、映射预设或目标底模变化：原位更新记录，评分重置为 `0 / unrated`。
+- 新源记录：新增为 `0 / unrated`。
+- Ranbooru 删除源记录：当前不会自动删除本插件中已经同步的副本。
+
+Ranbooru 的站点评分只是帖子热度或来源评分，不会冒充 Prompt 质量评分。同步记录必须在本插件缓存库中选择并点击 `使用 LLM 评分所选`，成功评价后才可能进入高分 RAG。
+
+手动编辑并保存联动记录会清除 Ranbooru 来源绑定，把它变成独立的本地手动记录。后续同步不会覆盖这个手动版本；如果源记录仍存在，会重新建立一条新的联动记录。
+
 ## 缓存库管理
 
 主数据库：
@@ -479,6 +532,7 @@ user/prompt_studio.db
 - 评分来源：`llm`、`manual` 或 `unrated`。
 - LLM 评分理由和评分模型。
 - 源标签或源输入。
+- 外部来源类型与来源标识；Ranbooru 同步记录显示为 `Ranbooru`。
 - 内容哈希。
 - 创建和更新时间。
 
@@ -486,7 +540,7 @@ user/prompt_studio.db
 
 缓存库支持：
 
-- 搜索 Prompt、负面 Prompt 和源标签。
+- 搜索 Prompt、负面 Prompt、源标签和外部来源。
 - 最低评分。
 - 输出格式。
 - 目标模型。
@@ -502,6 +556,7 @@ user/prompt_studio.db
 - 编辑器可以修改正向 Prompt、负面 Prompt、格式、目标模型、评分和源标签。
 - `使用 LLM 评分所选` 会调用当前 Provider 重新评价最多 200 条所选缓存，并更新评分来源、理由和模型。
 - 手动保存编辑后的记录会把评分来源重置为 `manual`，防止修改后的 Prompt 继续使用旧 LLM 评价。
+- 手动保存 Ranbooru 联动记录时会同时解除来源绑定，保护编辑后的本地版本不被下一次同步覆盖。
 - `保存当前记录` 更新原记录。
 - `另存为新记录` 创建新记录。
 - 保存后只有仍符合当前筛选条件的记录会继续保留在选择列表中。
@@ -832,6 +887,7 @@ E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover `
 - NoobAI 规则、权重范围和旧 SD 配置移除。
 - SFW 输出校验。
 - LLM 评分 JSON 解析、评分来源迁移、手动高分排除、模型/格式过滤与重复记录评分升级。
+- Ranbooru 当前/旧版 SQLite 读取、Tag/自然语言映射、分级筛选、联动参数保存、幂等同步和源内容变化后的评分失效。
 - RAG 相似度与超过 1000 条 LLM 评分缓存后的完整检索。
 - Provider 请求参数、URL 拼接和响应解析。
 - 多 Provider 设置、URL 自动恢复、凭据隔离和旧配置迁移。
@@ -937,6 +993,7 @@ Provider 官方文档：
 - 批量 LLM 取消会在当前请求返回或超时后生效；WD14 页面当前不提供取消功能。
 - 本地稀疏向量 RAG 不等价于大型语义 Embedding；缓存非常大时，全候选扫描会增加检索耗时。
 - 缓存库界面默认显示 200 条，缓存查询 API 单次最多返回 1000 条，但 RAG 不受这两个展示上限影响。
+- Ranbooru 联动是单向只读同步；源库中删除的记录不会自动从本插件缓存删除，需要在缓存库中手动选择并删除。
 - Regional JSON / Markdown 是编辑模板，不是自动空间理解或 Regional Prompter 直接控制。
 - 自定义 System Prompt 不能覆盖 Prompt Policy、底模规则和安全规则。
 - SFW 校验是本地关键词防线，不替代 Provider 自身的安全策略或人工检查。
