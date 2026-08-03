@@ -6,6 +6,7 @@ import ipaddress
 import json
 import sys
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,7 @@ WORKFLOW_DEFAULTS = {
     "save_score": 0,
     "cache_result": True,
     "batch_skip_existing": True,
+    "batch_skip_failed": True,
     "batch_retries": 2,
     "batch_score": 7,
     "wd_endpoint": "http://127.0.0.1:7860",
@@ -84,6 +86,8 @@ _INLINE_SLOTS: set[str] = set()
 _INLINE_LOCK = threading.RLock()
 _BATCH_CANCEL = threading.Event()
 _BATCH_LOCK = threading.Lock()
+_BATCH_CONTROL_LOCK = threading.Lock()
+_BATCH_ACTIVE_TASK_ID = ""
 
 
 def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
@@ -169,7 +173,7 @@ def _workflow_settings() -> dict[str, Any]:
             values[key] = max(minimum, min(float(values[key]), maximum))
         except (TypeError, ValueError):
             values[key] = WORKFLOW_DEFAULTS[key]
-    for key in ["remove_bad", "shuffle", "spaces", "cache_result", "batch_skip_existing"]:
+    for key in ["remove_bad", "shuffle", "spaces", "cache_result", "batch_skip_existing", "batch_skip_failed"]:
         values[key] = bool(values[key])
     for key in [
         "system_override", "nsfw_injection", "user_instruction", "remove_terms",
@@ -190,7 +194,7 @@ def _save_workflow_settings(
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
     few_shot_count, rag_min_score, save_score, cache_result,
-    batch_skip_existing, batch_retries, batch_score,
+    batch_skip_existing, batch_skip_failed, batch_retries, batch_score,
     wd_endpoint, wd_model, wd_threshold, wildcard_path,
 ):
     return _save_workflow_values({
@@ -201,7 +205,8 @@ def _save_workflow_settings(
         "spaces": bool(spaces), "max_tags": int(max_tags or 0),
         "few_shot_count": int(few_shot_count or 0), "rag_min_score": float(rag_min_score or 0),
         "save_score": float(save_score or 0), "cache_result": bool(cache_result),
-        "batch_skip_existing": bool(batch_skip_existing), "batch_retries": int(batch_retries or 0),
+        "batch_skip_existing": bool(batch_skip_existing), "batch_skip_failed": bool(batch_skip_failed),
+        "batch_retries": int(batch_retries or 0),
         "batch_score": float(batch_score or 0), "wd_endpoint": wd_endpoint, "wd_model": wd_model,
         "wd_threshold": float(wd_threshold or 0), "wildcard_path": wildcard_path,
     })
@@ -212,7 +217,7 @@ def _workflow_component_values(values: dict[str, Any]) -> list[Any]:
         "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction",
         "structured_mode", "region_count", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags",
         "few_shot_count", "rag_min_score", "save_score", "cache_result",
-        "batch_skip_existing", "batch_retries", "batch_score",
+        "batch_skip_existing", "batch_skip_failed", "batch_retries", "batch_score",
         "wd_endpoint", "wd_model", "wd_threshold", "wildcard_path",
     ]]
 
@@ -506,8 +511,11 @@ def _import_cache(file_value, dedupe, query="", min_score=0, output_mode="全部
         return f"导入失败：{_safe_error(error)}", gr.update(), gr.update()
 
 
-def _cancel_batch_generation():
-    _BATCH_CANCEL.set()
+def _cancel_batch_generation(task_id=""):
+    with _BATCH_CONTROL_LOCK:
+        if not task_id or str(task_id) != _BATCH_ACTIVE_TASK_ID:
+            return "当前会话没有正在运行的批量任务，未发送取消请求。"
+        _BATCH_CANCEL.set()
     return "已请求取消。当前 HTTP 请求返回后会停止，并保存已完成结果。"
 
 
@@ -545,23 +553,58 @@ def _preview_batch_sources(source_text, skip_existing, preset, base_model):
     return gr.update(value=rows), message
 
 
+def _batch_issue_views(issues, selected=None):
+    records = [dict(item) for item in (issues or []) if isinstance(item, dict) and str(item.get("source") or "").strip()]
+    rows = [
+        [item.get("index", ""), item["source"], item.get("status", ""), item.get("reason", ""), item.get("attempts", 0)]
+        for item in records
+    ]
+    choices = []
+    for item in records:
+        preview = " ".join(str(item["source"]).split())
+        if len(preview) > 72:
+            preview = preview[:69] + "..."
+        choices.append((f"#{item.get('index', '')} · {item.get('status', '')} · {preview}", str(item["source"])))
+    available = {value for _, value in choices}
+    retained = [value for value in _selected_values(selected) if value in available]
+    return gr.update(value=rows), gr.update(choices=choices, value=retained), records
+
+
+def _select_all_batch_issues(issues):
+    values = [str(item.get("source") or "") for item in (issues or []) if isinstance(item, dict) and item.get("source")]
+    return gr.update(value=values)
+
+
+def _clear_batch_issue_selection():
+    return gr.update(value=[])
+
+
+def _batch_output(status, table, cache_choices, issues, selected=None):
+    issue_table, issue_choices, issue_state = _batch_issue_views(issues, selected)
+    return status, table, cache_choices, issue_table, issue_choices, issue_state
+
+
 def _batch_generate(
-    source_text, skip_existing, retries, batch_score,
+    source_text, skip_existing, skip_failed, retries, batch_score,
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-    query="", min_score=0, filter_output_mode="全部", filter_base_model="全部",
+    query="", min_score=0, filter_output_mode="全部", filter_base_model="全部", existing_issues=None, task_id="",
 ):
+    global _BATCH_ACTIVE_TASK_ID
     sources, _parse_stats = _parse_batch_sources(source_text)
     if not sources:
-        yield "请输入批量请求，每行一条。", gr.update(), gr.update(), gr.update(value=[])
+        yield _batch_output("请输入批量请求，每行一条。", gr.update(), gr.update(), existing_issues or [])
         return
     if not _BATCH_LOCK.acquire(blocking=False):
-        yield "已有批量任务正在运行。", gr.update(), gr.update(), gr.update()
+        yield _batch_output("已有批量任务正在运行。", gr.update(), gr.update(), existing_issues or [])
         return
-    _BATCH_CANCEL.clear()
+    task_id = str(task_id or "")
+    with _BATCH_CONTROL_LOCK:
+        _BATCH_ACTIVE_TASK_ID = task_id
+        _BATCH_CANCEL.clear()
     pending, inserted, duplicates, skipped, failed = [], 0, 0, 0, 0
-    failures = []
+    issues = []
 
     def flush_pending():
         nonlocal inserted, duplicates
@@ -575,49 +618,119 @@ def _batch_generate(
     try:
         for index, source in enumerate(sources, start=1):
             if _BATCH_CANCEL.is_set():
+                for remaining_index, remaining_source in enumerate(sources[index - 1:], start=index):
+                    issues.append({
+                        "index": remaining_index, "source": remaining_source, "status": "已取消",
+                        "reason": "批量任务已取消，尚未处理", "attempts": 0,
+                    })
                 flush_pending()
                 table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
-                yield (
+                yield _batch_output(
                     f"任务已取消：处理 {index - 1}/{len(sources)}，新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
-                    table, choices, gr.update(value=failures),
+                    table, choices, issues,
                 )
                 return
             if skip_existing and DB.has_source_prompt(source, preset, base_model):
                 skipped += 1
+                issues.append({
+                    "index": index, "source": source, "status": "已跳过",
+                    "reason": "已有相同输入、输出预设和目标底模的缓存", "attempts": 0,
+                })
                 continue
             generated, last_status = "", ""
-            for _attempt in range(max(0, min(int(retries or 0), 3)) + 1):
-                generated, _system, last_status = _generate(
-                    source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-                    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
-                    remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-                    batch_score, False,
-                )
+            attempts = max(0, min(int(retries or 0), 3)) + 1
+            attempted = 0
+            for _attempt in range(attempts):
+                attempted += 1
+                try:
+                    generated, _system, last_status = _generate(
+                        source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+                        provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+                        remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
+                        batch_score, False,
+                    )
+                except Exception as error:
+                    generated, last_status = "", f"生成失败：{_safe_error(error)}"
                 if generated or _BATCH_CANCEL.is_set():
                     break
             if generated:
                 pending.append({"prompt": generated, "output_mode": preset, "base_model": base_model, "score": batch_score, "tags": source})
             else:
                 failed += 1
-                failures.append([index, source, last_status or "未返回结果"])
+                issues.append({
+                    "index": index, "source": source, "status": "生成错误",
+                    "reason": last_status or "未返回结果", "attempts": attempted,
+                })
+                if not skip_failed and not _BATCH_CANCEL.is_set():
+                    for remaining_index, remaining_source in enumerate(sources[index:], start=index + 1):
+                        issues.append({
+                            "index": remaining_index, "source": remaining_source, "status": "未处理",
+                            "reason": "前一项重试耗尽，批量任务已停止", "attempts": 0,
+                        })
+                    flush_pending()
+                    table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
+                    yield _batch_output(
+                        f"批量任务因错误停止：处理 {index}/{len(sources)}，新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
+                        table, choices, issues,
+                    )
+                    return
             if len(pending) >= 10 or index == len(sources):
                 flush_pending()
                 table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
-                yield (
+                yield _batch_output(
                     f"进度 {index}/{len(sources)}：新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}" + (f"；最近状态：{last_status}" if last_status and not generated else ""),
-                    table, choices, gr.update(value=failures),
+                    table, choices, issues,
                 )
         table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
-        yield (
-            f"批量任务完成：新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
-            table, choices, gr.update(value=failures),
+        yield _batch_output(
+            f"批量任务完成：新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}；问题汇总 {len(issues)} 条",
+            table, choices, issues,
         )
     finally:
         try:
             flush_pending()
         finally:
-            _BATCH_CANCEL.clear()
+            with _BATCH_CONTROL_LOCK:
+                if _BATCH_ACTIVE_TASK_ID == task_id:
+                    _BATCH_ACTIVE_TASK_ID = ""
+                    _BATCH_CANCEL.clear()
             _BATCH_LOCK.release()
+
+
+def _retry_batch_issues(
+    selected_sources, issue_records, retries, skip_failed, batch_score,
+    preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+    remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
+    query="", min_score=0, filter_output_mode="全部", filter_base_model="全部", task_id="",
+):
+    issues = [dict(item) for item in (issue_records or []) if isinstance(item, dict) and item.get("source")]
+    requested = set(_selected_values(selected_sources))
+    selected = [item for item in issues if str(item["source"]) in requested]
+    if not selected:
+        yield _batch_output("请先勾选需要手动重试的错误或跳过项。", gr.update(), gr.update(), issues, selected_sources)
+        return
+
+    selected_values = {str(item["source"]) for item in selected}
+    original_indices = {str(item["source"]): item.get("index", "") for item in selected}
+    remaining = [item for item in issues if str(item["source"]) not in selected_values]
+    source_text = "\n".join(str(item["source"]) for item in selected)
+    generator = _batch_generate(
+        source_text, False, skip_failed, retries, batch_score,
+        preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+        provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+        remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
+        query, min_score, filter_output_mode, filter_base_model, selected, task_id,
+    )
+    for status, table, cache_choices, _issue_table, _issue_choices, retry_issues in generator:
+        remapped = []
+        for item in retry_issues:
+            updated = dict(item)
+            updated["index"] = original_indices.get(str(updated.get("source") or ""), updated.get("index", ""))
+            remapped.append(updated)
+        combined = sorted([*remaining, *remapped], key=lambda item: int(item.get("index") or 0))
+        retained_selection = selected_sources if status == "已有批量任务正在运行。" else None
+        yield _batch_output(f"手动重试：{status}", table, cache_choices, combined, retained_selection)
 
 
 def _index_wildcards(path):
@@ -986,6 +1099,7 @@ def on_ui_tabs():
                         batch_sources = gr.Textbox(label="生成队列：每行一条创作要求或源标签", lines=12, placeholder="红发魔法师在月光图书馆阅读\n蓝发少女站在雨中的车站")
                         with gr.Row():
                             batch_skip_existing = gr.Checkbox(label="跳过相同输入的已有缓存", value=workflow["batch_skip_existing"])
+                            batch_skip_failed = gr.Checkbox(label="重试耗尽后跳过并继续", value=workflow["batch_skip_failed"])
                             batch_retries = gr.Slider(label="失败重试次数", minimum=0, maximum=3, value=workflow["batch_retries"], step=1)
                             batch_score = gr.Slider(label="批量结果评分", minimum=0, maximum=10, value=workflow["batch_score"], step=0.5)
                         with gr.Row():
@@ -996,7 +1110,18 @@ def on_ui_tabs():
                         batch_preview_status = gr.Markdown()
                         batch_queue = gr.Dataframe(headers=["序号", "输入", "状态"], datatype=["number", "str", "str"], interactive=False, wrap=True, label="队列预览")
                         batch_status = gr.Markdown("尚未开始批量任务。取消会在当前 HTTP 请求返回后生效，已完成结果会保留。")
-                        batch_failures = gr.Dataframe(headers=["序号", "输入", "错误"], datatype=["number", "str", "str"], interactive=False, wrap=True, label="失败清单")
+                        batch_task_id = gr.State(lambda: uuid.uuid4().hex)
+                        batch_issue_state = gr.State([])
+                        batch_issues = gr.Dataframe(
+                            headers=["序号", "Tag / 输入", "状态", "错误或跳过原因", "本轮尝试次数"],
+                            datatype=["number", "str", "str", "str", "number"],
+                            interactive=False, wrap=True, label="错误与跳过汇总",
+                        )
+                        batch_issue_selection = gr.CheckboxGroup(label="勾选需要手动重试的 Tag / 输入", choices=[])
+                        with gr.Row():
+                            batch_select_all_issues = gr.Button("全选错误与跳过项")
+                            batch_clear_issue_selection = gr.Button("清空选择")
+                            batch_retry_selected = gr.Button("手动重试所选", variant="primary")
                     with gr.Tab("直接批量导入"):
                         bulk_import = gr.Textbox(label="每行一条 Prompt，可使用“评分<TAB>Prompt”格式", lines=12)
                         with gr.Row():
@@ -1097,7 +1222,7 @@ def on_ui_tabs():
             preset, system_override, base_model, safety, nsfw_injection, user_instruction,
             structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
             few_shot_count, rag_min_score, save_score, cache_result,
-            batch_skip_existing, batch_retries, batch_score,
+            batch_skip_existing, batch_skip_failed, batch_retries, batch_score,
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
         generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
@@ -1129,10 +1254,17 @@ def on_ui_tabs():
         batch_preview_button.click(_preview_batch_sources, inputs=[batch_sources, batch_skip_existing, preset, base_model], outputs=[batch_queue, batch_preview_status])
         batch_generate.click(
             _batch_generate,
-            inputs=[batch_sources, batch_skip_existing, batch_retries, batch_score, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs],
-            outputs=[batch_status, table, selected_records, batch_failures],
+            inputs=[batch_sources, batch_skip_existing, batch_skip_failed, batch_retries, batch_score, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_issue_state, batch_task_id],
+            outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state],
         )
-        batch_cancel.click(_cancel_batch_generation, outputs=batch_status)
+        batch_cancel.click(_cancel_batch_generation, inputs=batch_task_id, outputs=batch_status)
+        batch_select_all_issues.click(_select_all_batch_issues, inputs=batch_issue_state, outputs=batch_issue_selection)
+        batch_clear_issue_selection.click(_clear_batch_issue_selection, outputs=batch_issue_selection)
+        batch_retry_selected.click(
+            _retry_batch_issues,
+            inputs=[batch_issue_selection, batch_issue_state, batch_retries, batch_skip_failed, batch_score, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_task_id],
+            outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state],
+        )
         preview_positions.click(_preview_positions, inputs=position_spec, outputs=[cache_status, table, selected_records])
         delete_positions.click(_delete_positions, inputs=[position_spec, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
         undo_delete.click(_undo_last_delete, inputs=cache_filter_inputs, outputs=[cache_status, table, selected_records])

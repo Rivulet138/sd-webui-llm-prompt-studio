@@ -26,6 +26,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "credentials": ui.CREDENTIALS,
             "wildcards": ui.DEFAULT_WILDCARDS,
             "call_llm": ui.call_llm,
+            "generate": ui._generate,
             "modules": sys.modules.get("modules"),
             "modules.shared": sys.modules.get("modules.shared"),
         }
@@ -53,6 +54,10 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         ui.CREDENTIALS = self.originals["credentials"]
         ui.DEFAULT_WILDCARDS = self.originals["wildcards"]
         ui.call_llm = self.originals["call_llm"]
+        ui._generate = self.originals["generate"]
+        with ui._BATCH_CONTROL_LOCK:
+            ui._BATCH_ACTIVE_TASK_ID = ""
+            ui._BATCH_CANCEL.clear()
         for name in ["modules", "modules.shared"]:
             if self.originals[name] is None:
                 sys.modules.pop(name, None)
@@ -74,6 +79,17 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         transport = httpx.ASGITransport(app=app, client=(client_host, 43210))
         async with httpx.AsyncClient(transport=transport, base_url="http://plugin.test") as client:
             return await client.request(method, path, **kwargs)
+
+    @staticmethod
+    def _batch_args(source_text, skip_existing=True, skip_failed=True, retries=2):
+        return (
+            source_text, skip_existing, skip_failed, retries, 7,
+            "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.35, 90, 1024, True, 0, 0,
+            True, "", False, False, 0, "Plain Prompt", 1,
+            "", 0, "全部", "全部",
+        )
 
     async def test_local_api_uses_saved_endpoint_and_blocks_remote_clients(self):
         self._install_shared("")
@@ -237,7 +253,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "NoobAI Tags", "custom system", "NoobAI", "NSFW", "local policy", "最多 40 个标签",
             "Regional JSON", 4, True, "watermark", True, True, 40,
             5, 8.5, 9, True,
-            False, 3, 8,
+            False, True, 3, 8,
             "http://127.0.0.1:7861", "wd-test", 0.42, str(self.lexicon),
         )
 
@@ -246,12 +262,13 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored["preset"], "NoobAI Tags")
         self.assertEqual(restored["base_model"], "NoobAI")
         self.assertEqual(restored["structured_mode"], "Regional JSON")
+        self.assertTrue(restored["batch_skip_failed"])
         self.assertEqual(restored["batch_retries"], 3)
         self.assertEqual(restored["wd_model"], "wd-test")
         self.assertEqual(restored["wildcard_path"], str(self.lexicon))
 
         reset_values = ui._reset_workflow_settings()
-        self.assertEqual(len(reset_values), 25)
+        self.assertEqual(len(reset_values), 26)
         self.assertEqual(reset_values[0], ui.WORKFLOW_DEFAULTS["preset"])
         self.assertIn("已恢复默认", reset_values[-1])
         self.assertIsNone(ui.DB.get_setting("workflow_settings_v1"))
@@ -269,6 +286,137 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(direct["value"][0][1], 8)
         self.assertEqual(direct["value"][1][1], 6)
         self.assertIn("2 条可导入", direct_status)
+
+    async def test_batch_retries_then_collects_errors_and_cached_skips(self):
+        ui.DB.save_prompt("already cached", "", "NoobAI Tags", "NoobAI", 7, "cached")
+        attempts = {}
+
+        def fake_generate(source, *_args):
+            attempts[source] = attempts.get(source, 0) + 1
+            if source == "retry":
+                if attempts[source] >= 3:
+                    return "1girl, recovered", "", "生成完成"
+                raise RuntimeError(f"临时异常 {attempts[source]}")
+            return "", "", f"模拟错误 {attempts[source]}"
+
+        ui._generate = fake_generate
+        results = list(ui._batch_generate(*self._batch_args("retry\ncached\nbad")))
+        status, _table, _choices, issue_table, issue_choices, issue_state = results[-1]
+
+        self.assertEqual(attempts, {"retry": 3, "bad": 3})
+        self.assertIn("问题汇总 2 条", status)
+        self.assertEqual([item["status"] for item in issue_state], ["已跳过", "生成错误"])
+        self.assertEqual(issue_state[1]["attempts"], 3)
+        self.assertEqual(len(issue_table["value"]), 2)
+        self.assertEqual(len(issue_choices["choices"]), 2)
+        self.assertTrue(ui.DB.has_source_prompt("retry", "NoobAI Tags", "NoobAI"))
+
+    async def test_batch_can_stop_after_retry_exhaustion_and_collect_unprocessed(self):
+        calls = []
+
+        def fake_generate(source, *_args):
+            calls.append(source)
+            return "", "", "永久错误"
+
+        ui._generate = fake_generate
+        results = list(ui._batch_generate(*self._batch_args("bad\nlater", False, False, 1)))
+        status, _table, _choices, _issue_table, _issue_choices, issue_state = results[-1]
+
+        self.assertEqual(calls, ["bad", "bad"])
+        self.assertIn("因错误停止", status)
+        self.assertEqual([item["status"] for item in issue_state], ["生成错误", "未处理"])
+        self.assertEqual(issue_state[0]["attempts"], 2)
+
+    async def test_manual_retry_runs_only_selected_issue_and_preserves_the_rest(self):
+        ui.DB.save_prompt("old alpha", "", "NoobAI Tags", "NoobAI", 7, "alpha")
+        calls = []
+
+        def fake_generate(source, *_args):
+            calls.append(source)
+            return f"generated {source}", "", "生成完成"
+
+        ui._generate = fake_generate
+        issues = [
+            {"index": 2, "source": "alpha", "status": "已跳过", "reason": "已有缓存", "attempts": 0},
+            {"index": 5, "source": "beta", "status": "生成错误", "reason": "超时", "attempts": 3},
+        ]
+        retry_args = (
+            ["alpha"], issues, 1, True, 7,
+            "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.35, 90, 1024, True, 0, 0,
+            True, "", False, False, 0, "Plain Prompt", 1,
+            "", 0, "全部", "全部",
+        )
+        results = list(ui._retry_batch_issues(*retry_args))
+        status, _table, _choices, issue_table, issue_choices, issue_state = results[-1]
+
+        self.assertEqual(calls, ["alpha"])
+        self.assertIn("手动重试", status)
+        self.assertEqual([item["source"] for item in issue_state], ["beta"])
+        self.assertEqual(issue_table["value"][0][0], 5)
+        self.assertEqual(issue_choices["choices"][0][1], "beta")
+        self.assertTrue(ui.DB.has_source_prompt("alpha", "NoobAI Tags", "NoobAI"))
+
+    async def test_batch_cancel_collects_every_unprocessed_source(self):
+        calls = []
+
+        def fake_generate(source, *_args):
+            calls.append(source)
+            ui._BATCH_CANCEL.set()
+            return f"generated {source}", "", "生成完成"
+
+        ui._generate = fake_generate
+        results = list(ui._batch_generate(*self._batch_args("first\nsecond\nthird", False, True, 0)))
+        status, _table, _choices, _issue_table, _issue_choices, issue_state = results[-1]
+
+        self.assertEqual(calls, ["first"])
+        self.assertIn("任务已取消：处理 1/3", status)
+        self.assertEqual([item["source"] for item in issue_state], ["second", "third"])
+        self.assertEqual({item["status"] for item in issue_state}, {"已取消"})
+        self.assertTrue(ui.DB.has_source_prompt("first", "NoobAI Tags", "NoobAI"))
+
+        selected = ui._select_all_batch_issues(issue_state)
+        self.assertEqual(selected["value"], ["second", "third"])
+
+    async def test_manual_retry_lock_contention_does_not_duplicate_issues(self):
+        issues = [
+            {"index": 2, "source": "alpha", "status": "已跳过", "reason": "已有缓存", "attempts": 0},
+            {"index": 5, "source": "beta", "status": "生成错误", "reason": "超时", "attempts": 3},
+        ]
+        retry_args = (
+            ["alpha"], issues, 1, True, 7,
+            "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.35, 90, 1024, True, 0, 0,
+            True, "", False, False, 0, "Plain Prompt", 1,
+            "", 0, "全部", "全部",
+        )
+
+        ui._BATCH_LOCK.acquire()
+        try:
+            results = list(ui._retry_batch_issues(*retry_args))
+        finally:
+            ui._BATCH_LOCK.release()
+
+        status, _table, _choices, _issue_table, issue_choices, issue_state = results[-1]
+        self.assertIn("已有批量任务正在运行", status)
+        self.assertEqual([item["source"] for item in issue_state], ["alpha", "beta"])
+        self.assertEqual([choice[1] for choice in issue_choices["choices"]], ["alpha", "beta"])
+        self.assertEqual(issue_choices["value"], ["alpha"])
+
+    async def test_only_the_owning_session_can_cancel_a_batch(self):
+        with ui._BATCH_CONTROL_LOCK:
+            ui._BATCH_ACTIVE_TASK_ID = "owner-session"
+            ui._BATCH_CANCEL.clear()
+
+        rejected = ui._cancel_batch_generation("other-session")
+        self.assertIn("未发送取消请求", rejected)
+        self.assertFalse(ui._BATCH_CANCEL.is_set())
+
+        accepted = ui._cancel_batch_generation("owner-session")
+        self.assertIn("已请求取消", accepted)
+        self.assertTrue(ui._BATCH_CANCEL.is_set())
 
     async def test_cache_table_selection_loads_editor_and_multiselect_preview(self):
         record_id = ui.DB.save_prompt(
