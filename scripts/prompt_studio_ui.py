@@ -24,6 +24,8 @@ from prompt_studio_core import (
 
 DB = StudioDB()
 CREDENTIALS = CredentialStore()
+_STYLE_PATH = Path(__file__).resolve().parents[1] / "style.css"
+UI_CSS = _STYLE_PATH.read_text(encoding="utf-8") if _STYLE_PATH.is_file() else ""
 DEFAULT_LLM_SETTINGS = {
     "provider": "OpenAI Compatible",
     "endpoint": "http://127.0.0.1:1234/v1",
@@ -1145,7 +1147,11 @@ def _create_inline_panel(slot, prompt_target):
         with gr.Row():
             with gr.Column(scale=3):
                 request = gr.Textbox(label="创作要求", lines=3, placeholder="描述希望生成的画面")
-                source_tags = gr.Textbox(label="源 Danbooru 标签（可选，优先使用）", lines=2)
+                source_tags = gr.Textbox(
+                    label="源 Danbooru 标签（可选，优先使用）",
+                    lines=2,
+                    elem_id=f"llm_prompt_studio_{slot}_source_tags",
+                )
                 preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
                 system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=3, value=workflow["system_override"], placeholder="留空则使用所选预设")
                 user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"], placeholder="例如：最多 30 个标签，不使用权重")
@@ -1557,14 +1563,23 @@ def on_ui_tabs():
     ranbooru_link = _ranbooru_link_settings()
     initial_records = DB.list_prompts()
     initial_handoff_table, initial_handoff_choices, initial_handoff_status = _handoff_views()
-    with gr.Blocks(analytics_enabled=False, elem_id="llm_prompt_studio") as ui:
+    with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio") as ui:
         gr.Markdown("## LLM 提示词工作室\n本地静态词库、RAG Few-Shot、提示词缓存与 Forge 扩展集成。")
-        with gr.Tabs():
-            with gr.Tab("生成提示词"):
+        with gr.Tabs(elem_id="llm_prompt_studio_main_tabs"):
+            with gr.Tab("生成", elem_id="llm_prompt_studio_generate_tab"):
                 with gr.Row():
                     with gr.Column(scale=3):
-                        request = gr.Textbox(label="创作要求", lines=4, placeholder="描述希望生成的画面，或粘贴已有提示词")
-                        source_tags = gr.Textbox(label="源 Danbooru 标签（可选，优先使用）", lines=3)
+                        request = gr.Textbox(
+                            label="创作要求",
+                            lines=4,
+                            placeholder="描述希望生成的画面，或粘贴已有提示词",
+                            elem_id="llm_prompt_studio_request",
+                        )
+                        source_tags = gr.Textbox(
+                            label="源标签（PNG Tag 汇总可导入，优先使用）",
+                            lines=3,
+                            elem_id="llm_prompt_studio_source_tags",
+                        )
                         preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
                         base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
@@ -1593,10 +1608,10 @@ def on_ui_tabs():
                     reset_workflow = gr.Button("恢复默认工作参数")
                 output = gr.Textbox(label="生成的提示词", lines=8)
                 system_preview = gr.Textbox(label="最终 System Prompt", lines=12)
-                status = gr.Markdown()
+                status = gr.Markdown(elem_id="llm_prompt_studio_status", elem_classes=["lps-status"])
                 workflow_status = gr.Markdown("已自动载入上次保存的工作参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认工作参数；保存后下次会自动填入。")
 
-            with gr.Tab("批量缓存"):
+            with gr.Tab("批处理", elem_id="llm_prompt_studio_batch_tab"):
                 with gr.Tabs():
                     with gr.Tab("LLM 批量生成"):
                         batch_sources = gr.Textbox(label="生成队列：每行一条创作要求或源标签", lines=12, placeholder="红发魔法师在月光图书馆阅读\n蓝发少女站在雨中的车站")
@@ -1612,7 +1627,7 @@ def on_ui_tabs():
                             save_batch_workflow = gr.Button("保存批量与工作参数")
                         batch_preview_status = gr.Markdown()
                         batch_queue = gr.Dataframe(headers=["序号", "输入", "状态"], datatype=["number", "str", "str"], interactive=False, wrap=True, label="队列预览")
-                        batch_status = gr.Markdown("尚未开始批量任务。取消会在当前 HTTP 请求返回后生效，已完成结果会保留。")
+                        batch_status = gr.Markdown("尚未开始批量任务。取消会在当前 HTTP 请求返回后生效，已完成结果会保留。", elem_id="llm_prompt_studio_batch_status", elem_classes=["lps-status"])
                         batch_task_id = gr.State(lambda: uuid.uuid4().hex)
                         batch_issue_state = gr.State([])
                         batch_issues = gr.Dataframe(
@@ -1637,7 +1652,7 @@ def on_ui_tabs():
                         bulk_import_status = gr.Markdown()
                         bulk_preview = gr.Dataframe(headers=["序号", "评分", "Prompt"], datatype=["number", "number", "str"], interactive=False, wrap=True, label="导入预览")
 
-            with gr.Tab("缓存库"):
+            with gr.Tab("缓存与联动", elem_id="llm_prompt_studio_library_tab"):
                 with gr.Row():
                     cache_query = gr.Textbox(label="搜索 Prompt、负面词、源标签或外部来源", scale=4)
                     cache_min_score = gr.Slider(label="最低评分", minimum=0, maximum=10, value=0, step=0.5, scale=2)
@@ -1647,7 +1662,7 @@ def on_ui_tabs():
                     refresh = gr.Button("应用筛选", variant="primary")
                     clear_filters = gr.Button("清除筛选")
                     undo_delete = gr.Button("撤销上次删除")
-                cache_status = gr.Markdown(f"本地缓存共 {len(initial_records)} 条记录。点击表格任意单元格可载入该行。")
+                cache_status = gr.Markdown(f"本地缓存共 {len(initial_records)} 条记录。点击表格任意单元格可载入该行。", elem_id="llm_prompt_studio_cache_status", elem_classes=["lps-status"])
                 selected_records = gr.Dropdown(label="选择缓存记录（支持多选）", choices=_cache_choices(initial_records), value=[], multiselect=True)
                 delete_preview_state = gr.State([])
                 with gr.Row():
@@ -1660,7 +1675,7 @@ def on_ui_tabs():
                     value=_as_rows(initial_records), label="已缓存 Prompt",
                     headers=["全库序号", "内部 ID", "评分", "评分来源", "评分模型", "格式", "目标模型", "正向提示词", "负面提示词", "源标签", "评分理由", "外部来源", "来源标识"],
                     datatype=["number", "number", "number", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str"],
-                    interactive=False, wrap=True,
+                    interactive=False, wrap=True, elem_id="llm_prompt_studio_cache_table", elem_classes=["lps-table"],
                 )
                 with gr.Accordion("记录编辑器", open=True):
                     with gr.Row():
@@ -1740,16 +1755,16 @@ def on_ui_tabs():
                             handoff_process = gr.Button("使用 LLM 处理并缓存", variant="primary")
                             handoff_skip = gr.Button("跳过所选")
                             handoff_clear_finished = gr.Button("清理已完成 / 已跳过")
-                        handoff_status = gr.Markdown(initial_handoff_status)
-                        handoff_table = gr.Dataframe(
-                            value=initial_handoff_table.get("value", []),
-                            headers=[
+                    handoff_status = gr.Markdown(initial_handoff_status, elem_id="llm_prompt_studio_handoff_status", elem_classes=["lps-status"])
+                    handoff_table = gr.Dataframe(
+                        value=initial_handoff_table.get("value", []),
+                        headers=[
                                 "交接 ID", "状态", "尝试次数", "Ranbooru ID", "分级", "源评分",
                                 "Tag Prompt", "自然语言 Prompt", "错误", "LLM 结果",
-                            ],
-                            datatype=["number", "str", "number", "str", "str", "number", "str", "str", "str", "str"],
-                            interactive=False, wrap=True, label="实时交接、错误与跳过汇总",
-                        )
+                        ],
+                        datatype=["number", "str", "number", "str", "str", "number", "str", "str", "str", "str"],
+                        interactive=False, wrap=True, label="实时交接、错误与跳过汇总", elem_id="llm_prompt_studio_handoff_table", elem_classes=["lps-table"],
+                    )
                 with gr.Accordion("JSON / CSV 导入导出", open=False):
                     with gr.Row():
                         import_file = gr.File(label="导入文件", file_types=[".json", ".csv"], type="filepath")
@@ -1761,7 +1776,7 @@ def on_ui_tabs():
                         export_button = gr.Button("导出全部缓存")
                     export_file = gr.File(label="导出文件", interactive=False)
 
-            with gr.Tab("LLM 连接"):
+            with gr.Tab("连接设置", elem_id="llm_prompt_studio_connection_tab"):
                 provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=llm_settings["provider"])
                 endpoint = gr.Textbox(label="接口地址", value=llm_settings["endpoint"])
                 model = gr.Textbox(label="模型 ID", value=llm_settings["model"], placeholder="填写服务端暴露的模型名称")
@@ -1770,28 +1785,34 @@ def on_ui_tabs():
                 timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=llm_settings["timeout"], step=5)
                 max_tokens = gr.Number(label="最大输出 Token（0 表示使用 Provider 默认值）", value=llm_settings["max_tokens"], precision=0)
                 send_temperature = gr.Checkbox(label="发送温度参数（推理模型不支持时关闭）", value=llm_settings["send_temperature"])
-                test = gr.Button("测试 API")
+                test = gr.Button("测试 API", elem_id="llm_prompt_studio_test_connection")
                 with gr.Row():
-                    save_connection = gr.Button("保存全部 LLM 设置")
+                    save_connection = gr.Button("保存全部 LLM 设置", variant="primary")
                     clear_credentials = gr.Button("清除已保存的 API Key")
-                test_status = gr.Markdown(_credential_status(llm_settings["provider"], llm_settings["endpoint"]))
-            with gr.Tab("静态词库"):
-                wildcard_path = gr.Textbox(label="静态词库目录", value=workflow["wildcard_path"])
-                index = gr.Button("建立 / 刷新本地索引")
-                wildcard_status = gr.Markdown()
-                wildcard_query = gr.Textbox(label="搜索已索引词条")
-                wildcard_results = gr.Dropdown(label="匹配结果", choices=[], multiselect=True)
-            with gr.Tab("WD14 + LLM"):
-                image = gr.Image(label="待反推图片", type="numpy")
-                wd_endpoint = gr.Textbox(label="Forge WD14 API 地址", value=workflow["wd_endpoint"])
-                wd_model = gr.Textbox(label="WD14 模型", value=workflow["wd_model"])
-                wd_threshold = gr.Slider(label="WD14 阈值", minimum=0, maximum=1, value=workflow["wd_threshold"], step=0.01)
-                interrogate = gr.Button("调用已安装的 WD14 Tagger")
-                wd_tags = gr.Textbox(label="WD14 标签", lines=5)
-                wd_status = gr.Markdown()
-                action = gr.Radio(label="LLM 操作", choices=ACTION_UI_CHOICES, value="Expand")
-                transform = gr.Button("使用 LLM 扩写 / 润色")
-                transform_output = gr.Textbox(label="LLM 处理结果", lines=8)
+                test_status = gr.Markdown(
+                    _credential_status(llm_settings["provider"], llm_settings["endpoint"]),
+                    elem_id="llm_prompt_studio_connection_status",
+                    elem_classes=["lps-status"],
+                )
+            with gr.Tab("工具", elem_id="llm_prompt_studio_tools_tab"):
+                with gr.Tabs(elem_id="llm_prompt_studio_tools_tabs"):
+                    with gr.Tab("静态词库", elem_id="llm_prompt_studio_wildcards_tab"):
+                        wildcard_path = gr.Textbox(label="静态词库目录", value=workflow["wildcard_path"], elem_id="llm_prompt_studio_wildcard_path")
+                        index = gr.Button("建立 / 刷新本地索引", elem_id="llm_prompt_studio_wildcard_index", elem_classes=["lps-primary"])
+                        wildcard_status = gr.Markdown(elem_id="llm_prompt_studio_wildcard_status", elem_classes=["lps-status"])
+                        wildcard_query = gr.Textbox(label="搜索已索引词条", elem_id="llm_prompt_studio_wildcard_query")
+                        wildcard_results = gr.Dropdown(label="匹配结果", choices=[], multiselect=True, elem_id="llm_prompt_studio_wildcard_results")
+                    with gr.Tab("WD14 + LLM", elem_id="llm_prompt_studio_wd14_tab"):
+                        image = gr.Image(label="待反推图片", type="numpy")
+                        wd_endpoint = gr.Textbox(label="Forge WD14 API 地址", value=workflow["wd_endpoint"])
+                        wd_model = gr.Textbox(label="WD14 模型", value=workflow["wd_model"])
+                        wd_threshold = gr.Slider(label="WD14 阈值", minimum=0, maximum=1, value=workflow["wd_threshold"], step=0.01)
+                        interrogate = gr.Button("调用已安装的 WD14 Tagger")
+                        wd_tags = gr.Textbox(label="WD14 标签", lines=5)
+                        wd_status = gr.Markdown(elem_classes=["lps-status"])
+                        action = gr.Radio(label="LLM 操作", choices=ACTION_UI_CHOICES, value="Expand")
+                        transform = gr.Button("使用 LLM 扩写 / 润色", variant="primary")
+                        transform_output = gr.Textbox(label="LLM 处理结果", lines=8)
 
         workflow_inputs = [
             preset, system_override, base_model, safety, nsfw_injection, user_instruction,

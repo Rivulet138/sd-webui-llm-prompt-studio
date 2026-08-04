@@ -6,6 +6,7 @@
 
 - Forge 顶部独立页签 `LLM 提示词工作室`，用于完整配置、生成、批量任务和缓存管理。
 - txt2img 与 img2img 正向提示词区域中的内嵌面板，位于 Ranbooru 区域之后、原生负面提示词之前，可以直接把 LLM 结果写入正向提示词。
+- `PNG Tag 汇总` 页可以把历史 PNG 汇总结果覆盖或追加到独立页签的源标签输入，并自动打开生成页。
 
 运行时只使用 Python 标准库以及 Forge 已提供的 Gradio、FastAPI 和 Pillow，不需要额外安装 Python 包。
 
