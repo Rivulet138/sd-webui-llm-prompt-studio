@@ -114,6 +114,10 @@ _BATCH_CANCEL = threading.Event()
 _BATCH_LOCK = threading.Lock()
 _BATCH_CONTROL_LOCK = threading.Lock()
 _BATCH_ACTIVE_TASK_ID = ""
+_PNG_BATCH_CANCEL = threading.Event()
+_PNG_BATCH_LOCK = threading.Lock()
+_PNG_BATCH_CONTROL_LOCK = threading.Lock()
+_PNG_BATCH_ACTIVE_TASK_ID = ""
 
 
 def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
@@ -1088,6 +1092,245 @@ def _expand_or_polish(source, action, preset, system_override, base_model, safet
         return "", f"处理失败：{_safe_error(error)}"
 
 
+PNG_BATCH_SCHEMA = "prompt_batch.v1"
+PNG_BATCH_MAX_RECORDS = 200
+PNG_BATCH_MAX_PROMPT_LENGTH = 12000
+PNG_BATCH_MAX_TOTAL_LENGTH = 1000000
+PNG_BATCH_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _png_batch_json(payload):
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_png_batch_payload(payload):
+    if isinstance(payload, str):
+        if len(payload.encode("utf-8")) > PNG_BATCH_MAX_BYTES:
+            raise ValueError("PNG 批次 JSON 超过 4 MB")
+        payload = json.loads(payload or "{}")
+    if isinstance(payload, dict) and len(_png_batch_json(payload).encode("utf-8")) > PNG_BATCH_MAX_BYTES:
+        raise ValueError("PNG 批次 JSON 超过 4 MB")
+    if not isinstance(payload, dict) or payload.get("schema_version") != PNG_BATCH_SCHEMA:
+        raise ValueError("仅支持 prompt_batch.v1 JSON")
+    records = payload.get("records")
+    if not isinstance(records, list) or len(records) > PNG_BATCH_MAX_RECORDS:
+        raise ValueError("PNG batch records must be a list of at most 200 items")
+    normalized, total = [], 0
+    for position, record in enumerate(records, 1):
+        if not isinstance(record, dict):
+            raise ValueError(f"record {position} must be an object")
+        image, prompt = record.get("image") or {}, record.get("prompt") or {}
+        if not isinstance(image, dict) or not isinstance(prompt, dict):
+            raise ValueError(f"第 {position} 条记录缺少 image 或 prompt")
+        positive = str(prompt.get("positive") or "").strip()
+        if not positive:
+            raise ValueError(f"第 {position} 条记录缺少正向 Prompt")
+        if len(positive) > PNG_BATCH_MAX_PROMPT_LENGTH:
+            raise ValueError(f"record {position} prompt is too long")
+        total += len(positive)
+        if total > PNG_BATCH_MAX_TOTAL_LENGTH:
+            raise ValueError("PNG batch prompt text is too large")
+        filename = Path(str(image.get("filename") or "")).name or f"record-{position}.png"
+        if len(filename) > 255:
+            raise ValueError(f"第 {position} 条图片名过长")
+        record_id = str(record.get("record_id") or uuid.uuid4().hex)
+        sha256 = str(image.get("sha256") or "")
+        if len(record_id) > 256 or len(sha256) > 128:
+            raise ValueError(f"第 {position} 条图片标识过长")
+        item = {"record_id": record_id, "index": position,
+                "image": {"filename": filename, "sha256": sha256},
+                "prompt": {"positive": positive}}
+        if "processed" in prompt:
+            processed = str(prompt["processed"] or "")
+            if len(processed) > PNG_BATCH_MAX_PROMPT_LENGTH:
+                raise ValueError(f"第 {position} 条处理结果过长")
+            total += len(processed)
+            if total > PNG_BATCH_MAX_TOTAL_LENGTH:
+                raise ValueError("PNG 批次 Prompt 文本总长度过大")
+            item["prompt"]["processed"] = processed
+        if record.get("status"):
+            item["status"] = str(record["status"])
+        if record.get("error"):
+            item["error"] = str(record["error"])
+        if record.get("appended") is True:
+            item["appended"] = True
+        normalized.append(item)
+    producer = payload.get("producer") or {}
+    if not isinstance(producer, dict):
+        raise ValueError("producer 必须是对象")
+    return {"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": str(producer.get("name") or "LLM Prompt Studio")}, "records": normalized}
+
+
+def _png_batch_export_payload(records, producer="LLM Prompt Studio"):
+    return _normalize_png_batch_payload({"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": producer}, "records": records})
+
+
+def _png_batch_process_records(records, action, transform):
+    results = []
+    for record in records:
+        row = dict(record)
+        try:
+            source = row.get("prompt", {}).get("positive", "")
+            processed = str(transform(source, action) or "")
+            if not processed:
+                raise ValueError("empty LLM result")
+            row["prompt"] = {**row.get("prompt", {}), "processed": processed}
+            row["status"], row["error"] = "completed", ""
+        except Exception as error:
+            row["status"], row["error"] = "failed", str(error)
+        results.append(row)
+    return results
+
+
+def _png_batch_load(file_path):
+    try:
+        path = Path(file_path)
+        if path.stat().st_size > PNG_BATCH_MAX_BYTES:
+            raise ValueError("PNG 批次 JSON 超过 4 MB")
+        data = _normalize_png_batch_payload(path.read_text(encoding="utf-8"))
+        return _png_batch_json(data), f"已导入 {len(data['records'])} 条逐图 Prompt。"
+    except Exception as error:
+        return {}, f"导入失败：{_safe_error(error)}"
+
+
+def _png_batch_table(payload):
+    try:
+        data = _normalize_png_batch_payload(payload or {})
+    except Exception:
+        return []
+    return [
+        [
+            record["index"],
+            record["image"]["filename"],
+            record["prompt"]["positive"],
+            "已追加" if record.get("appended") else record.get("status", "已完成" if record["prompt"].get("processed") else "等待处理"),
+            record["prompt"].get("processed", ""),
+            record.get("error", ""),
+        ]
+        for record in data["records"]
+    ]
+
+
+def _png_batch_current(payload, selection):
+    try:
+        data = _normalize_png_batch_payload(payload or {})
+    except Exception:
+        return 1, ""
+    records = data["records"]
+    if not records:
+        return 1, ""
+    if int(selection or 0) < 1:
+        return 0, ""
+    selected = max(1, min(int(selection or 1), len(records)))
+    prompt = records[selected - 1]["prompt"]
+    return selected, prompt.get("processed", "")
+
+
+def _png_batch_refresh(payload, selection=1):
+    selected, current = _png_batch_current(payload, selection)
+    return _png_batch_table(payload), selected, current, f"已载入 {len(_png_batch_table(payload))} 条逐图 Prompt。"
+
+
+def _png_batch_move(payload, selection, offset):
+    selected, current = _png_batch_current(payload, int(selection or 1) + int(offset))
+    return selected, current
+
+
+def _cancel_png_batch(task_id=""):
+    with _PNG_BATCH_CONTROL_LOCK:
+        if not task_id or str(task_id) != _PNG_BATCH_ACTIVE_TASK_ID:
+            return "当前没有正在运行的 PNG 批处理。"
+        _PNG_BATCH_CANCEL.set()
+    return "已请求取消；当前 LLM 请求返回后停止，已完成结果会保留。"
+
+
+def _png_batch_run(
+    payload, action, preset, system_override, base_model, safety, nsfw_injection,
+    user_instruction, provider, endpoint, model, api_key, temperature, timeout,
+    max_tokens, send_temperature, task_id,
+):
+    global _PNG_BATCH_ACTIVE_TASK_ID
+    try:
+        data = _normalize_png_batch_payload(payload or {})
+    except Exception as error:
+        yield payload, [], 1, "", f"处理失败：{_safe_error(error)}"
+        return
+    if not data["records"]:
+        yield _png_batch_json(data), [], 1, "", "批次为空，请先导入逐图 Prompt。"
+        return
+    if not _PNG_BATCH_LOCK.acquire(blocking=False):
+        selected, current = _png_batch_current(data, 1)
+        yield _png_batch_json(data), _png_batch_table(data), selected, current, "已有 PNG 批处理正在运行。"
+        return
+
+    task_id = str(task_id or "")
+    with _PNG_BATCH_CONTROL_LOCK:
+        _PNG_BATCH_ACTIVE_TASK_ID = task_id
+        _PNG_BATCH_CANCEL.clear()
+    records = [dict(record) for record in data["records"]]
+    try:
+        for position, record in enumerate(records, 1):
+            if _PNG_BATCH_CANCEL.is_set():
+                for pending in records[position - 1:]:
+                    pending["status"] = "已取消"
+                    pending["error"] = "尚未处理"
+                break
+            source = record["prompt"]["positive"]
+            processed, llm_status = _expand_or_polish(
+                source, action, preset, system_override, base_model, safety,
+                nsfw_injection, user_instruction, provider, endpoint, model,
+                api_key, temperature, timeout, max_tokens, send_temperature,
+            )
+            if processed:
+                record["prompt"] = {**record["prompt"], "processed": processed}
+                record["status"], record["error"] = "已完成", ""
+            else:
+                record["status"], record["error"] = "失败", llm_status or "LLM 未返回结果"
+            result = {"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": records}
+            selected, current = _png_batch_current(result, 1)
+            yield _png_batch_json(result), _png_batch_table(result), selected, current, f"处理中 {position}/{len(records)}"
+
+        result = {"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": records}
+        selected, current = _png_batch_current(result, 1)
+        completed = sum(1 for record in records if record.get("status") == "已完成")
+        failed = sum(1 for record in records if record.get("status") == "失败")
+        cancelled = sum(1 for record in records if record.get("status") == "已取消")
+        yield _png_batch_json(result), _png_batch_table(result), selected, current, f"批处理结束：完成 {completed}，失败 {failed}，取消 {cancelled}。"
+    finally:
+        with _PNG_BATCH_CONTROL_LOCK:
+            if _PNG_BATCH_ACTIVE_TASK_ID == task_id:
+                _PNG_BATCH_ACTIVE_TASK_ID = ""
+                _PNG_BATCH_CANCEL.clear()
+        _PNG_BATCH_LOCK.release()
+
+
+def _png_batch_advance_after_append(payload, selection, succeeded):
+    if not succeeded:
+        selected, current = _png_batch_current(payload, selection)
+        return payload, selected, current, "当前结果未写入。"
+    data = _normalize_png_batch_payload(payload or {})
+    selected = int(selection or 0)
+    if selected < 1 or selected > len(data["records"]):
+        return _png_batch_json(data), 0, "", "没有待追加的结果。"
+    data["records"][selected - 1]["appended"] = True
+    if selected == len(data["records"]):
+        return _png_batch_json(data), 0, "", "全部逐图结果已追加完成。"
+    next_selection, current = _png_batch_current(data, selected + 1)
+    return _png_batch_json(data), next_selection, current, f"已追加第 {selected} 条，当前为第 {next_selection} 条。"
+
+
+def _png_batch_export_file(payload):
+    data = _normalize_png_batch_payload(payload or {})
+    export_dir = Path(__file__).resolve().parents[1] / "user" / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / f"prompt_batch_{uuid.uuid4().hex}.json"
+    content = _png_batch_json(data)
+    if len(content.encode("utf-8")) > PNG_BATCH_MAX_BYTES:
+        raise ValueError("导出 JSON 超过 4 MB")
+    path.write_text(content, encoding="utf-8")
+    return str(path)
+
+
 def _test_connection(provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
@@ -1640,6 +1883,39 @@ def on_ui_tabs():
                             batch_select_all_issues = gr.Button("全选错误与跳过项")
                             batch_clear_issue_selection = gr.Button("清空选择")
                             batch_retry_selected = gr.Button("手动重试所选", variant="primary")
+                    with gr.Tab("PNG 润色 / 扩写", elem_id="llm_prompt_studio_png_batch_tab"):
+                        png_batch_file = gr.File(label="导入 prompt_batch.v1 JSON", file_types=[".json"], type="filepath", elem_id="llm_prompt_studio_png_batch_file")
+                        with gr.Accordion("批次 JSON", open=False):
+                            png_batch_payload = gr.Textbox(
+                                label="批量输入 / 结果 JSON",
+                                value=_png_batch_json({"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": []}),
+                                lines=8,
+                                elem_id="llm_prompt_studio_png_batch_payload",
+                            )
+                        png_batch_action = gr.Radio(label="操作", choices=ACTION_UI_CHOICES, value="Expand", elem_id="llm_prompt_studio_png_batch_action")
+                        png_batch_selection = gr.Number(label="当前序号", value=1, precision=0, elem_id="llm_prompt_studio_png_batch_selection")
+                        png_batch_current = gr.Textbox(label="当前结果", lines=3, interactive=False, elem_id="llm_prompt_studio_png_batch_current")
+                        with gr.Row():
+                            png_batch_previous = gr.Button("上一条", elem_id="llm_prompt_studio_png_batch_previous")
+                            png_batch_next = gr.Button("下一条", elem_id="llm_prompt_studio_png_batch_next")
+                        png_batch_target = gr.Radio(label="目标 Prompt", choices=[("不写入", "none"), ("txt2img", "txt2img"), ("img2img", "img2img")], value="none", elem_id="llm_prompt_studio_png_batch_target")
+                        png_batch_append = gr.Radio(label="写入方式", choices=[("追加", "append"), ("覆盖", "replace")], value="append", elem_id="llm_prompt_studio_png_batch_append")
+                        with gr.Row():
+                            png_batch_run = gr.Button("开始处理", variant="primary", elem_id="llm_prompt_studio_png_batch_run")
+                            png_batch_cancel = gr.Button("取消", variant="stop", elem_id="llm_prompt_studio_png_batch_cancel")
+                            png_batch_append_button = gr.Button("追加并下一条", variant="primary", elem_id="llm_prompt_studio_png_batch_append_button")
+                            png_batch_export = gr.DownloadButton("导出结果", elem_id="llm_prompt_studio_png_batch_export")
+                        png_batch_table = gr.Dataframe(headers=["序号", "文件", "原始正向 Prompt", "状态", "LLM 结果", "错误"], datatype=["number", "str", "str", "str", "str", "str"], interactive=False, wrap=True, elem_id="llm_prompt_studio_png_batch_table", elem_classes=["lps-table"])
+                        gr.Markdown("", elem_id="llm_prompt_studio_png_batch_results")
+                        png_batch_status = gr.HTML("等待导入 JSON。", elem_id="llm_prompt_studio_png_batch_status", elem_classes=["lps-status"])
+                        png_batch_append_succeeded = gr.Checkbox(value=False, visible=False, elem_id="llm_prompt_studio_png_batch_append_succeeded")
+                        png_batch_task_id = gr.State(lambda: uuid.uuid4().hex)
+                        png_batch_file_event = png_batch_file.change(
+                            _png_batch_load,
+                            inputs=png_batch_file,
+                            outputs=[png_batch_payload, png_batch_status],
+                        )
+
                     with gr.Tab("直接批量导入"):
                         bulk_import = gr.Textbox(label="每行一条 Prompt，可使用“评分<TAB>Prompt”格式", lines=12)
                         with gr.Row():
@@ -1829,6 +2105,34 @@ def on_ui_tabs():
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
         save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint])
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
+        png_batch_payload.input(_png_batch_refresh, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_table, png_batch_selection, png_batch_current, png_batch_status])
+        png_batch_file_event.then(
+            _png_batch_refresh,
+            inputs=[png_batch_payload, png_batch_selection],
+            outputs=[png_batch_table, png_batch_selection, png_batch_current, png_batch_status],
+        )
+        png_batch_previous.click(_png_batch_move, inputs=[png_batch_payload, png_batch_selection, gr.State(-1)], outputs=[png_batch_selection, png_batch_current])
+        png_batch_next.click(_png_batch_move, inputs=[png_batch_payload, png_batch_selection, gr.State(1)], outputs=[png_batch_selection, png_batch_current])
+        png_batch_selection.change(_png_batch_current, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_selection, png_batch_current])
+        png_batch_run.click(
+            _png_batch_run,
+            inputs=[png_batch_payload, png_batch_action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, png_batch_task_id],
+            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status],
+        )
+        png_batch_cancel.click(_cancel_png_batch, inputs=png_batch_task_id, outputs=png_batch_status, queue=False)
+        png_batch_export.click(_png_batch_export_file, inputs=png_batch_payload, outputs=png_batch_export)
+        png_append_event = png_batch_append_button.click(
+            fn=None,
+            inputs=[png_batch_current, png_batch_target, png_batch_append],
+            outputs=[png_batch_status, png_batch_append_succeeded],
+            js="(prompt, target, mode) => window.llmPromptStudioPngBatch.appendToPrompt(prompt, target, mode)",
+        )
+        png_append_event.then(
+            _png_batch_advance_after_append,
+            inputs=[png_batch_payload, png_batch_selection, png_batch_append_succeeded],
+            outputs=[png_batch_payload, png_batch_selection, png_batch_current, png_batch_status],
+            queue=False,
+        )
         index.click(_index_wildcards, inputs=wildcard_path, outputs=[wildcard_status, wildcard_results])
         wildcard_query.change(_search_wildcards, inputs=wildcard_query, outputs=wildcard_results)
         interrogate.click(_wd14_interrogate, inputs=[image, wd_endpoint, wd_model, wd_threshold], outputs=[wd_tags, wd_status])
