@@ -53,6 +53,39 @@
         }[char]));
     }
 
+    function canonicalPrompt(value) {
+        return String(value ?? "").normalize("NFKC").replace(/\s+/g, " ").trim();
+    }
+
+    function normalizeQueueStatus(value) {
+        return String(value || "").startsWith("已完成") ? "已完成" : "待生图";
+    }
+
+    function migrateQueue(rows) {
+        const queue = [];
+        const positions = new Map();
+        let duplicateCount = 0;
+        let emptyCount = 0;
+        for (const row of Array.isArray(rows) ? rows : []) {
+            const prompt = row && typeof row.prompt === "string" ? row.prompt.trim() : "";
+            const key = canonicalPrompt(prompt);
+            if (!key) {
+                emptyCount += 1;
+                continue;
+            }
+            const status = normalizeQueueStatus(row.status);
+            if (positions.has(key)) {
+                duplicateCount += 1;
+                const existing = queue[positions.get(key)];
+                if (status === "已完成") existing.status = "已完成";
+                continue;
+            }
+            positions.set(key, queue.length);
+            queue.push({ index: queue.length + 1, prompt, status });
+        }
+        return { queue, duplicateCount, emptyCount };
+    }
+
     function isVisible(element) {
         if (!element) return false;
         const style = window.getComputedStyle(element);
@@ -85,21 +118,47 @@
         window.localStorage.setItem(QUEUE_KEY, JSON.stringify(state.queue));
     }
 
+    function renderQueueMigrationNotice(migration) {
+        if (migration?.error) {
+            render("error", migration.error.headline, migration.error.detail);
+            return;
+        }
+        if (!migration?.duplicateCount && !migration?.emptyCount) return;
+        const details = [];
+        if (migration.duplicateCount) details.push(`已移除重复记录 ${migration.duplicateCount} 条`);
+        if (migration.emptyCount) details.push(`已移除空记录 ${migration.emptyCount} 条`);
+        details.push(`保留 ${state.queue.length} 条唯一 Prompt，并已重新编号`);
+        render("warning", "已整理历史 Prompt 队列", details.join("；"));
+    }
+
     function loadQueue() {
+        let migration = { queue: [], duplicateCount: 0, emptyCount: 0 };
         try {
             const raw = window.localStorage.getItem(QUEUE_KEY);
             const parsed = raw ? JSON.parse(raw) : [];
-            state.queue = Array.isArray(parsed)
-                ? parsed.filter((row) => row && typeof row.prompt === "string").map((row, index) => ({
-                    index: Number(row.index) || index + 1,
-                    prompt: row.prompt.trim(),
-                    status: String(row.status || "").startsWith("已完成") ? "已完成" : "待生图",
-                }))
-                : [];
+            migration = migrateQueue(parsed);
+            state.queue = migration.queue;
         } catch (error) {
             state.queue = [];
+            migration.error = {
+                headline: "历史 Prompt 队列恢复失败",
+                detail: String(error?.message || error),
+            };
+            renderQueue();
+            renderQueueMigrationNotice(migration);
+            return migration;
+        }
+        try {
+            saveQueue();
+        } catch (error) {
+            migration.error = {
+                headline: "历史 Prompt 队列已恢复，但整理结果保存失败",
+                detail: String(error?.message || error),
+            };
         }
         renderQueue();
+        renderQueueMigrationNotice(migration);
+        return migration;
     }
 
     async function waitForStudioGeneration(runId, beforeOutput, beforeStatus, timeoutMs = 300000) {
@@ -172,14 +231,15 @@
     async function generateBatch(config) {
         if (state.running) return "已有队列任务正在运行";
         const seen = new Set();
-        let duplicateCount = 0;
+        let duplicateInputCount = 0;
         const requests = String(config.request || "").split(/\r?\n/).map((value) => value.trim()).filter((value) => {
             if (!value || value.startsWith("#")) return false;
-            if (seen.has(value)) {
-                duplicateCount += 1;
+            const key = canonicalPrompt(value);
+            if (seen.has(key)) {
+                duplicateInputCount += 1;
                 return false;
             }
-            seen.add(value);
+            seen.add(key);
             return true;
         });
         if (!requests.length) {
@@ -191,6 +251,8 @@
         state.phase = "llm";
         const runId = ++state.runId;
         let added = 0;
+        let duplicateOutputCount = 0;
+        const queuedPrompts = new Set(state.queue.map((row) => canonicalPrompt(row.prompt)).filter(Boolean));
         try {
             await wait(150);
             for (let index = 1; index <= requests.length; index += 1) {
@@ -207,18 +269,30 @@
                 const beforeStatus = String(statusHost?.textContent || "");
                 button.click();
                 const prompt = await waitForStudioGeneration(runId, beforeOutput, beforeStatus);
-                state.queue.push({ index: state.queue.length + 1, prompt, status: "待生图" });
+                const promptKey = canonicalPrompt(prompt);
+                if (queuedPrompts.has(promptKey)) {
+                    duplicateOutputCount += 1;
+                    renderQueue();
+                    continue;
+                }
+                state.queue.push({ index: state.queue.length + 1, prompt: prompt.trim(), status: "待生图" });
+                queuedPrompts.add(promptKey);
                 try {
                     saveQueue();
                 } catch (error) {
                     state.queue.pop();
+                    queuedPrompts.delete(promptKey);
                     throw new Error(`Prompt 队列保存失败：${String(error?.message || error)}`);
                 }
                 added += 1;
                 renderQueue();
             }
             const message = state.cancelled ? `已取消 Prompt 批量生成，新增 ${added} 条` : `Prompt 批量生成完成，新增 ${added} 条，已保存待生图队列`;
-            const detail = `${duplicateCount ? `已忽略重复输入 ${duplicateCount} 条；` : ""}请检查队列后再点击“投入队列生图”`;
+            const details = [];
+            if (duplicateInputCount) details.push(`已忽略重复输入 ${duplicateInputCount} 条`);
+            if (duplicateOutputCount) details.push(`已忽略重复生成结果 ${duplicateOutputCount} 条`);
+            details.push("请检查队列后再点击“投入队列生图”");
+            const detail = details.join("；");
             render(state.cancelled ? "warning" : "success", message, detail);
             return message;
         } catch (error) {
@@ -328,8 +402,11 @@
         return "正在取消当前阶段";
     }
 
-    loadQueue();
-    window.setTimeout(renderQueue, 1000);
+    const queueMigration = loadQueue();
+    window.setTimeout(() => {
+        renderQueue();
+        renderQueueMigrationNotice(queueMigration);
+    }, 1000);
     window.llmPromptStudioAutoLoop = {
         generateBatch,
         runStored,

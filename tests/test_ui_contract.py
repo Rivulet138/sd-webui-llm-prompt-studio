@@ -1,4 +1,6 @@
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
@@ -59,7 +61,11 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "findButton(\"llm_prompt_studio_auto_loop_dispatch\")",
             "querySelector(`#${tab}_generate`)",
             "target === \"img2img\"",
-            "seen.has(value)",
+            "canonicalPrompt",
+            "migrateQueue",
+            "seen.has(key)",
+            "queuedPrompts.has(promptKey)",
+            "duplicateOutputCount",
             "const promptRequest = requests[index - 1]",
             "setValue(\"llm_prompt_studio_output\", \"\")",
             "state.queue.pop()",
@@ -71,12 +77,29 @@ class PromptStudioUiContractTests(unittest.TestCase):
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
         self.assertIn("structured_mode, region_count, 0, False, False", source)
 
+    def test_auto_loop_queue_migration_and_generated_output_deduplication(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for the browser-script regression test")
+        result = subprocess.run(
+            [node, str(ROOT / "tests" / "auto_loop_runtime_test.js")],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, (result.stdout or "") + (result.stderr or ""))
+
     def test_extension_styles_cover_workflows_tables_and_mobile(self):
         css = (ROOT / "style.css").read_text(encoding="utf-8")
 
         self.assertIn("#llm_prompt_studio_main_tabs", css)
         self.assertIn(".lps-form-row", css)
         self.assertIn(".lps-table", css)
+        self.assertIn("#llm_prompt_studio_auto_loop_log > .prose", css)
+        self.assertIn("#llm_prompt_studio_auto_loop_dispatch", css)
         self.assertIn("@media (max-width: 900px)", css)
 
 
