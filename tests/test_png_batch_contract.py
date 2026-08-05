@@ -63,6 +63,28 @@ class PngBatchContractTests(unittest.TestCase):
                 "records": [{"image": "bad", "prompt": {"positive": "x"}}],
             })
 
+    def test_schema_uses_stable_generated_ids_and_rejects_identity_conflicts(self):
+        payload = {
+            "schema_version": "prompt_batch.v1",
+            "producer": {"name": "collector"},
+            "records": [{"image": {"filename": "one.png", "sha256": "a" * 64}, "prompt": {"positive": "cat"}}],
+        }
+        first = ui._normalize_png_batch_payload(payload)
+        second = ui._normalize_png_batch_payload(payload)
+        self.assertEqual(first["records"][0]["record_id"], second["records"][0]["record_id"])
+
+        duplicate = {**payload, "records": [
+            {**payload["records"][0], "record_id": "same"},
+            {**payload["records"][0], "record_id": "same"},
+        ]}
+        with self.assertRaisesRegex(ValueError, "record_id 重复"):
+            ui._normalize_png_batch_payload(duplicate)
+        with self.assertRaisesRegex(ValueError, "sha256"):
+            ui._normalize_png_batch_payload({
+                "schema_version": "prompt_batch.v1",
+                "records": [{"image": {"filename": "one.png", "sha256": "bad"}, "prompt": {"positive": "cat"}}],
+            })
+
     def test_partial_failure_does_not_drop_later_records(self):
         records = [
             {"record_id": "a", "index": 1, "image": {"filename": "one.png", "sha256": ""}, "prompt": {"positive": "one"}},
@@ -104,6 +126,72 @@ class PngBatchContractTests(unittest.TestCase):
         self.assertTrue(all(update[1].get("__type__") == "update" for update in updates[:-1]))
         self.assertEqual(len(ui._normalize_png_batch_payload(updates[-1][0])["records"]), 5001)
 
+    def test_completed_records_are_not_sent_to_llm_again(self):
+        payload = {
+            "schema_version": "prompt_batch.v1",
+            "producer": {"name": "studio"},
+            "records": [
+                {"record_id": "done", "image": {"filename": "done.png"}, "prompt": {"positive": "same", "processed": "already done"}, "status": "completed"},
+                {"record_id": "new", "image": {"filename": "new.png"}, "prompt": {"positive": "same"}},
+            ],
+        }
+        calls = []
+        original = ui._expand_or_polish
+
+        def fake_expand(source, *_args):
+            calls.append(source)
+            return "new result", "ok"
+
+        ui._expand_or_polish = fake_expand
+        try:
+            updates = list(ui._png_batch_run(
+                payload, "Expand", "Danbooru Tags", "", "Auto / checkpoint default",
+                "SFW", "", "", "OpenAI-compatible", "http://127.0.0.1:1234",
+                "model", "", 0.3, 30, 1000, True, "skip-completed-test",
+            ))
+        finally:
+            ui._expand_or_polish = original
+            ui._PNG_BATCH_CANCEL.clear()
+
+        records = ui._normalize_png_batch_payload(updates[-1][0])["records"]
+        self.assertEqual(calls, ["same"])
+        self.assertEqual(records[0]["prompt"]["processed"], "already done")
+        self.assertEqual(records[1]["prompt"]["processed"], "new result")
+        self.assertIn("已有结果跳过 1", updates[-1][-1])
+
+    def test_duplicate_pending_prompts_reuse_success_or_failure_outcome(self):
+        def run_with(result):
+            payload = {
+                "schema_version": "prompt_batch.v1",
+                "records": [
+                    {"record_id": "one", "image": {"filename": "one.png"}, "prompt": {"positive": "same"}},
+                    {"record_id": "two", "image": {"filename": "two.png"}, "prompt": {"positive": "same"}},
+                ],
+            }
+            calls = []
+            original = ui._expand_or_polish
+            ui._expand_or_polish = lambda source, *_args: (calls.append(source) or result)
+            try:
+                updates = list(ui._png_batch_run(
+                    payload, "Expand", "Danbooru Tags", "", "Auto / checkpoint default",
+                    "SFW", "", "", "OpenAI-compatible", "http://127.0.0.1:1234",
+                    "model", "", 0.3, 30, 1000, True, f"dedupe-{result[0]}",
+                ))
+            finally:
+                ui._expand_or_polish = original
+                ui._PNG_BATCH_CANCEL.clear()
+            return calls, ui._normalize_png_batch_payload(updates[-1][0])["records"], updates[-1][-1]
+
+        success_calls, success_records, success_status = run_with(("processed", "ok"))
+        failed_calls, failed_records, failed_status = run_with(("", "timeout"))
+
+        self.assertEqual(success_calls, ["same"])
+        self.assertEqual([record["prompt"]["processed"] for record in success_records], ["processed", "processed"])
+        self.assertIn("相同 Prompt 复用 1", success_status)
+        self.assertEqual(failed_calls, ["same"])
+        self.assertEqual([record["status"] for record in failed_records], ["失败", "失败"])
+        self.assertIn("相同 Prompt 复用 1", failed_status)
+
     def test_native_append_javascript_dispatches_prompt_events(self):
         script = (ROOT / "javascript" / "llm_prompt_studio_png_batch.js").read_text(encoding="utf-8")
         self.assertIn('dispatchEvent(new Event("input"', script)
@@ -117,6 +205,7 @@ class PngBatchContractTests(unittest.TestCase):
             "records": [
                 {"image": {"filename": "one.png"}, "prompt": {"positive": "one"}},
                 {"image": {"filename": "two.png"}, "prompt": {"positive": "two"}},
+                {"image": {"filename": "done.png"}, "prompt": {"positive": "done", "processed": "existing"}, "status": "completed"},
             ],
         }
         original = ui._expand_or_polish
@@ -139,6 +228,8 @@ class PngBatchContractTests(unittest.TestCase):
         records = ui._normalize_png_batch_payload(updates[-1][0])["records"]
         self.assertEqual(records[0]["prompt"]["processed"], "processed one")
         self.assertEqual(records[1]["status"], "已取消")
+        self.assertEqual(records[2]["status"], "completed")
+        self.assertNotIn("error", records[2])
 
     def test_last_append_enters_completed_state(self):
         payload = {

@@ -33,10 +33,9 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_auto_score",
             "llm_prompt_studio_auto_loop_tab",
             "llm_prompt_studio_auto_loop_target",
-            "llm_prompt_studio_auto_loop_count",
-            "llm_prompt_studio_auto_loop_continuous",
             "llm_prompt_studio_auto_loop_request",
             "llm_prompt_studio_auto_loop_start",
+            "llm_prompt_studio_auto_loop_dispatch",
             "llm_prompt_studio_auto_loop_run",
             "llm_prompt_studio_auto_loop_clear",
             "llm_prompt_studio_auto_loop_cancel",
@@ -57,11 +56,20 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "state.phase === \"forge\"",
             "MAX_LOG_ROWS = 100",
             "localStorage",
-            "setChecked(\"llm_prompt_studio_cache_result\", false)",
+            "findButton(\"llm_prompt_studio_auto_loop_dispatch\")",
             "querySelector(`#${tab}_generate`)",
             "target === \"img2img\"",
+            "seen.has(value)",
+            "const promptRequest = requests[index - 1]",
+            "setValue(\"llm_prompt_studio_output\", \"\")",
+            "state.queue.pop()",
+            "writePrompt(row.prompt, target, mode, basePrompt)",
+            "已完成（队列状态未保存）",
         ):
             self.assertIn(marker, script)
+        self.assertNotIn("这是第 ${index} 条", script)
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        self.assertIn("structured_mode, region_count, 0, False, False", source)
 
     def test_extension_styles_cover_workflows_tables_and_mobile(self):
         css = (ROOT / "style.css").read_text(encoding="utf-8")

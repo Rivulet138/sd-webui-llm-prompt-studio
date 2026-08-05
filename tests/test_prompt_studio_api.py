@@ -136,9 +136,15 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["source_score"], 42)
         self.assertEqual(stored["natural_prompt"], payload["natural_prompt"])
 
-    async def test_ranbooru_handoff_process_retries_and_keeps_failed_record(self):
-        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 2, "auto_score": False})
-        ui.call_llm = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("temporary outage"))
+    async def test_ranbooru_handoff_process_sends_once_and_keeps_failed_record(self):
+        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 3, "auto_score": True})
+        calls = []
+
+        def fail_llm(*_args, **_kwargs):
+            calls.append(True)
+            raise RuntimeError("temporary outage")
+
+        ui.call_llm = fail_llm
         payload = {
             "ranbooru_id": 18,
             "database_key": "abcdef0123456789",
@@ -150,13 +156,14 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             ui.process_ranbooru_handoff(payload)
         record = ui.DB.list_handoffs()[0]
 
+        self.assertEqual(len(calls), 1)
         self.assertEqual(record["status"], "error")
-        self.assertEqual(record["attempts"], 3)
+        self.assertEqual(record["attempts"], 1)
         self.assertIn("temporary outage", record["error"])
         self.assertEqual(ui._handoff_safety("e"), "NSFW")
 
-    async def test_ranbooru_handoff_unexpected_exception_is_retried_and_recorded(self):
-        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 1, "auto_score": False})
+    async def test_ranbooru_handoff_unexpected_exception_is_not_retried_and_is_recorded(self):
+        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 3, "auto_score": True})
         calls = []
 
         def fail_generate(*_args, **_kwargs):
@@ -172,16 +179,24 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             })
         record = ui.DB.list_handoffs()[0]
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(record["status"], "error")
-        self.assertEqual(record["attempts"], 2)
+        self.assertEqual(record["attempts"], 1)
         self.assertIn("cache write failed", record["error"])
 
     async def test_ranbooru_handoff_process_caches_with_source_provenance(self):
         ui.DB.set_setting("workflow_settings_v1", {
             "preset": "NoobAI Tags", "base_model": "NoobAI",
-            "batch_retries": 1, "auto_score": False,
+            "batch_retries": 3, "auto_score": True,
         })
+        calls = []
+
+        def generate_once(*_args, **_kwargs):
+            calls.append(True)
+            return "1girl, red_hair"
+
+        ui.call_llm = generate_once
+        ui.evaluate_prompt_quality = lambda *_args, **_kwargs: self.fail("handoff must not send an LLM scoring request")
         payload = {
             "ranbooru_id": 19,
             "database_key": "abcdef0123456789",
@@ -193,6 +208,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         handoff = ui.DB.get_handoff(result["handoff_id"])
         cached = ui.DB.list_prompts()[0]
 
+        self.assertEqual(len(calls), 1)
         self.assertEqual(handoff["status"], "completed")
         self.assertEqual(handoff["attempts"], 1)
         self.assertEqual(cached["source_kind"], "ranbooru")
@@ -594,44 +610,68 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(direct["value"][1][1], 6)
         self.assertIn("2 条可导入", direct_status)
 
-    async def test_batch_retries_then_collects_errors_and_cached_skips(self):
+    async def test_batch_sends_each_unique_prompt_once_and_collects_errors_and_cached_skips(self):
         ui.DB.save_prompt("already cached", "", "NoobAI Tags", "NoobAI", 7, "cached")
         attempts = {}
 
         def fake_generate(source, *_args):
             attempts[source] = attempts.get(source, 0) + 1
-            if source == "retry":
-                if attempts[source] >= 3:
-                    return "1girl, recovered", "", "生成完成"
-                raise RuntimeError(f"临时异常 {attempts[source]}")
+            if source == "once":
+                return "1girl, generated once", "", "生成完成"
             return "", "", f"模拟错误 {attempts[source]}"
 
         ui._generate = fake_generate
-        results = list(ui._batch_generate(*self._batch_args("retry\ncached\nbad")))
+        results = list(ui._batch_generate(*self._batch_args("once\nonce\ncached\nbad", retries=3, auto_score=True)))
         status, _table, _choices, issue_table, issue_choices, issue_state = results[-1]
 
-        self.assertEqual(attempts, {"retry": 3, "bad": 3})
+        self.assertEqual(attempts, {"once": 1, "bad": 1})
+        self.assertIn("LLM 请求 2", status)
         self.assertIn("问题汇总 2 条", status)
         self.assertEqual([item["status"] for item in issue_state], ["已跳过", "生成错误"])
-        self.assertEqual(issue_state[1]["attempts"], 3)
+        self.assertEqual(issue_state[1]["attempts"], 1)
         self.assertEqual(len(issue_table["value"]), 2)
         self.assertEqual(len(issue_choices["choices"]), 2)
-        self.assertTrue(ui.DB.has_source_prompt("retry", "NoobAI Tags", "NoobAI"))
+        self.assertTrue(ui.DB.has_source_prompt("once", "NoobAI Tags", "NoobAI"))
 
-    async def test_batch_cache_uses_llm_evaluation_score(self):
+    async def test_batch_parser_does_not_silently_truncate_large_queues(self):
+        sources, stats = ui._parse_batch_sources("\n".join(f"prompt {index}" for index in range(10001)))
+
+        self.assertEqual(len(sources), 10001)
+        self.assertEqual(sources[-1], "prompt 10000")
+        self.assertEqual(stats["duplicates"], 0)
+
+    async def test_auto_loop_dispatch_forces_no_cache_and_no_llm_scoring(self):
+        captured = {}
+
+        def fake_generate(*args):
+            captured["args"] = args
+            return "generated", "system", "ok"
+
+        ui._generate = fake_generate
+        result = ui._generate_auto_loop(
+            "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "",
+            0.3, 90, 1024, True, 0, 0, True, "", False, False, 0,
+            "Plain Prompt", 1,
+        )
+
+        self.assertEqual(result[0], "generated")
+        self.assertEqual(captured["args"][-3:], (0, False, False))
+
+    async def test_batch_cache_uses_local_score_without_llm_evaluation_request(self):
         ui._generate = lambda source, *_args: (f"generated {source}", "", "生成完成")
-        ui.evaluate_prompt_quality = lambda *_args, **_kwargs: {"score": 9.1, "reason": "Strong prompt structure"}
+        ui.evaluate_prompt_quality = lambda *_args, **_kwargs: self.fail("batch scoring must not call the LLM")
 
         results = list(ui._batch_generate(*self._batch_args("alpha", False, True, 0, True)))
         status = results[-1][0]
         record = ui.DB.list_prompts()[0]
 
-        self.assertIn("LLM 已评分 1", status)
-        self.assertEqual(record["score"], 9.1)
-        self.assertEqual(record["score_source"], "llm")
-        self.assertEqual(record["score_reason"], "Strong prompt structure")
+        self.assertIn("LLM 请求 1", status)
+        self.assertEqual(record["score"], 7)
+        self.assertEqual(record["score_source"], "manual")
+        self.assertIn("未调用 LLM 评分", record["score_reason"])
 
-    async def test_batch_can_stop_after_retry_exhaustion_and_collect_unprocessed(self):
+    async def test_batch_can_stop_after_single_failure_and_collect_unprocessed(self):
         calls = []
 
         def fake_generate(source, *_args):
@@ -642,10 +682,10 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         results = list(ui._batch_generate(*self._batch_args("bad\nlater", False, False, 1)))
         status, _table, _choices, _issue_table, _issue_choices, issue_state = results[-1]
 
-        self.assertEqual(calls, ["bad", "bad"])
+        self.assertEqual(calls, ["bad"])
         self.assertIn("因错误停止", status)
         self.assertEqual([item["status"] for item in issue_state], ["生成错误", "未处理"])
-        self.assertEqual(issue_state[0]["attempts"], 2)
+        self.assertEqual(issue_state[0]["attempts"], 1)
 
     async def test_manual_retry_runs_only_selected_issue_and_preserves_the_rest(self):
         ui.DB.save_prompt("old alpha", "", "NoobAI Tags", "NoobAI", 7, "alpha")
