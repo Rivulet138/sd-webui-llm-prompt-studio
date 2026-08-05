@@ -6,7 +6,7 @@
 
 - Forge 顶部独立页签 `LLM 提示词工作室`，用于完整配置、生成、批量任务和缓存管理。
 - txt2img 与 img2img 正向提示词区域中的内嵌面板，位于 Ranbooru 区域之后、原生负面提示词之前，可以直接把 LLM 结果写入正向提示词。
-- `PNG Prompt Collector` 可把历史 PNG 按一图一条发送到 `批处理 > PNG 润色 / 扩写`，批量处理后逐条追加到 txt2img / img2img 正向 Prompt。
+- `PNG Prompt Collector` 可把历史 PNG 按一图一条发送到 `批处理 > PNG 润色 / 扩写`，Prompt Batch 不设置批次数量上限，处理后可逐条追加到 txt2img / img2img 正向 Prompt。
 
 运行时只使用 Python 标准库以及 Forge 已提供的 Gradio、FastAPI 和 Pillow，不需要额外安装 Python 包。
 

@@ -9,12 +9,13 @@ import prompt_studio_ui as ui
 
 
 class PngBatchContractTests(unittest.TestCase):
-    def test_schema_and_limits_are_declared(self):
+    def test_schema_and_per_prompt_limit_are_declared(self):
         source = (Path(__file__).parents[1] / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
         self.assertIn('PNG_BATCH_SCHEMA = "prompt_batch.v1"', source)
-        self.assertIn("PNG_BATCH_MAX_RECORDS = 200", source)
         self.assertIn("PNG_BATCH_MAX_PROMPT_LENGTH = 12000", source)
-        self.assertIn("PNG_BATCH_MAX_BYTES = 4 * 1024 * 1024", source)
+        self.assertNotIn("PNG_BATCH_MAX_RECORDS", source)
+        self.assertNotIn("PNG_BATCH_MAX_TOTAL_LENGTH", source)
+        self.assertNotIn("PNG_BATCH_MAX_BYTES", source)
         self.assertIn("Path(str(image.get(\"filename\") or \"\")).name", source)
         self.assertIn("png_batch_payload = gr.Textbox", source)
 
@@ -35,6 +36,20 @@ class PngBatchContractTests(unittest.TestCase):
         normalized = ui._normalize_png_batch_payload(payload)
         self.assertEqual(len(normalized["records"]), 2)
         self.assertEqual([row["image"]["filename"] for row in normalized["records"]], ["one.png", "two.png"])
+
+    def test_schema_accepts_more_than_five_thousand_records(self):
+        payload = {
+            "schema_version": "prompt_batch.v1",
+            "producer": {"name": "collector"},
+            "records": [
+                {"record_id": str(index), "image": {"filename": f"{index}.png"}, "prompt": {"positive": f"prompt {index} " + "x" * 1024}}
+                for index in range(5001)
+            ],
+        }
+        normalized = ui._normalize_png_batch_payload(payload)
+        self.assertEqual(len(normalized["records"]), 5001)
+        self.assertGreater(len(ui._png_batch_json(normalized).encode("utf-8")), 4 * 1024 * 1024)
+        self.assertTrue(normalized["records"][-1]["prompt"]["positive"].startswith("prompt 5000 "))
 
     def test_schema_rejects_oversized_and_malformed_records(self):
         with self.assertRaises(ValueError):
@@ -62,6 +77,32 @@ class PngBatchContractTests(unittest.TestCase):
         results = ui._png_batch_process_records(records, "Expand", transform)
         self.assertEqual([item["status"] for item in results], ["failed", "completed"])
         self.assertEqual(results[1]["prompt"]["processed"], "processed two")
+
+    def test_large_batch_progress_does_not_resend_full_payload(self):
+        payload = {
+            "schema_version": "prompt_batch.v1",
+            "producer": {"name": "collector"},
+            "records": [
+                {"record_id": str(index), "image": {"filename": f"{index}.png"}, "prompt": {"positive": f"prompt {index}"}}
+                for index in range(5001)
+            ],
+        }
+        original = ui._expand_or_polish
+        ui._expand_or_polish = lambda *_args: ("processed", "ok")
+        try:
+            updates = list(ui._png_batch_run(
+                payload, "Expand", "Danbooru Tags", "", "Auto / checkpoint default",
+                "SFW", "", "", "OpenAI-compatible", "http://127.0.0.1:1234",
+                "model", "", 0.3, 30, 1000, True, "large-test",
+            ))
+        finally:
+            ui._expand_or_polish = original
+            ui._PNG_BATCH_CANCEL.clear()
+
+        self.assertLessEqual(len(updates), 102)
+        self.assertTrue(all(update[0].get("__type__") == "update" for update in updates[:-1]))
+        self.assertTrue(all(update[1].get("__type__") == "update" for update in updates[:-1]))
+        self.assertEqual(len(ui._normalize_png_batch_payload(updates[-1][0])["records"]), 5001)
 
     def test_native_append_javascript_dispatches_prompt_events(self):
         script = (ROOT / "javascript" / "llm_prompt_studio_png_batch.js").read_text(encoding="utf-8")

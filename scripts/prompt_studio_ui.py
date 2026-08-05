@@ -1093,10 +1093,7 @@ def _expand_or_polish(source, action, preset, system_override, base_model, safet
 
 
 PNG_BATCH_SCHEMA = "prompt_batch.v1"
-PNG_BATCH_MAX_RECORDS = 200
 PNG_BATCH_MAX_PROMPT_LENGTH = 12000
-PNG_BATCH_MAX_TOTAL_LENGTH = 1000000
-PNG_BATCH_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _png_batch_json(payload):
@@ -1105,17 +1102,13 @@ def _png_batch_json(payload):
 
 def _normalize_png_batch_payload(payload):
     if isinstance(payload, str):
-        if len(payload.encode("utf-8")) > PNG_BATCH_MAX_BYTES:
-            raise ValueError("PNG 批次 JSON 超过 4 MB")
         payload = json.loads(payload or "{}")
-    if isinstance(payload, dict) and len(_png_batch_json(payload).encode("utf-8")) > PNG_BATCH_MAX_BYTES:
-        raise ValueError("PNG 批次 JSON 超过 4 MB")
     if not isinstance(payload, dict) or payload.get("schema_version") != PNG_BATCH_SCHEMA:
         raise ValueError("仅支持 prompt_batch.v1 JSON")
     records = payload.get("records")
-    if not isinstance(records, list) or len(records) > PNG_BATCH_MAX_RECORDS:
-        raise ValueError("PNG batch records must be a list of at most 200 items")
-    normalized, total = [], 0
+    if not isinstance(records, list):
+        raise ValueError("PNG batch records must be a list")
+    normalized = []
     for position, record in enumerate(records, 1):
         if not isinstance(record, dict):
             raise ValueError(f"record {position} must be an object")
@@ -1127,9 +1120,6 @@ def _normalize_png_batch_payload(payload):
             raise ValueError(f"第 {position} 条记录缺少正向 Prompt")
         if len(positive) > PNG_BATCH_MAX_PROMPT_LENGTH:
             raise ValueError(f"record {position} prompt is too long")
-        total += len(positive)
-        if total > PNG_BATCH_MAX_TOTAL_LENGTH:
-            raise ValueError("PNG batch prompt text is too large")
         filename = Path(str(image.get("filename") or "")).name or f"record-{position}.png"
         if len(filename) > 255:
             raise ValueError(f"第 {position} 条图片名过长")
@@ -1144,9 +1134,6 @@ def _normalize_png_batch_payload(payload):
             processed = str(prompt["processed"] or "")
             if len(processed) > PNG_BATCH_MAX_PROMPT_LENGTH:
                 raise ValueError(f"第 {position} 条处理结果过长")
-            total += len(processed)
-            if total > PNG_BATCH_MAX_TOTAL_LENGTH:
-                raise ValueError("PNG 批次 Prompt 文本总长度过大")
             item["prompt"]["processed"] = processed
         if record.get("status"):
             item["status"] = str(record["status"])
@@ -1185,8 +1172,6 @@ def _png_batch_process_records(records, action, transform):
 def _png_batch_load(file_path):
     try:
         path = Path(file_path)
-        if path.stat().st_size > PNG_BATCH_MAX_BYTES:
-            raise ValueError("PNG 批次 JSON 超过 4 MB")
         data = _normalize_png_batch_payload(path.read_text(encoding="utf-8"))
         return _png_batch_json(data), f"已导入 {len(data['records'])} 条逐图 Prompt。"
     except Exception as error:
@@ -1268,6 +1253,7 @@ def _png_batch_run(
         _PNG_BATCH_ACTIVE_TASK_ID = task_id
         _PNG_BATCH_CANCEL.clear()
     records = [dict(record) for record in data["records"]]
+    progress_interval = max(1, len(records) // 100)
     try:
         for position, record in enumerate(records, 1):
             if _PNG_BATCH_CANCEL.is_set():
@@ -1286,9 +1272,8 @@ def _png_batch_run(
                 record["status"], record["error"] = "已完成", ""
             else:
                 record["status"], record["error"] = "失败", llm_status or "LLM 未返回结果"
-            result = {"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": records}
-            selected, current = _png_batch_current(result, 1)
-            yield _png_batch_json(result), _png_batch_table(result), selected, current, f"处理中 {position}/{len(records)}"
+            if position % progress_interval == 0 or position == len(records):
+                yield gr.update(), gr.update(), gr.update(), gr.update(), f"处理中 {position}/{len(records)}"
 
         result = {"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": records}
         selected, current = _png_batch_current(result, 1)
@@ -1325,8 +1310,6 @@ def _png_batch_export_file(payload):
     export_dir.mkdir(parents=True, exist_ok=True)
     path = export_dir / f"prompt_batch_{uuid.uuid4().hex}.json"
     content = _png_batch_json(data)
-    if len(content.encode("utf-8")) > PNG_BATCH_MAX_BYTES:
-        raise ValueError("导出 JSON 超过 4 MB")
     path.write_text(content, encoding="utf-8")
     return str(path)
 
