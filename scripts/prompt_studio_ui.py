@@ -983,33 +983,34 @@ def _search_wildcards(query):
 def _save_llm_settings(provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
     provider = str(provider or DEFAULT_LLM_SETTINGS["provider"])
     if provider not in PROVIDER_PROFILES:
-        return "保存失败：不支持的 Provider。", gr.update()
+        return "保存失败：不支持的 Provider。", gr.update(), gr.update()
     try:
         endpoint = validate_endpoint(endpoint)
+        model = str(model or "").strip()
         settings = {
             "endpoint": endpoint,
-            "model": str(model or "").strip(),
+            "model": model,
             "temperature": max(0.0, min(float(temperature), 2.0)),
             "timeout": max(5, min(int(timeout), 600)),
             "max_tokens": max(0, min(int(max_tokens), 262144)),
             "send_temperature": bool(send_temperature),
         }
     except (TypeError, ValueError) as error:
-        return f"保存失败：{_safe_error(error)}", gr.update()
+        return f"保存失败：{_safe_error(error)}", gr.update(), gr.update()
     store = _connection_store()
     providers = dict(store.get("providers", {}))
     providers[provider] = settings
     DB.set_setting("llm_connections_v2", {"version": 2, "active_provider": provider, "providers": providers})
     key_saved = CREDENTIALS.save(provider, endpoint, api_key)
     key_available = key_saved or CREDENTIALS.has_matching(provider, endpoint)
-    message = f"{provider} 设置已保存，URL、模型和生成参数下次会自动恢复。"
+    message = f"{provider} 设置已保存。模型 ID：{model or '未指定（使用服务端默认模型）'}。URL、模型 ID 和生成参数下次会自动恢复。"
     if key_available:
         message += " API Key 已按 Provider 与 URL 保存在服务端，下次可留空。"
     elif get_provider_profile(provider).get("requires_api_key"):
         message += " 尚未保存 API Key，调用前必须填写。"
     else:
         message += " 当前未保存 API Key。"
-    return message, gr.update(value=endpoint)
+    return message, gr.update(value=endpoint), gr.update(value=model)
 
 
 def _clear_llm_credentials(provider, endpoint):
@@ -1391,7 +1392,7 @@ def _create_inline_panel(slot, prompt_target):
             with gr.Row():
                 provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=settings["provider"])
                 endpoint = gr.Textbox(label="接口地址", value=settings["endpoint"])
-                model = gr.Textbox(label="模型 ID", value=settings["model"])
+                model = gr.Textbox(label="模型 ID", value=settings["model"], elem_id=f"llm_prompt_studio_{slot}_model_id")
                 api_key = gr.Textbox(label="API Key（留空则使用已保存凭据）", type="password")
                 temperature = gr.Slider(label="温度", minimum=0, maximum=2, value=settings["temperature"], step=0.05)
                 timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=settings["timeout"], step=5)
@@ -1426,7 +1427,7 @@ def _create_inline_panel(slot, prompt_target):
         generate.click(_inline_generate, inputs=inputs, outputs=[output, system_preview, status, prompt_target])
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, connection_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=connection_status)
-        save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[connection_status, endpoint])
+        save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[connection_status, endpoint, model])
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=connection_status)
         save_workflow.click(
             _save_inline_workflow_settings,
@@ -2076,7 +2077,7 @@ def on_ui_tabs():
             with gr.Tab("连接设置", elem_id="llm_prompt_studio_connection_tab"):
                 provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=llm_settings["provider"])
                 endpoint = gr.Textbox(label="接口地址", value=llm_settings["endpoint"])
-                model = gr.Textbox(label="模型 ID", value=llm_settings["model"], placeholder="填写服务端暴露的模型名称")
+                model = gr.Textbox(label="模型 ID", value=llm_settings["model"], placeholder="填写服务端暴露的模型名称", elem_id="llm_prompt_studio_model_id")
                 api_key = gr.Textbox(label="API Key（留空则使用已保存凭据）", type="password")
                 temperature = gr.Slider(label="温度", minimum=0, maximum=2, value=llm_settings["temperature"], step=0.05)
                 timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=llm_settings["timeout"], step=5)
@@ -2124,7 +2125,7 @@ def on_ui_tabs():
         reset_workflow.click(_reset_workflow_settings, outputs=[*workflow_inputs, workflow_status])
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
-        save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint])
+        save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint, model])
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
         png_batch_payload.input(_png_batch_refresh, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_table, png_batch_selection, png_batch_current, png_batch_status])
         png_batch_file_event.then(

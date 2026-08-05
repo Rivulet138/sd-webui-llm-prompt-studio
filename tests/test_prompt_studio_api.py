@@ -277,14 +277,17 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(valid.status_code, 200)
 
     async def test_provider_settings_and_keys_are_restored_independently(self):
-        message, _ = ui._save_llm_settings(
+        message, _, saved_model = ui._save_llm_settings(
             "Anthropic", "https://api.anthropic.com/", "claude-test", "anthropic-key", 0.2, 120, 2048, False,
         )
         self.assertIn("Anthropic 设置已保存", message)
-        message, _ = ui._save_llm_settings(
+        self.assertIn("模型 ID：claude-test", message)
+        self.assertEqual(saved_model["value"], "claude-test")
+        message, _, saved_model = ui._save_llm_settings(
             "Google Gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-test", "gemini-key", 0.6, 80, 4096, True,
         )
         self.assertIn("Google Gemini 设置已保存", message)
+        self.assertEqual(saved_model["value"], "gemini-test")
 
         anthropic = ui._connection_settings("Anthropic")
         gemini = ui._connection_settings("Google Gemini")

@@ -28,6 +28,7 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_cache_table",
             "llm_prompt_studio_generate_button",
             "llm_prompt_studio_output",
+            "llm_prompt_studio_model_id",
             "llm_prompt_studio_cache_result",
             "llm_prompt_studio_auto_score",
             "llm_prompt_studio_auto_loop_tab",
