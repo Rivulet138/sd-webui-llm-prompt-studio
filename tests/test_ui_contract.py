@@ -38,6 +38,8 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_auto_loop_request",
             "llm_prompt_studio_auto_loop_start",
             "llm_prompt_studio_auto_loop_cache",
+            "llm_prompt_studio_auto_loop_continuous",
+            "llm_prompt_studio_auto_loop_cycles",
             "llm_prompt_studio_auto_loop_generate_run",
             "llm_prompt_studio_auto_loop_dispatch",
             "llm_prompt_studio_auto_loop_run",
@@ -48,6 +50,12 @@ class PromptStudioUiContractTests(unittest.TestCase):
         ):
             self.assertIn(f'elem_id="{elem_id}"', source)
 
+        self.assertNotIn("_save_inline_workflow_settings", source)
+        self.assertNotIn('workflow["batch_score"]', source)
+        self.assertNotIn("batch_score, False, False", source)
+        self.assertIn("validate_endpoint(endpoint) + \"/tagger/v1/interrogate\"", source)
+        self.assertIn("response.read(4 * 1024 * 1024 + 1)", source)
+
     def test_auto_loop_javascript_contract(self):
         script = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
         for marker in (
@@ -56,27 +64,28 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "async function runStored",
             "waitForStudioGeneration",
             "waitForForgeGeneration",
-            "state.cancelled",
-            "state.phase === \"forge\"",
+            "run.cancelled",
+            "run.phase === \"forge\"",
             "MAX_LOG_ROWS = 100",
             "localStorage",
             "findButton(\"llm_prompt_studio_auto_loop_dispatch\")",
-            "querySelector(`#${tab}_generate`)",
+            "find(`${target}_generate`)",
             "target === \"img2img\"",
             "canonicalPrompt",
             "migrateQueue",
-            "seen.has(key)",
-            "queuedPrompts.has(promptKey)",
+            "seen.has(id)",
+            "state.requestIds.has(requestId)",
             "duplicateOutputCount",
             "async function generateAndRun",
-            "const promptRequest = requests[index - 1]",
+            "allowRepeat: continuous",
+            "cycleLimit === 0",
             "setValue(\"llm_prompt_studio_output\", \"\")",
-            "state.queue.pop()",
             "writePrompt(row.prompt, target, mode, basePrompt)",
-            "已完成（队列状态未保存）",
+            "requestIds: Array.from(state.requestIds)",
+            "state.lastBatchRowIds.slice()",
+            "not persistent",
         ):
             self.assertIn(marker, script)
-        self.assertNotIn("这是第 ${index} 条", script)
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
         self.assertIn("structured_mode, region_count, 0, False, False", source)
         self.assertIn("auto_loop_cache_result", source)

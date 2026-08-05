@@ -37,6 +37,29 @@ class PngBatchContractTests(unittest.TestCase):
         self.assertEqual(len(normalized["records"]), 2)
         self.assertEqual([row["image"]["filename"] for row in normalized["records"]], ["one.png", "two.png"])
 
+    def test_schema_round_trip_preserves_processed_output_kind(self):
+        payload = {
+            "schema_version": "prompt_batch.v1",
+            "producer": {"name": "collector"},
+            "records": [{
+                "record_id": "typed",
+                "source_identity": "tags:cat",
+                "image": {"filename": "typed.png"},
+                "prompt": {
+                    "positive": "cat",
+                    "processed": "a cat in sunlight",
+                    "processed_kind": "natural",
+                    "output_kind": "natural",
+                },
+            }],
+        }
+
+        normalized = ui._normalize_png_batch_payload(payload)
+
+        self.assertEqual(normalized["records"][0]["prompt"]["processed_kind"], "natural")
+        self.assertEqual(normalized["records"][0]["prompt"]["output_kind"], "natural")
+        self.assertEqual(normalized["records"][0]["source_identity"], "tags:cat")
+
     def test_schema_accepts_more_than_five_thousand_records(self):
         payload = {
             "schema_version": "prompt_batch.v1",

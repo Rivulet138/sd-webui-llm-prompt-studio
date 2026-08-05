@@ -2,23 +2,31 @@
     "use strict";
 
     const QUEUE_KEY = "llm_prompt_studio_auto_loop_queue_v1";
+    const RUN_LOCK_KEY = "llm_prompt_studio_auto_loop_run";
     const MAX_LOG_ROWS = 100;
+    const ACTIVE_LEASE_MS = 35 * 60 * 1000;
+    const STATUS = Object.freeze({ pending: "pending", running: "running", completed: "completed" });
+    const FAILURE_PATTERN = /fail|error|timeout|refused|interrupted|失败|错误|超时|拒绝|中断/i;
     const state = {
-        running: false,
-        cancelled: false,
-        runId: 0,
-        phase: "idle",
-        target: "txt2img",
         queue: [],
+        requestIds: new Set(),
+        active: null,
+        sequence: 0,
+        instanceId: `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        releaseCrossTabLock: null,
+        lastLockFailure: "",
+        lastLockFailureMessage: "",
+        persistent: true,
+        lastSaveFailure: "",
+        lastBatchRowIds: [],
     };
 
     function root() {
         return typeof gradioApp === "function" ? gradioApp() : document;
     }
 
-    function find(id, selector = "") {
-        const host = root().querySelector(`#${id}`);
-        return host ? (selector ? host.querySelector(selector) : host) : null;
+    function find(id) {
+        return root().querySelector(`#${id}`);
     }
 
     function findButton(id) {
@@ -30,15 +38,15 @@
         return find(id)?.querySelector("textarea, input, select");
     }
 
-    function setValue(id, next) {
+    function setValue(id, value) {
         const element = input(id);
-        if (!element) throw new Error(`未找到控件：${id}`);
+        if (!element) throw new Error(`未找到控件: ${id}`);
         const prototype = element instanceof HTMLTextAreaElement
             ? HTMLTextAreaElement.prototype
             : HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-        if (setter) setter.call(element, String(next ?? ""));
-        else element.value = String(next ?? "");
+        if (setter) setter.call(element, String(value ?? ""));
+        else element.value = String(value ?? "");
         element.dispatchEvent(new Event("input", { bubbles: true }));
         element.dispatchEvent(new Event("change", { bubbles: true }));
     }
@@ -48,54 +56,60 @@
     }
 
     function escapeHtml(value) {
-        return String(value ?? "").replace(/[&<>\"']/g, (char) => ({
+        return String(value ?? "").replace(/[&<>\"']/g, (character) => ({
             "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
-        }[char]));
+        }[character]));
     }
 
     function canonicalPrompt(value) {
-        return String(value ?? "").normalize("NFKC").replace(/\s+/g, " ").trim();
+        return String(value ?? "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
     }
 
-    function normalizeQueueStatus(value) {
-        return String(value || "").startsWith("已完成") ? "已完成" : "待生图";
+    function normalizeStatus(value) {
+        return /completed|已完成/i.test(String(value || "")) ? STATUS.completed : STATUS.pending;
     }
 
-    function migrateQueue(rows) {
-        const queue = [];
+    function createId(prefix) {
+        state.sequence += 1;
+        return `${prefix}-${Date.now().toString(36)}-${state.sequence.toString(36)}`;
+    }
+
+    function migrateQueue(stored) {
+        const sourceRows = Array.isArray(stored) ? stored : stored?.rows;
+        const preserveDistinctRows = !Array.isArray(stored) && Number(stored?.version || 0) >= 2;
+        const requestIds = new Set(Array.isArray(stored?.requestIds) ? stored.requestIds.map(canonicalPrompt).filter(Boolean) : []);
+        const rows = [];
         const positions = new Map();
         let duplicateCount = 0;
         let emptyCount = 0;
-        for (const row of Array.isArray(rows) ? rows : []) {
-            const prompt = row && typeof row.prompt === "string" ? row.prompt.trim() : "";
-            const key = canonicalPrompt(prompt);
-            if (!key) {
+        for (const source of Array.isArray(sourceRows) ? sourceRows : []) {
+            const prompt = typeof source?.prompt === "string" ? source.prompt.trim() : "";
+            const promptKey = canonicalPrompt(prompt);
+            if (!promptKey) {
                 emptyCount += 1;
                 continue;
             }
-            const status = normalizeQueueStatus(row.status);
-            if (positions.has(key)) {
+            const requestId = canonicalPrompt(source.requestId);
+            if (requestId) requestIds.add(requestId);
+            const status = normalizeStatus(source.status);
+            if (!preserveDistinctRows && positions.has(promptKey)) {
                 duplicateCount += 1;
-                const existing = queue[positions.get(key)];
-                if (status === "已完成") existing.status = "已完成";
+                const existing = rows[positions.get(promptKey)];
+                if (status === STATUS.completed) existing.status = STATUS.completed;
+                if (!existing.requestId && requestId) existing.requestId = requestId;
                 continue;
             }
-            positions.set(key, queue.length);
-            queue.push({ index: queue.length + 1, prompt, status });
+            if (!preserveDistinctRows) positions.set(promptKey, rows.length);
+            rows.push({
+                index: rows.length + 1,
+                id: String(source.id || createId("row")),
+                batchId: String(source.batchId || ""),
+                requestId,
+                prompt,
+                status,
+            });
         }
-        return { queue, duplicateCount, emptyCount };
-    }
-
-    function isVisible(element) {
-        if (!element) return false;
-        const style = window.getComputedStyle(element);
-        return style.display !== "none" && style.visibility !== "hidden" && element.offsetParent !== null;
-    }
-
-    function isBusy(tab) {
-        const interrupt = root().querySelector(`#${tab}_interrupt`);
-        const generate = root().querySelector(`#${tab}_generate`);
-        return isVisible(interrupt) || Boolean(generate?.disabled);
+        return { rows, requestIds, duplicateCount, emptyCount };
     }
 
     function render(kind, headline, detail = "") {
@@ -111,309 +125,467 @@
         const rows = state.queue.slice(-MAX_LOG_ROWS);
         host.innerHTML = rows.length
             ? rows.map((row) => `<div class="lps-auto-loop-row"><span>${row.index}</span><span>${escapeHtml(row.status)}</span><code>${escapeHtml(row.prompt)}</code></div>`).join("")
-            : `<div class="lps-auto-loop-empty">暂无已保存 Prompt。先批量生成，再决定是否投入生图。</div>`;
+            : '<div class="lps-auto-loop-empty">暂无已保存 Prompt。</div>';
     }
 
     function saveQueue() {
-        window.localStorage.setItem(QUEUE_KEY, JSON.stringify(state.queue));
-    }
-
-    function renderQueueMigrationNotice(migration) {
-        if (migration?.error) {
-            render("error", migration.error.headline, migration.error.detail);
-            return;
+        try {
+            state.lastSaveFailure = "";
+            const currentRaw = window.localStorage.getItem(QUEUE_KEY);
+            const current = currentRaw ? JSON.parse(currentRaw) : null;
+            if (
+                current?.activeOwner
+                && current.activeOwner !== state.instanceId
+                && Number(current.activeUntil || 0) > Date.now()
+            ) {
+                state.persistent = false;
+                state.lastSaveFailure = "foreign";
+                render("warning", "另一标签页正在使用自动队列", "当前页不会覆盖其运行状态");
+                return false;
+            }
+            window.localStorage.setItem(QUEUE_KEY, JSON.stringify({
+                version: 2,
+                rows: state.queue,
+                requestIds: Array.from(state.requestIds),
+                activeOwner: state.active ? state.instanceId : "",
+                activeUntil: state.active ? Date.now() + ACTIVE_LEASE_MS : 0,
+            }));
+            const verifiedRaw = window.localStorage.getItem(QUEUE_KEY);
+            const verified = verifiedRaw ? JSON.parse(verifiedRaw) : null;
+            if (state.active && verified?.activeOwner !== state.instanceId) {
+                state.persistent = false;
+                state.lastSaveFailure = "foreign";
+                render("warning", "自动队列租约获取失败", "另一标签页已取得运行权");
+                return false;
+            }
+            state.persistent = true;
+            return true;
+        } catch (error) {
+            state.persistent = false;
+            state.lastSaveFailure = "storage";
+            render("warning", "队列仅保存在内存中 (not persistent)", String(error?.message || error));
+            return false;
         }
-        if (!migration?.duplicateCount && !migration?.emptyCount) return;
-        const details = [];
-        if (migration.duplicateCount) details.push(`已移除重复记录 ${migration.duplicateCount} 条`);
-        if (migration.emptyCount) details.push(`已移除空记录 ${migration.emptyCount} 条`);
-        details.push(`保留 ${state.queue.length} 条唯一 Prompt，并已重新编号`);
-        render("warning", "已整理历史 Prompt 队列", details.join("；"));
     }
 
     function loadQueue() {
-        let migration = { queue: [], duplicateCount: 0, emptyCount: 0 };
         try {
             const raw = window.localStorage.getItem(QUEUE_KEY);
-            const parsed = raw ? JSON.parse(raw) : [];
-            migration = migrateQueue(parsed);
-            state.queue = migration.queue;
+            const migration = migrateQueue(raw ? JSON.parse(raw) : []);
+            state.queue = migration.rows;
+            state.requestIds = migration.requestIds;
+            renderQueue();
+            if (!saveQueue()) return;
+            if (migration.duplicateCount || migration.emptyCount) {
+                render("warning", "已整理历史 Prompt 队列", `移除重复 ${migration.duplicateCount} 条，空记录 ${migration.emptyCount} 条`);
+            }
         } catch (error) {
             state.queue = [];
-            migration.error = {
-                headline: "历史 Prompt 队列恢复失败",
-                detail: String(error?.message || error),
-            };
+            state.requestIds = new Set();
+            state.persistent = false;
             renderQueue();
-            renderQueueMigrationNotice(migration);
-            return migration;
+            render("error", "历史 Prompt 队列恢复失败", String(error?.message || error));
         }
-        try {
-            saveQueue();
-        } catch (error) {
-            migration.error = {
-                headline: "历史 Prompt 队列已恢复，但整理结果保存失败",
-                detail: String(error?.message || error),
-            };
-        }
-        renderQueue();
-        renderQueueMigrationNotice(migration);
-        return migration;
     }
 
-    async function waitForStudioGeneration(runId, beforeOutput, beforeStatus, timeoutMs = 300000) {
+    function isVisible(element) {
+        if (!element) return false;
+        const style = window.getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden" && element.offsetParent !== null;
+    }
+
+    function isForgeBusy(tab) {
+        return isVisible(find(`${tab}_interrupt`)) || Boolean(find(`${tab}_generate`)?.disabled);
+    }
+
+    function hasForeignActiveLease() {
+        try {
+            const raw = window.localStorage.getItem(QUEUE_KEY);
+            const stored = raw ? JSON.parse(raw) : null;
+            return Boolean(
+                stored?.activeOwner
+                && stored.activeOwner !== state.instanceId
+                && Number(stored.activeUntil || 0) > Date.now()
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function crossTabLockFailureMessage() {
+        if (state.lastLockFailure === "unsupported") return "当前浏览器不支持 Web Locks，无法安全启动自动队列";
+        if (state.lastLockFailure === "unavailable") return "自动队列锁不可用，请刷新页面后重试";
+        return "另一标签页正在运行自动队列";
+    }
+
+    async function acquireCrossTabLock() {
+        state.lastLockFailure = "";
+        state.lastLockFailureMessage = "";
+        if (typeof navigator === "undefined" || typeof navigator.locks?.request !== "function") {
+            state.lastLockFailure = "unsupported";
+            return false;
+        }
+        return new Promise((resolve) => {
+            let resolved = false;
+            const rejectLock = () => {
+                if (!resolved) {
+                    state.lastLockFailure = "unavailable";
+                    resolved = true;
+                    resolve(false);
+                }
+            };
+            try {
+                navigator.locks.request(RUN_LOCK_KEY, { ifAvailable: true }, async (lock) => {
+                    if (!lock) {
+                        state.lastLockFailure = "busy";
+                        resolved = true;
+                        resolve(false);
+                        return;
+                    }
+                    let release;
+                    const held = new Promise((releaseLock) => { release = releaseLock; });
+                    state.releaseCrossTabLock = release;
+                    resolved = true;
+                    resolve(true);
+                    await held;
+                }).catch(rejectLock);
+            } catch {
+                rejectLock();
+            }
+        });
+    }
+
+    function releaseCrossTabLock() {
+        const release = state.releaseCrossTabLock;
+        state.releaseCrossTabLock = null;
+        if (typeof release === "function") release();
+    }
+
+    async function beginRun(phase, target = null) {
+        if (state.active) return null;
+        if (!await acquireCrossTabLock()) {
+            const message = crossTabLockFailureMessage();
+            if (state.lastLockFailure === "unsupported") {
+                render("error", "当前浏览器不支持安全的自动队列锁", "请使用支持 Web Locks 的新版浏览器");
+            } else if (state.lastLockFailure === "unavailable") {
+                render("error", "自动队列锁不可用", "请刷新页面后重试");
+            } else {
+                render("warning", "另一标签页正在运行自动队列", "请在原标签页取消或等待任务结束");
+            }
+            state.lastLockFailureMessage = message;
+            return null;
+        }
+        if (state.active) {
+            releaseCrossTabLock();
+            return null;
+        }
+        const run = { id: createId("run"), phase, target, cancelled: false };
+        state.active = run;
+        if (!saveQueue() && state.lastSaveFailure === "foreign") {
+            state.active = null;
+            releaseCrossTabLock();
+            return null;
+        }
+        return run;
+    }
+
+    function assertActive(run) {
+        if (run.cancelled || state.active !== run) throw new Error("已取消");
+    }
+
+    function finishRun(run) {
+        if (state.active === run) {
+            state.active = null;
+            saveQueue();
+            releaseCrossTabLock();
+        }
+    }
+
+    async function waitForStudioGeneration(run, beforeStatus, timeoutMs = 300000) {
         const button = findButton("llm_prompt_studio_auto_loop_dispatch");
         const output = input("llm_prompt_studio_output");
         const statusHost = find("llm_prompt_studio_status");
         let sawBusy = false;
         const started = Date.now();
         while (Date.now() - started < timeoutMs) {
-            if (state.cancelled || state.runId !== runId) throw new Error("已取消");
+            assertActive(run);
             const busy = Boolean(button?.disabled);
             sawBusy ||= busy;
-            const currentOutput = String(output?.value || "").trim();
             const currentStatus = String(statusHost?.textContent || "");
-            const changed = currentStatus !== beforeStatus || currentOutput !== beforeOutput;
-            if (changed && /失败|错误|超时|拒绝|拦截/.test(currentStatus)) {
+            if (currentStatus !== beforeStatus && FAILURE_PATTERN.test(currentStatus)) {
                 throw new Error(currentStatus || "LLM Prompt 生成失败");
             }
             if (sawBusy && !busy) {
-                await wait(100);
-                const finishedOutput = String(output?.value || "").trim() || currentOutput;
-                if (finishedOutput) return finishedOutput;
+                await wait(50);
+                assertActive(run);
+                const result = String(output?.value || "").trim();
+                if (result && !FAILURE_PATTERN.test(String(statusHost?.textContent || ""))) return result;
                 throw new Error(currentStatus || "LLM Prompt 生成失败：未返回结果");
             }
-            if (changed && currentOutput && (!button || (!busy && Date.now() - started > 500))) return currentOutput;
-            await wait(250);
+            await wait(25);
         }
-        throw new Error("LLM Prompt 生成超时，请检查 API 设置");
+        throw new Error("LLM Prompt 生成超时");
     }
 
-    async function waitForForgeGeneration(tab, runId, beforeGallery, timeoutMs = 1800000) {
-        const started = Date.now();
+    async function waitForForgeGeneration(tab, run, beforeStatus, timeoutMs = 1800000) {
+        const statusHost = find(`${tab}_status`);
         let sawBusy = false;
-        const gallery = root().querySelector(`#${tab}_gallery`);
+        const started = Date.now();
         while (Date.now() - started < timeoutMs) {
-            if (state.cancelled || state.runId !== runId) throw new Error("已取消");
-            const busy = isBusy(tab);
+            assertActive(run);
+            const busy = isForgeBusy(tab);
             sawBusy ||= busy;
-            if (sawBusy && !busy) return;
-            if (!busy && gallery && gallery.innerHTML !== beforeGallery && Date.now() - started > 500) return;
-            await wait(400);
+            const currentStatus = String(statusHost?.textContent || "");
+            if (currentStatus !== beforeStatus && FAILURE_PATTERN.test(currentStatus)) throw new Error(currentStatus);
+            if (sawBusy && !busy) {
+                if (!FAILURE_PATTERN.test(currentStatus)) return;
+            }
+            await wait(25);
         }
-        throw new Error(`${tab} 生图超时，请检查 Forge 队列或手动停止任务`);
+        throw new Error(`${tab} generation timeout`);
+    }
+
+    function ensureLlmIdle() {
+        const general = findButton("llm_prompt_studio_generate_button");
+        const dispatch = findButton("llm_prompt_studio_auto_loop_dispatch");
+        if (!general || !dispatch || general.disabled || dispatch.disabled) throw new Error("LLM Studio 当前已有生成任务");
+        return dispatch;
+    }
+
+    function ensureForgeIdle(target) {
+        if (isForgeBusy(target)) throw new Error(`${target} 当前已有生图任务`);
     }
 
     function writePrompt(prompt, target, mode, basePrompt = "") {
         const targetInput = root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`);
         if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
-        const base = String(basePrompt || "");
-        const next = mode === "append" && base.trim()
-            ? `${base.replace(/[\s,]+$/, "")}, ${String(prompt).replace(/^[\s,]+/, "")}`
+        const next = mode === "append" && String(basePrompt).trim()
+            ? `${String(basePrompt).replace(/[\s,]+$/, "")}, ${String(prompt).replace(/^[\s,]+/, "")}`
             : String(prompt).trim();
         setValue(`${target}_prompt`, next);
         targetInput.focus({ preventScroll: true });
     }
 
-    function ensureLlmIdle() {
-        const generalButton = findButton("llm_prompt_studio_generate_button");
-        const dispatchButton = findButton("llm_prompt_studio_auto_loop_dispatch");
-        if (!generalButton || !dispatchButton || generalButton.disabled || dispatchButton.disabled) {
-            throw new Error("LLM Studio 当前已有生成任务，请等待完成后再启动");
-        }
-        return dispatchButton;
-    }
-
-    function ensureForgeIdle(target) {
-        if (isBusy(target)) throw new Error(`${target} 当前已有生图任务，请等待完成后再启动`);
-    }
-
-    async function generateBatch(config) {
-        if (state.running) return "已有队列任务正在运行";
+    function parseRequests(value) {
         const seen = new Set();
-        let duplicateInputCount = 0;
-        const requests = String(config.request || "").split(/\r?\n/).map((value) => value.trim()).filter((value) => {
-            if (!value || value.startsWith("#")) return false;
-            const key = canonicalPrompt(value);
-            if (seen.has(key)) {
-                duplicateInputCount += 1;
+        let duplicateCount = 0;
+        const requests = String(value || "").split(/\r?\n/).map((item) => item.trim()).filter((item) => {
+            if (!item || item.startsWith("#")) return false;
+            const id = canonicalPrompt(item);
+            if (seen.has(id)) {
+                duplicateCount += 1;
                 return false;
             }
-            seen.add(key);
+            seen.add(id);
             return true;
         });
-        if (!requests.length) {
-            render("warning", "缺少批量创作要求", "请按每行一条填写至少一个 Prompt");
-            return "缺少每轮创作要求";
-        }
-        state.running = true;
-        state.cancelled = false;
-        state.phase = "llm";
-        const runId = ++state.runId;
-        let added = 0;
+        return { requests, duplicateCount };
+    }
+
+    async function generateBatch(config, parentRun = null) {
+        if (state.active && state.active !== parentRun) return "已有队列任务正在运行";
+        const parsed = parseRequests(config.request);
+        if (!parsed.requests.length) return "缺少每轮创作要求";
+        const run = parentRun || await beginRun("llm");
+        if (!run) return state.lastLockFailureMessage || crossTabLockFailureMessage();
+        run.phase = "llm";
+        run.target = null;
+        const batchId = createId("batch");
+        const queuedPrompts = new Set(state.queue.map((row) => canonicalPrompt(row.prompt)));
+        const allowRepeat = Boolean(config.allowRepeat);
+        const allowDuplicateOutput = Boolean(config.allowDuplicateOutput);
+        state.lastBatchRowIds = [];
         let duplicateOutputCount = 0;
-        const queuedPrompts = new Set(state.queue.map((row) => canonicalPrompt(row.prompt)).filter(Boolean));
+        let skippedRequestCount = 0;
         try {
-            await wait(150);
-            for (let index = 1; index <= requests.length; index += 1) {
-                if (state.cancelled || state.runId !== runId) break;
-                const button = ensureLlmIdle();
-                render("warning", `正在批量生成 Prompt：第 ${index}/${requests.length} 条`, "每条唯一输入仅请求一次，不评分、不写入 Prompt 缓存");
-                const promptRequest = requests[index - 1];
-                setValue("llm_prompt_studio_request", promptRequest);
-                setValue("llm_prompt_studio_source_tags", "");
-                setValue("llm_prompt_studio_output", "");
-                const output = input("llm_prompt_studio_output");
-                const statusHost = find("llm_prompt_studio_status");
-                const beforeOutput = String(output?.value || "");
-                const beforeStatus = String(statusHost?.textContent || "");
-                button.click();
-                const prompt = await waitForStudioGeneration(runId, beforeOutput, beforeStatus);
-                const promptKey = canonicalPrompt(prompt);
-                if (queuedPrompts.has(promptKey)) {
-                    duplicateOutputCount += 1;
-                    renderQueue();
+            for (const request of parsed.requests) {
+                assertActive(run);
+                const requestId = canonicalPrompt(request);
+                if (!allowRepeat && state.requestIds.has(requestId)) {
+                    skippedRequestCount += 1;
                     continue;
                 }
-                state.queue.push({ index: state.queue.length + 1, prompt: prompt.trim(), status: "待生图" });
-                queuedPrompts.add(promptKey);
-                try {
+                const button = ensureLlmIdle();
+                setValue("llm_prompt_studio_request", request);
+                setValue("llm_prompt_studio_source_tags", "");
+                setValue("llm_prompt_studio_output", "");
+                const beforeStatus = String(find("llm_prompt_studio_status")?.textContent || "");
+                button.click();
+                const prompt = await waitForStudioGeneration(run, beforeStatus);
+                assertActive(run);
+                if (!allowRepeat) state.requestIds.add(requestId);
+                const promptKey = canonicalPrompt(prompt);
+                if (!allowDuplicateOutput && queuedPrompts.has(promptKey)) {
+                    duplicateOutputCount += 1;
                     saveQueue();
-                } catch (error) {
-                    state.queue.pop();
-                    queuedPrompts.delete(promptKey);
-                    throw new Error(`Prompt 队列保存失败：${String(error?.message || error)}`);
+                    continue;
                 }
-                added += 1;
+                const row = {
+                    index: state.queue.length + 1,
+                    id: createId("row"),
+                    batchId,
+                    requestId,
+                    prompt: prompt.trim(),
+                    status: STATUS.pending,
+                };
+                state.queue.push(row);
+                state.lastBatchRowIds.push(row.id);
+                queuedPrompts.add(promptKey);
+                saveQueue();
                 renderQueue();
             }
-            const message = state.cancelled ? `已取消 Prompt 批量生成，新增 ${added} 条` : `Prompt 批量生成完成，新增 ${added} 条，已保存待生图队列`;
-            const details = [];
-            if (duplicateInputCount) details.push(`已忽略重复输入 ${duplicateInputCount} 条`);
-            if (duplicateOutputCount) details.push(`已忽略重复生成结果 ${duplicateOutputCount} 条`);
-            details.push("请检查队列后再点击“投入队列生图”");
-            const detail = details.join("；");
-            render(state.cancelled ? "warning" : "success", message, detail);
+            const added = state.lastBatchRowIds.length;
+            const persistence = state.persistent ? "" : "；当前队列未持久化 (not persistent)";
+            const message = `Prompt 批量生成完成，新增 ${added} 条${persistence}`;
+            render("success", message, `重复输入 ${parsed.duplicateCount} 条，历史请求跳过 ${skippedRequestCount} 条，重复结果 ${duplicateOutputCount} 条`);
             return message;
         } catch (error) {
             const message = String(error?.message || error);
             render(message === "已取消" ? "warning" : "error", "Prompt 批量生成已停止", message);
             return message;
         } finally {
-            state.running = false;
-            state.phase = "idle";
+            if (!parentRun) finishRun(run);
         }
     }
 
-    async function runStored(config) {
-        if (state.running) return "已有队列任务正在运行";
-        const pending = state.queue.filter((row) => !String(row.status || "").startsWith("已完成"));
-        if (!pending.length) {
-            render("warning", "没有待生图 Prompt", "请先批量生成或清空后重新生成");
-            return "没有待生图 Prompt";
-        }
+    async function runStored(config, rowIds = null, parentRun = null) {
+        if (state.active && state.active !== parentRun) return "已有队列任务正在运行";
+        const selectedIds = rowIds ? new Set(rowIds) : null;
+        const pending = state.queue.filter((row) => row.status !== STATUS.completed && (!selectedIds || selectedIds.has(row.id)));
+        if (!pending.length) return "没有待生图 Prompt";
         const target = config.target === "img2img" ? "img2img" : "txt2img";
         const mode = config.writeMode === "append" ? "append" : "replace";
         const targetInput = root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`);
         if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
         const basePrompt = String(targetInput.value || "");
-        state.running = true;
-        state.cancelled = false;
-        state.phase = "forge";
-        state.target = target;
-        const runId = ++state.runId;
-        let completed = 0;
+        const run = parentRun || await beginRun("forge", target);
+        if (!run) return state.lastLockFailureMessage || crossTabLockFailureMessage();
+        run.phase = "forge";
+        run.target = target;
         let currentRow = null;
+        let completed = 0;
         try {
             for (const row of pending) {
-                if (state.cancelled || state.runId !== runId) break;
+                assertActive(run);
                 ensureForgeIdle(target);
                 currentRow = row;
-                row.status = "生图中";
+                row.status = STATUS.running;
                 renderQueue();
                 writePrompt(row.prompt, target, mode, basePrompt);
-                const generate = root().querySelector(`#${target}_generate`);
+                const generate = find(`${target}_generate`);
                 if (!generate) throw new Error(`未找到 ${target} 生图按钮`);
-                const gallery = root().querySelector(`#${target}_gallery`);
-                const beforeGallery = gallery?.innerHTML || "";
+                const statusHost = find(`${target}_status`);
+                const beforeStatus = String(statusHost?.textContent || "");
                 generate.click();
-                await waitForForgeGeneration(target, runId, beforeGallery);
-                row.status = "已完成";
-                try {
-                    saveQueue();
-                } catch (error) {
-                    row.status = "已完成（队列状态未保存）";
-                    currentRow = null;
-                    renderQueue();
-                    throw new Error(`Prompt 队列保存失败：${String(error?.message || error)}`);
-                }
+                await waitForForgeGeneration(target, run, beforeStatus);
+                assertActive(run);
+                row.status = STATUS.completed;
                 currentRow = null;
                 completed += 1;
+                saveQueue();
                 renderQueue();
-                render("success", `队列生图进度：已完成 ${completed}/${pending.length}`, "");
             }
-            const message = state.cancelled ? `已取消队列生图，完成 ${completed} 条` : `队列生图完成，共 ${completed} 条`;
-            render(state.cancelled ? "warning" : "success", message, "");
+            const message = `队列生图完成，共 ${completed} 条${state.persistent ? "" : "；状态未持久化 (not persistent)"}`;
+            render("success", message);
             return message;
         } catch (error) {
             const message = String(error?.message || error);
             render(message === "已取消" ? "warning" : "error", "队列生图已停止", message);
             return message;
         } finally {
-            if (currentRow?.status === "生图中") {
-                currentRow.status = "待生图";
-                try {
-                    saveQueue();
-                } catch (error) {
-                    render("error", "Prompt 队列状态保存失败", String(error?.message || error));
-                }
+            if (currentRow?.status === STATUS.running) {
+                currentRow.status = STATUS.pending;
+                saveQueue();
                 renderQueue();
             }
-            state.running = false;
-            state.phase = "idle";
+            if (!parentRun) finishRun(run);
         }
     }
 
     async function generateAndRun(config) {
-        if (state.running) return "已有队列任务正在运行";
-        const generated = await generateBatch(config);
-        if (!String(generated).startsWith("Prompt 批量生成完成")) return generated;
-        return runStored(config);
+        if (state.active) return "已有队列任务正在运行";
+        const run = await beginRun("llm");
+        if (!run) return state.lastLockFailureMessage || crossTabLockFailureMessage();
+        const continuous = Boolean(config.continuous);
+        const parsedCycles = Number(config.cycles);
+        const cycleLimit = continuous
+            ? (Number.isFinite(parsedCycles) ? Math.max(0, Math.floor(parsedCycles)) : 1)
+            : 1;
+        let completedCycles = 0;
+        try {
+            while (cycleLimit === 0 || completedCycles < cycleLimit) {
+                assertActive(run);
+                const generated = await generateBatch({
+                    ...config,
+                    allowRepeat: continuous,
+                    allowDuplicateOutput: continuous,
+                }, run);
+                if (!String(generated).startsWith("Prompt 批量生成完成")) return generated;
+                const rowIds = state.lastBatchRowIds.slice();
+                if (!rowIds.length) return "本轮没有新增 Prompt";
+                const generatedImages = await runStored(config, rowIds, run);
+                if (!String(generatedImages).startsWith("队列生图完成")) return generatedImages;
+                completedCycles += 1;
+                if (continuous) {
+                    render("success", `持续自动生图已完成 ${completedCycles} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "将持续运行到取消");
+                }
+            }
+            return continuous ? `持续自动生图完成，共 ${completedCycles} 轮` : `生成并生图完成，共 ${completedCycles} 轮`;
+        } finally {
+            finishRun(run);
+        }
     }
 
     function clearQueue() {
-        if (state.running) return "运行中不能清空队列";
-        const previous = state.queue;
+        if (state.active) return "运行中不能清空队列";
+        if (hasForeignActiveLease()) return "另一标签页正在运行自动队列，不能清空";
         state.queue = [];
-        try {
-            saveQueue();
-        } catch (error) {
-            state.queue = previous;
-            render("error", "清空队列失败", String(error?.message || error));
-            return "清空队列失败";
-        }
+        state.requestIds.clear();
+        state.lastBatchRowIds = [];
+        const persisted = saveQueue();
         renderQueue();
-        render("success", "已清空待生图队列", "");
-        return "已清空待生图队列";
+        const message = persisted ? "已清空待生图队列" : "已清空内存队列；未持久化 (not persistent)";
+        render(persisted ? "success" : "warning", message);
+        return message;
     }
 
     function cancel() {
-        if (!state.running) return "当前没有运行中的任务";
-        state.cancelled = true;
-        state.runId += 1;
-        if (state.phase === "forge") {
-            const interrupt = root().querySelector(`#${state.target}_interrupt`);
+        const run = state.active;
+        if (!run) return "当前没有运行中的任务";
+        run.cancelled = true;
+        if (run.phase === "forge" && run.target) {
+            const interrupt = find(`${run.target}_interrupt`);
             if (isVisible(interrupt)) interrupt.click();
         }
-        render("warning", "正在取消当前阶段", "已生成或已完成的队列记录会保留");
+        render("warning", "正在取消当前阶段", "迟到结果不会写入队列");
         return "正在取消当前阶段";
     }
 
-    const queueMigration = loadQueue();
-    window.setTimeout(() => {
-        renderQueue();
-        renderQueueMigrationNotice(queueMigration);
-    }, 1000);
+    if (typeof window.addEventListener === "function") {
+        window.addEventListener("storage", (event) => {
+            if (event.key !== QUEUE_KEY) return;
+            const stored = event.newValue ? JSON.parse(event.newValue) : null;
+            const lostOwnership = Boolean(
+                state.active
+                && stored?.activeOwner
+                && stored.activeOwner !== state.instanceId
+                && Number(stored.activeUntil || 0) > Date.now()
+            );
+            if (lostOwnership) {
+                const run = state.active;
+                run.cancelled = true;
+                if (run.phase === "forge" && run.target) {
+                    const interrupt = find(`${run.target}_interrupt`);
+                    if (isVisible(interrupt)) interrupt.click();
+                }
+                render("error", "自动队列运行权已转移", "当前页已停止，迟到结果不会写入队列");
+            } else if (!state.active) {
+                loadQueue();
+            }
+        });
+    }
+    loadQueue();
+    window.setTimeout(renderQueue, 1000);
     window.llmPromptStudioAutoLoop = {
         generateBatch,
         generateAndRun,

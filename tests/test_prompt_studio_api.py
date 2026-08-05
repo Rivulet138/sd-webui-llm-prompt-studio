@@ -86,9 +86,9 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             return await client.request(method, path, **kwargs)
 
     @staticmethod
-    def _batch_args(source_text, skip_existing=True, skip_failed=True, retries=2, auto_score=False):
+    def _batch_args(source_text, skip_existing=True, skip_failed=True):
         return (
-            source_text, skip_existing, skip_failed, retries, 7, auto_score,
+            source_text, skip_existing, skip_failed,
             "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
             0.35, 90, 1024, True, 0, 0,
@@ -137,7 +137,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["natural_prompt"], payload["natural_prompt"])
 
     async def test_ranbooru_handoff_process_sends_once_and_keeps_failed_record(self):
-        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 3, "auto_score": True})
+        ui.DB.set_setting("workflow_settings_v1", {"auto_score": True})
         calls = []
 
         def fail_llm(*_args, **_kwargs):
@@ -163,7 +163,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui._handoff_safety("e"), "NSFW")
 
     async def test_ranbooru_handoff_unexpected_exception_is_not_retried_and_is_recorded(self):
-        ui.DB.set_setting("workflow_settings_v1", {"batch_retries": 3, "auto_score": True})
+        ui.DB.set_setting("workflow_settings_v1", {"auto_score": True})
         calls = []
 
         def fail_generate(*_args, **_kwargs):
@@ -187,7 +187,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_ranbooru_handoff_process_caches_with_source_provenance(self):
         ui.DB.set_setting("workflow_settings_v1", {
             "preset": "NoobAI Tags", "base_model": "NoobAI",
-            "batch_retries": 3, "auto_score": True,
+            "auto_score": True,
         })
         calls = []
 
@@ -212,8 +212,53 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff["status"], "completed")
         self.assertEqual(handoff["attempts"], 1)
         self.assertEqual(cached["source_kind"], "ranbooru")
+        self.assertEqual(cached["score_source"], "unrated")
         self.assertIn("ranbooru:abcdef0123456789:19:llm:", cached["source_ref"])
         self.assertEqual(cached["tags"], payload["tags_prompt"])
+
+    async def test_completed_handoff_process_reuses_result_without_another_llm_call(self):
+        calls = []
+        ui.call_llm = lambda *_args, **_kwargs: calls.append(True) or "1girl, red_hair"
+        payload = {
+            "ranbooru_id": 29,
+            "database_key": "abcdef0123456789",
+            "tags_prompt": "1girl, red_hair, portrait",
+            "rating": "g",
+        }
+
+        first = ui.process_ranbooru_handoff(payload)
+        second = ui.process_ranbooru_handoff(payload)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second["handoff_id"], first["handoff_id"])
+        self.assertEqual(second["prompt"], first["prompt"])
+        self.assertIn("复用", second["status"])
+
+    async def test_superseded_handoff_discards_stale_result_and_cache_write(self):
+        original_payload = {
+            "ranbooru_id": 30,
+            "database_key": "abcdef0123456789",
+            "tags_prompt": "old tags",
+        }
+        updated_payload = {**original_payload, "tags_prompt": "new tags"}
+
+        def superseding_generate(*_args, **_kwargs):
+            ui.receive_ranbooru_handoff(updated_payload, "process_and_cache")
+            return "stale result", "system", "生成完成"
+
+        ui._generate = superseding_generate
+        with self.assertRaisesRegex(ValueError, "新版本替代"):
+            ui.process_ranbooru_handoff(original_payload)
+
+        pending = ui.DB.list_handoffs()[0]
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["payload"]["tags_prompt"], "new tags")
+        self.assertEqual(ui.DB.list_prompts(), [])
+
+        ui._generate = lambda *_args, **_kwargs: ("current result", "system", "生成完成")
+        result = ui.process_ranbooru_handoff(pending["id"])
+        self.assertEqual(result["prompt"], "current result")
+        self.assertEqual(ui.DB.get_handoff(pending["id"])["status"], "completed")
 
     async def test_ranbooru_handoff_process_uses_current_natural_variant(self):
         captured = {}
@@ -405,7 +450,10 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         original_generate = ui._generate
         ui._generate = lambda *args: ("", "system", "生成失败")
         try:
-            generated, system, status, prompt_update = ui._inline_generate()
+            generated, system, status, prompt_update = ui._inline_generate(
+                "request", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+                0, 0, True, "", False, False, 0, "Plain Prompt", 1, 0, False, False,
+            )
         finally:
             ui._generate = original_generate
 
@@ -447,7 +495,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "NoobAI Tags", "custom system", "NoobAI", "NSFW", "local policy", "最多 40 个标签",
             "Regional JSON", 4, True, "watermark", True, True, 40,
             5, 8.5, 9, True, True,
-            False, True, 3, 8,
+            False, True,
             "http://127.0.0.1:7861", "wd-test", 0.42, str(self.lexicon),
         )
 
@@ -458,12 +506,11 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored["structured_mode"], "Regional JSON")
         self.assertTrue(restored["auto_score"])
         self.assertTrue(restored["batch_skip_failed"])
-        self.assertEqual(restored["batch_retries"], 3)
         self.assertEqual(restored["wd_model"], "wd-test")
         self.assertEqual(restored["wildcard_path"], str(self.lexicon))
 
         reset_values = ui._reset_workflow_settings()
-        self.assertEqual(len(reset_values), 27)
+        self.assertEqual(len(reset_values), 25)
         self.assertEqual(reset_values[0], ui.WORKFLOW_DEFAULTS["preset"])
         self.assertIn("已恢复默认", reset_values[-1])
         self.assertIsNone(ui.DB.get_setting("workflow_settings_v1"))
@@ -486,6 +533,35 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["score_model"], "judge-model")
         self.assertEqual(record["score_reason"], "Model-compatible ordering")
         self.assertIn("LLM 评分 8.7/10", status)
+
+    async def test_generation_rejects_prompt_emptied_by_postprocessing(self):
+        ui.call_llm = lambda *_args, **_kwargs: "watermark, signature"
+
+        generated, _system, status = ui._generate(
+            "test", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.35, 90, 1024, True, 0, 0,
+            True, "", False, False, 0, "Plain Prompt", 1,
+            0, True, False,
+        )
+
+        self.assertEqual(generated, "")
+        self.assertIn("未返回可用", status)
+        self.assertEqual(ui.DB.list_prompts(), [])
+
+    async def test_repeated_generated_cache_dedupes_identical_content(self):
+        args = (
+            "same request", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.35, 90, 1024, True, 0, 0,
+            True, "", False, False, 0, "Plain Prompt", 1,
+            0, True, False,
+        )
+
+        ui._generate(*args)
+        ui._generate(*args)
+
+        self.assertEqual(len(ui.DB.list_prompts()), 1)
 
     async def test_failed_llm_score_is_cached_as_unrated_zero(self):
         def fail_score(*_args, **_kwargs):
@@ -596,6 +672,14 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["database_path"], str(path))
         self.assertEqual(saved["natural_base_model"], "Krea 2")
 
+    async def test_invalid_png_payload_refresh_preserves_error_evidence(self):
+        table, selection, current, status = ui._png_batch_refresh("not-json", 1)
+
+        self.assertEqual(table, [])
+        self.assertEqual(selection, 1)
+        self.assertEqual(current, "")
+        self.assertIn("无效", status)
+
     async def test_batch_and_direct_import_previews_report_queue_shape(self):
         queue, status = ui._preview_batch_sources(
             "first request\nfirst request\n# note\nsecond request", True, "NoobAI Tags", "NoobAI",
@@ -621,7 +705,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             return "", "", f"模拟错误 {attempts[source]}"
 
         ui._generate = fake_generate
-        results = list(ui._batch_generate(*self._batch_args("once\nonce\ncached\nbad", retries=3, auto_score=True)))
+        results = list(ui._batch_generate(*self._batch_args("once\nonce\ncached\nbad")))
         status, _table, _choices, issue_table, issue_choices, issue_state = results[-1]
 
         self.assertEqual(attempts, {"once": 1, "bad": 1})
@@ -665,23 +749,59 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "Plain Prompt", 1, True,
         )
         self.assertEqual(result[0], "generated")
-        self.assertEqual(
-            captured["args"][-5:],
-            (0, True, False, "auto_loop", "auto_loop:NoobAI Tags:NoobAI:request"),
+        self.assertEqual(captured["args"][-6:-3], (0, True, False))
+        self.assertEqual(captured["args"][-3], "auto_loop")
+        self.assertTrue(captured["args"][-2].startswith("auto_loop:"))
+        self.assertTrue(captured["args"][-1])
+
+    async def test_auto_loop_cache_is_unrated_and_model_configuration_is_part_of_identity(self):
+        common = (
+            "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1",
+        )
+        tail = ("", 0.3, 90, 1024, True, 0, 0, True, "", False, False, 0, "Plain Prompt", 1, True)
+
+        first = ui._generate_auto_loop(*common, "model-a", *tail)
+        second = ui._generate_auto_loop(*common, "model-b", *tail)
+        records = ui.DB.list_prompts()
+
+        self.assertEqual(first[0], "1girl, red_hair")
+        self.assertEqual(second[0], "1girl, red_hair")
+        self.assertEqual(len(records), 2)
+        self.assertEqual({record["score_source"] for record in records}, {"unrated"})
+        self.assertEqual({record["source_kind"] for record in records}, {"auto_loop"})
+        self.assertEqual(len({record["source_ref"] for record in records}), 2)
+
+    async def test_auto_loop_cache_keeps_each_unique_result_from_the_same_configuration(self):
+        outputs = iter(["1girl, red_hair", "1girl, blue_hair"])
+        ui.call_llm = lambda *_args, **_kwargs: next(outputs)
+        args = (
+            "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "",
+            0.3, 90, 1024, True, 0, 0, True, "", False, False, 0,
+            "Plain Prompt", 1, True,
         )
 
-    async def test_batch_cache_uses_local_score_without_llm_evaluation_request(self):
+        ui._generate_auto_loop(*args)
+        ui._generate_auto_loop(*args)
+        records = ui.DB.list_prompts()
+
+        self.assertEqual({record["prompt"] for record in records}, {"1girl, red_hair", "1girl, blue_hair"})
+        self.assertEqual(len({record["source_ref"] for record in records}), 2)
+        self.assertEqual({record["score_source"] for record in records}, {"unrated"})
+
+    async def test_batch_cache_is_unrated_without_llm_evaluation_request(self):
         ui._generate = lambda source, *_args: (f"generated {source}", "", "生成完成")
         ui.evaluate_prompt_quality = lambda *_args, **_kwargs: self.fail("batch scoring must not call the LLM")
 
-        results = list(ui._batch_generate(*self._batch_args("alpha", False, True, 0, True)))
+        results = list(ui._batch_generate(*self._batch_args("alpha", False, True)))
         status = results[-1][0]
         record = ui.DB.list_prompts()[0]
 
         self.assertIn("LLM 请求 1", status)
-        self.assertEqual(record["score"], 7)
-        self.assertEqual(record["score_source"], "manual")
-        self.assertIn("未调用 LLM 评分", record["score_reason"])
+        self.assertEqual(record["score"], 0)
+        self.assertEqual(record["score_source"], "unrated")
+        self.assertIn("批量生成未评分", record["score_reason"])
 
     async def test_batch_can_stop_after_single_failure_and_collect_unprocessed(self):
         calls = []
@@ -691,7 +811,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             return "", "", "永久错误"
 
         ui._generate = fake_generate
-        results = list(ui._batch_generate(*self._batch_args("bad\nlater", False, False, 1)))
+        results = list(ui._batch_generate(*self._batch_args("bad\nlater", False, False)))
         status, _table, _choices, _issue_table, _issue_choices, issue_state = results[-1]
 
         self.assertEqual(calls, ["bad"])
@@ -713,7 +833,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             {"index": 5, "source": "beta", "status": "生成错误", "reason": "超时", "attempts": 3},
         ]
         retry_args = (
-            ["alpha"], issues, 1, True, 7, False,
+            ["alpha"], issues, True,
             "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
             0.35, 90, 1024, True, 0, 0,
@@ -739,7 +859,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             return f"generated {source}", "", "生成完成"
 
         ui._generate = fake_generate
-        results = list(ui._batch_generate(*self._batch_args("first\nsecond\nthird", False, True, 0)))
+        results = list(ui._batch_generate(*self._batch_args("first\nsecond\nthird", False, True)))
         status, _table, _choices, _issue_table, _issue_choices, issue_state = results[-1]
 
         self.assertEqual(calls, ["first"])
@@ -757,7 +877,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             {"index": 5, "source": "beta", "status": "生成错误", "reason": "超时", "attempts": 3},
         ]
         retry_args = (
-            ["alpha"], issues, 1, True, 7, False,
+            ["alpha"], issues, True,
             "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
             0.35, 90, 1024, True, 0, 0,

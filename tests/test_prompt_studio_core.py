@@ -120,6 +120,82 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertEqual(db.delete_handoffs({"completed"}), 1)
             self.assertEqual(db.list_handoffs(), [])
 
+    def test_completed_handoff_is_not_reopened_by_identical_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            payload = {"ranbooru_id": "7", "tags_prompt": "1girl, red_hair"}
+            handoff_id = db.save_handoff(payload, "ranbooru", "ranbooru:test:7", "process_and_cache")
+            db.update_handoff(handoff_id, "completed", attempts=1, result_prompt="finished")
+
+            repeated_id = db.save_handoff(payload, "ranbooru", "ranbooru:test:7", "process_and_cache")
+            record = db.get_handoff(repeated_id)
+
+            self.assertEqual(repeated_id, handoff_id)
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["attempts"], 1)
+            self.assertEqual(record["result_prompt"], "finished")
+
+    def test_handoff_claim_is_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            handoff_id = db.save_handoff(
+                {"ranbooru_id": "8", "tags_prompt": "1girl, blue_hair"},
+                "ranbooru", "ranbooru:test:8", "process_and_cache",
+            )
+
+            first = db.claim_handoff(handoff_id)
+            second = db.claim_handoff(handoff_id)
+
+            self.assertIsNotNone(first)
+            self.assertEqual(first["status"], "processing")
+            self.assertEqual(first["attempts"], 1)
+            self.assertIsNone(second)
+
+    def test_stale_handoff_claim_cannot_overwrite_new_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            handoff_id = db.save_handoff(
+                {"ranbooru_id": "9", "tags_prompt": "old tags"},
+                "ranbooru", "ranbooru:test:9", "process_and_cache",
+            )
+            stale = db.claim_handoff(handoff_id)
+            self.assertIsNotNone(stale)
+
+            db.save_handoff(
+                {"ranbooru_id": "9", "tags_prompt": "new tags"},
+                "ranbooru", "ranbooru:test:9", "process_and_cache",
+            )
+            current = db.claim_handoff(handoff_id)
+            self.assertIsNotNone(current)
+            self.assertGreater(current["revision"], stale["revision"])
+
+            self.assertFalse(db.update_handoff(
+                handoff_id,
+                "completed",
+                result_prompt="stale result",
+                expected_claim_token=stale["claim_token"],
+                expected_revision=stale["revision"],
+            ))
+            self.assertTrue(db.update_handoff(
+                handoff_id,
+                "completed",
+                result_prompt="current result",
+                expected_claim_token=current["claim_token"],
+                expected_revision=current["revision"],
+            ))
+            record = db.get_handoff(handoff_id)
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["result_prompt"], "current result")
+
+    def test_single_prompt_save_can_request_content_deduplication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            first = db.save_prompt("same prompt", tags="same source", dedupe=True)
+            second = db.save_prompt("same prompt", tags="same source", dedupe=True)
+
+            self.assertEqual(first, second)
+            self.assertEqual(len(db.list_prompts()), 1)
+
     def test_external_prompt_save_updates_same_source_without_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
@@ -135,7 +211,7 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertEqual(len(db.list_prompts()), 1)
             self.assertEqual(db.get_prompt(first)["prompt"], "second")
 
-    def test_llm_batch_score_upgrades_an_existing_manual_duplicate(self):
+    def test_trusted_batch_metadata_upgrades_an_existing_manual_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
             record_id = db.save_prompt(

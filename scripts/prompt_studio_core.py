@@ -11,6 +11,7 @@ import math
 import os
 import random
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -372,11 +373,18 @@ class StudioDB:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
                     result_prompt TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    claim_token TEXT NOT NULL DEFAULT '',
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     UNIQUE(source_kind, source_ref)
                 );
             """)
+            handoff_columns = {row["name"] for row in conn.execute("PRAGMA table_info(handoffs)").fetchall()}
+            if "revision" not in handoff_columns:
+                conn.execute("ALTER TABLE handoffs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+            if "claim_token" not in handoff_columns:
+                conn.execute("ALTER TABLE handoffs ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(prompts)").fetchall()}
             if "content_hash" not in columns:
                 conn.execute("ALTER TABLE prompts ADD COLUMN content_hash TEXT DEFAULT ''")
@@ -412,6 +420,7 @@ class StudioDB:
         self, prompt: str, negative: str = "", output_mode: str = "", base_model: str = "", score: float = 0,
         tags: str = "", record_id: int | None = None, score_source: str = "manual", score_reason: str = "",
         score_model: str = "", source_kind: str | None = None, source_ref: str | None = None,
+        dedupe: bool = False,
     ) -> int:
         now = int(time.time())
         record = {"prompt": prompt, "negative_prompt": negative, "output_mode": output_mode, "base_model": base_model, "tags": tags}
@@ -423,6 +432,19 @@ class StudioDB:
                     (str(source_kind), str(source_ref)),
                 ).fetchone()
                 record_id = int(existing["id"]) if existing else None
+            if not record_id and dedupe and not (source_kind and source_ref):
+                existing = conn.execute(
+                    "SELECT id FROM prompts WHERE content_hash=? LIMIT 1",
+                    (content_hash,),
+                ).fetchone()
+                if existing:
+                    existing_id = int(existing["id"])
+                    if score_source == "llm":
+                        conn.execute(
+                            "UPDATE prompts SET score=?, score_source='llm', score_reason=?, score_model=?, updated_at=? WHERE id=?",
+                            (score, score_reason, score_model, now, existing_id),
+                        )
+                    return existing_id
             if record_id:
                 if source_kind is None and source_ref is None:
                     conn.execute(
@@ -653,28 +675,31 @@ class StudioDB:
         now = int(time.time())
         payload_json = json.dumps(dict(payload or {}), ensure_ascii=False, separators=(",", ":"))
         with self.lock, self._connection() as conn:
-            conn.execute(
+            existing = conn.execute(
+                "SELECT id, payload_json, action FROM handoffs WHERE source_kind=? AND source_ref=?",
+                (source_kind, source_ref),
+            ).fetchone()
+            if existing:
+                handoff_id = int(existing["id"])
+                if str(existing["payload_json"] or "") != payload_json or str(existing["action"] or "") != action:
+                    conn.execute(
+                        "UPDATE handoffs SET payload_json=?, action=?, status='pending', attempts=0, error='', "
+                        "result_prompt='', revision=revision+1, claim_token='', updated_at=? WHERE id=?",
+                        (payload_json, action, now, handoff_id),
+                    )
+                else:
+                    conn.execute("UPDATE handoffs SET updated_at=? WHERE id=?", (now, handoff_id))
+                return handoff_id
+            cursor = conn.execute(
                 """
                 INSERT INTO handoffs(
                     source_kind, source_ref, payload_json, action, status, attempts,
                     error, result_prompt, created_at, updated_at
                 ) VALUES(?,?,?,?,'pending',0,'','',?,?)
-                ON CONFLICT(source_kind, source_ref) DO UPDATE SET
-                    payload_json=excluded.payload_json,
-                    action=excluded.action,
-                    status='pending',
-                    attempts=0,
-                    error='',
-                    result_prompt='',
-                    updated_at=excluded.updated_at
                 """,
                 (source_kind, source_ref, payload_json, action, now, now),
             )
-            row = conn.execute(
-                "SELECT id FROM handoffs WHERE source_kind=? AND source_ref=?",
-                (source_kind, source_ref),
-            ).fetchone()
-        return int(row["id"])
+        return int(cursor.lastrowid)
 
     def get_handoff(self, handoff_id: int) -> dict[str, Any] | None:
         with self.lock, self._connection() as conn:
@@ -719,18 +744,59 @@ class StudioDB:
         attempts: int | None = None,
         error: str = "",
         result_prompt: str = "",
+        expected_claim_token: str | None = None,
+        expected_revision: int | None = None,
+        allowed_statuses: Iterable[str] | None = None,
     ) -> bool:
         if status not in {"pending", "processing", "completed", "error", "skipped"}:
             raise ValueError(f"Unsupported handoff status: {status}")
         fields = ["status=?", "error=?", "result_prompt=?", "updated_at=?"]
         params: list[Any] = [status, str(error or "")[:2000], str(result_prompt or ""), int(time.time())]
+        if status != "processing":
+            fields.append("claim_token=''")
         if attempts is not None:
             fields.append("attempts=?")
             params.append(max(0, int(attempts)))
-        params.append(int(handoff_id))
+        where = ["id=?"]
+        where_params: list[Any] = [int(handoff_id)]
+        if expected_claim_token is not None:
+            where.extend(["status='processing'", "claim_token=?"])
+            where_params.append(str(expected_claim_token))
+        if expected_revision is not None:
+            where.append("revision=?")
+            where_params.append(int(expected_revision))
+        selected_statuses = sorted({
+            str(value) for value in (allowed_statuses or [])
+            if str(value) in {"pending", "processing", "completed", "error", "skipped"}
+        })
+        if selected_statuses:
+            where.append(f"status IN ({','.join('?' for _ in selected_statuses)})")
+            where_params.extend(selected_statuses)
+        params.extend(where_params)
         with self.lock, self._connection() as conn:
-            cursor = conn.execute(f"UPDATE handoffs SET {','.join(fields)} WHERE id=?", params)
+            cursor = conn.execute(
+                f"UPDATE handoffs SET {','.join(fields)} WHERE {' AND '.join(where)}",
+                params,
+            )
         return cursor.rowcount > 0
+
+    def claim_handoff(self, handoff_id: int) -> dict[str, Any] | None:
+        """Atomically claim one pending or explicitly retried handoff."""
+        now = int(time.time())
+        claim_token = secrets.token_hex(16)
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE handoffs
+                SET status='processing', attempts=attempts+1, error='', result_prompt='', claim_token=?, updated_at=?
+                WHERE id=? AND status IN ('pending','error','skipped')
+                """,
+                (claim_token, now, int(handoff_id)),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute("SELECT * FROM handoffs WHERE id=?", (int(handoff_id),)).fetchone()
+        return self._decode_handoff(row)
 
     def delete_handoffs(self, statuses: Iterable[str]) -> int:
         allowed = {"completed", "error", "skipped"}
