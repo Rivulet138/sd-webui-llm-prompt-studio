@@ -640,7 +640,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sources[-1], "prompt 10000")
         self.assertEqual(stats["duplicates"], 0)
 
-    async def test_auto_loop_dispatch_forces_no_cache_and_no_llm_scoring(self):
+    async def test_auto_loop_dispatch_can_cache_without_llm_scoring(self):
         captured = {}
 
         def fake_generate(*args):
@@ -657,6 +657,18 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result[0], "generated")
         self.assertEqual(captured["args"][-3:], (0, False, False))
+
+        result = ui._generate_auto_loop(
+            "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "",
+            0.3, 90, 1024, True, 0, 0, True, "", False, False, 0,
+            "Plain Prompt", 1, True,
+        )
+        self.assertEqual(result[0], "generated")
+        self.assertEqual(
+            captured["args"][-5:],
+            (0, True, False, "auto_loop", "auto_loop:NoobAI Tags:NoobAI:request"),
+        )
 
     async def test_batch_cache_uses_local_score_without_llm_evaluation_request(self):
         ui._generate = lambda source, *_args: (f"generated {source}", "", "生成完成")

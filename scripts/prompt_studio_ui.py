@@ -122,7 +122,7 @@ _PNG_BATCH_ACTIVE_TASK_ID = ""
 
 def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
     labels = {"llm": "LLM", "manual": "手动", "unrated": "未评分"}
-    source_labels = {"ranbooru": "Ranbooru"}
+    source_labels = {"ranbooru": "Ranbooru", "auto_loop": "自动生图循环"}
     return [[
         row.get("visible_position", ""), row["id"], row["score"], labels.get(row.get("score_source"), "手动"),
         row.get("score_model", ""), row["output_mode"], row["base_model"], row["prompt"],
@@ -1072,8 +1072,16 @@ def _generate_auto_loop(
     request, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-    structured_mode, region_count,
+    structured_mode, region_count, cache_result=False,
 ):
+    if cache_result:
+        source_ref = f"auto_loop:{preset}:{base_model}:{str(request or '').strip()}"
+        return _generate(
+            request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+            provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
+            few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
+            structured_mode, region_count, 0, True, False, "auto_loop", source_ref,
+        )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
@@ -1877,8 +1885,16 @@ def on_ui_tabs():
             with gr.Tab("批处理", elem_id="llm_prompt_studio_batch_tab"):
                 with gr.Tabs():
                     with gr.Tab("LLM 批量生成"):
-                        gr.Markdown("每条去重后的输入只发送一次 LLM 生成请求；失败不会自动重试，批量评分不会调用 LLM。")
-                        batch_sources = gr.Textbox(label="生成队列：每行一条创作要求或源标签", lines=12, placeholder="红发魔法师在月光图书馆阅读\n蓝发少女站在雨中的车站")
+                        gr.Markdown(
+                            "同一批输入可以直接生成并缓存到 SQLite，也可以生成到 Forge 生图队列后逐条追加/覆盖 Prompt。"
+                            "每条去重后的输入只发送一次 LLM 请求。"
+                        )
+                        batch_sources = gr.Textbox(
+                            label="批量创作要求（每行一条）", lines=12,
+                            placeholder="红发魔法师在月光图书馆阅读\n蓝发少女站在雨中的车站",
+                            elem_id="llm_prompt_studio_auto_loop_request",
+                        )
+                        auto_loop_request = batch_sources
                         with gr.Row():
                             batch_skip_existing = gr.Checkbox(label="跳过相同输入的已有缓存", value=workflow["batch_skip_existing"])
                             batch_skip_failed = gr.Checkbox(label="单条失败后跳过并继续", value=workflow["batch_skip_failed"])
@@ -1904,6 +1920,40 @@ def on_ui_tabs():
                             batch_select_all_issues = gr.Button("全选错误与跳过项")
                             batch_clear_issue_selection = gr.Button("清空选择")
                             batch_retry_selected = gr.Button("重新提交所选（每条一次）", variant="primary")
+                        with gr.Accordion("Forge Prompt 队列与自动生图", open=True, elem_id="llm_prompt_studio_auto_loop_tab"):
+                            gr.Markdown(
+                                "生成到浏览器队列后，可以先检查再投入生图，也可以一键生成并立即生图。"
+                                "勾选 SQLite 缓存时只保存结果和来源，不自动评分；需要进入高分 RAG 的记录可稍后在缓存库执行 LLM 评分。"
+                            )
+                            with gr.Row(elem_classes=["lps-form-row"]):
+                                auto_loop_target = gr.Radio(
+                                    label="生图目标", choices=[("txt2img", "txt2img"), ("img2img", "img2img")],
+                                    value="txt2img", elem_id="llm_prompt_studio_auto_loop_target",
+                                )
+                                auto_loop_write_mode = gr.Radio(
+                                    label="Prompt 写入方式", choices=[("追加", "append"), ("覆盖", "replace")],
+                                    value="append", elem_id="llm_prompt_studio_auto_loop_write_mode",
+                                )
+                                auto_loop_cache_result = gr.Checkbox(
+                                    label="同时缓存到 SQLite Prompt 库", value=False,
+                                    elem_id="llm_prompt_studio_auto_loop_cache",
+                                )
+                            with gr.Row():
+                                auto_loop_start = gr.Button("生成到生图队列", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
+                                auto_loop_generate_run = gr.Button("生成并立即生图", variant="primary", elem_id="llm_prompt_studio_auto_loop_generate_run")
+                                auto_loop_run = gr.Button("投入已有队列生图", elem_id="llm_prompt_studio_auto_loop_run")
+                                auto_loop_clear = gr.Button("清空队列", elem_id="llm_prompt_studio_auto_loop_clear")
+                                auto_loop_cancel = gr.Button("取消当前阶段", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
+                            auto_loop_dispatch = gr.Button(
+                                "自动队列单次生成",
+                                elem_id="llm_prompt_studio_auto_loop_dispatch",
+                                elem_classes=["lps-auto-loop-dispatch"],
+                            )
+                            auto_loop_status = gr.HTML(
+                                "等待开始。生成到队列后可检查、追加到 Prompt，或直接投入生图。",
+                                elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
+                            )
+                            gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
                     with gr.Tab("PNG 润色 / 扩写", elem_id="llm_prompt_studio_png_batch_tab"):
                         png_batch_file = gr.File(label="导入 prompt_batch.v1 JSON", file_types=[".json"], type="filepath", elem_id="llm_prompt_studio_png_batch_file")
                         with gr.Accordion("批次 JSON", open=False):
@@ -1936,42 +1986,6 @@ def on_ui_tabs():
                             inputs=png_batch_file,
                             outputs=[png_batch_payload, png_batch_status],
                         )
-
-                    with gr.Tab("自动生图循环", elem_id="llm_prompt_studio_auto_loop_tab"):
-                        gr.Markdown(
-                            "分两步工作：先按每行一个创作要求批量生成并保存逐条 Prompt；确认队列后，再投入 Forge 原生 txt2img / img2img 生图。"
-                            "重复行会自动去重，每条唯一输入只发送一次 LLM 请求。"
-                            "生成阶段不会评分，也不会写入 Prompt 缓存。队列保存在当前浏览器中，页面关闭后仍可恢复。"
-                        )
-                        with gr.Row(elem_classes=["lps-form-row"]):
-                            auto_loop_target = gr.Radio(
-                                label="生图目标", choices=[("txt2img", "txt2img"), ("img2img", "img2img")],
-                                value="txt2img", elem_id="llm_prompt_studio_auto_loop_target",
-                            )
-                            auto_loop_write_mode = gr.Radio(
-                                label="Prompt 写入方式", choices=[("覆盖", "replace"), ("追加", "append")],
-                                value="replace", elem_id="llm_prompt_studio_auto_loop_write_mode",
-                            )
-                        auto_loop_request = gr.Textbox(
-                            label="批量创作要求（每行一条）", lines=8,
-                            placeholder="赛博朋克城市夜景\n月光图书馆中的红发魔法师",
-                            elem_id="llm_prompt_studio_auto_loop_request",
-                        )
-                        with gr.Row():
-                            auto_loop_start = gr.Button("批量生成 Prompt", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
-                            auto_loop_run = gr.Button("投入队列生图", variant="primary", elem_id="llm_prompt_studio_auto_loop_run")
-                            auto_loop_clear = gr.Button("清空队列", elem_id="llm_prompt_studio_auto_loop_clear")
-                            auto_loop_cancel = gr.Button("取消当前阶段", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
-                        auto_loop_dispatch = gr.Button(
-                            "自动队列单次生成",
-                            elem_id="llm_prompt_studio_auto_loop_dispatch",
-                            elem_classes=["lps-auto-loop-dispatch"],
-                        )
-                        auto_loop_status = gr.HTML(
-                            "等待开始。先批量生成 Prompt，确认队列后再投入生图。",
-                            elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
-                        )
-                        gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
 
                     with gr.Tab("直接批量导入"):
                         bulk_import = gr.Textbox(label="每行一条 Prompt，可使用“评分<TAB>Prompt”格式", lines=12)
@@ -2157,7 +2171,7 @@ def on_ui_tabs():
         generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result, auto_score], outputs=[output, system_preview, status])
         auto_loop_dispatch.click(
             _generate_auto_loop,
-            inputs=[request, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count],
+            inputs=[request, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, auto_loop_cache_result],
             outputs=[output, system_preview, status],
         )
         save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
@@ -2206,6 +2220,12 @@ def on_ui_tabs():
             inputs=[auto_loop_target, auto_loop_write_mode],
             outputs=auto_loop_status,
             js="(target, writeMode) => window.llmPromptStudioAutoLoop.runStored({target, writeMode})",
+        )
+        auto_loop_generate_run.click(
+            fn=None,
+            inputs=[auto_loop_request, auto_loop_target, auto_loop_write_mode],
+            outputs=auto_loop_status,
+            js="(request, target, writeMode) => window.llmPromptStudioAutoLoop.generateAndRun({request, target, writeMode})",
         )
         auto_loop_cancel.click(
             fn=None,

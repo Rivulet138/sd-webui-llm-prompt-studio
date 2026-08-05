@@ -374,6 +374,13 @@
         }
     }
 
+    async function generateAndRun(config) {
+        if (state.running) return "已有队列任务正在运行";
+        const generated = await generateBatch(config);
+        if (!String(generated).startsWith("Prompt 批量生成完成")) return generated;
+        return runStored(config);
+    }
+
     function clearQueue() {
         if (state.running) return "运行中不能清空队列";
         const previous = state.queue;
@@ -409,6 +416,7 @@
     }, 1000);
     window.llmPromptStudioAutoLoop = {
         generateBatch,
+        generateAndRun,
         runStored,
         clearQueue,
         cancel,

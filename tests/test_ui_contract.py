@@ -37,6 +37,8 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_auto_loop_target",
             "llm_prompt_studio_auto_loop_request",
             "llm_prompt_studio_auto_loop_start",
+            "llm_prompt_studio_auto_loop_cache",
+            "llm_prompt_studio_auto_loop_generate_run",
             "llm_prompt_studio_auto_loop_dispatch",
             "llm_prompt_studio_auto_loop_run",
             "llm_prompt_studio_auto_loop_clear",
@@ -66,6 +68,7 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "seen.has(key)",
             "queuedPrompts.has(promptKey)",
             "duplicateOutputCount",
+            "async function generateAndRun",
             "const promptRequest = requests[index - 1]",
             "setValue(\"llm_prompt_studio_output\", \"\")",
             "state.queue.pop()",
@@ -76,6 +79,8 @@ class PromptStudioUiContractTests(unittest.TestCase):
         self.assertNotIn("这是第 ${index} 条", script)
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
         self.assertIn("structured_mode, region_count, 0, False, False", source)
+        self.assertIn("auto_loop_cache_result", source)
+        self.assertIn('"auto_loop", source_ref', source)
 
     def test_auto_loop_queue_migration_and_generated_output_deduplication(self):
         node = shutil.which("node")
