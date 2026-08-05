@@ -1826,8 +1826,8 @@ def on_ui_tabs():
                             few_shot_count = gr.Slider(label="Few-Shot 示例数", minimum=0, maximum=8, value=workflow["few_shot_count"], step=1)
                             rag_min_score = gr.Slider(label="RAG 最低缓存评分", minimum=0, maximum=10, value=workflow["rag_min_score"], step=0.5)
                             save_score = gr.Slider(label="手动评分（关闭自动评分时使用）", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
-                            cache_result = gr.Checkbox(label="在本地缓存本次结果", value=workflow["cache_result"])
-                            auto_score = gr.Checkbox(label="使用 LLM 自动评价并评分", value=workflow["auto_score"])
+                            cache_result = gr.Checkbox(label="在本地缓存本次结果", value=workflow["cache_result"], elem_id="llm_prompt_studio_cache_result")
+                            auto_score = gr.Checkbox(label="使用 LLM 自动评价并评分", value=workflow["auto_score"], elem_id="llm_prompt_studio_auto_score")
                 with gr.Row():
                     generate = gr.Button("生成提示词", variant="primary", elem_id="llm_prompt_studio_generate_button")
                     save_workflow = gr.Button("保存全部工作参数")
@@ -1901,8 +1901,8 @@ def on_ui_tabs():
 
                     with gr.Tab("自动生图循环", elem_id="llm_prompt_studio_auto_loop_tab"):
                         gr.Markdown(
-                            "按顺序执行：LLM 生成 Prompt → 写入 Forge 原生 Prompt → 等待生图完成 → 进入下一轮。"
-                            "循环由当前浏览器页面驱动，页面关闭后会停止。"
+                            "分两步工作：先批量生成并保存逐条 Prompt；确认队列后，再投入 Forge 原生 txt2img / img2img 生图。"
+                            "生成阶段不会评分，也不会写入 Prompt 缓存。队列保存在当前浏览器中，页面关闭后仍可恢复。"
                         )
                         with gr.Row(elem_classes=["lps-form-row"]):
                             auto_loop_target = gr.Radio(
@@ -1914,7 +1914,7 @@ def on_ui_tabs():
                                 elem_id="llm_prompt_studio_auto_loop_count",
                             )
                             auto_loop_continuous = gr.Checkbox(
-                                label="持续运行直到取消", value=False,
+                                label="持续生成直到取消", value=False,
                                 elem_id="llm_prompt_studio_auto_loop_continuous",
                             )
                             auto_loop_write_mode = gr.Radio(
@@ -1927,10 +1927,12 @@ def on_ui_tabs():
                             elem_id="llm_prompt_studio_auto_loop_request",
                         )
                         with gr.Row():
-                            auto_loop_start = gr.Button("开始自动循环", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
-                            auto_loop_cancel = gr.Button("取消自动循环", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
+                            auto_loop_start = gr.Button("批量生成 Prompt", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
+                            auto_loop_run = gr.Button("投入队列生图", variant="primary", elem_id="llm_prompt_studio_auto_loop_run")
+                            auto_loop_clear = gr.Button("清空队列", elem_id="llm_prompt_studio_auto_loop_clear")
+                            auto_loop_cancel = gr.Button("取消当前阶段", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
                         auto_loop_status = gr.HTML(
-                            "等待开始。请先确认 Forge 原生 txt2img / img2img 参数。",
+                            "等待开始。先批量生成 Prompt，确认队列后再投入生图。",
                             elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
                         )
                         gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
@@ -2154,15 +2156,28 @@ def on_ui_tabs():
         )
         auto_loop_start.click(
             fn=None,
-            inputs=[auto_loop_target, auto_loop_count, auto_loop_continuous, auto_loop_request, auto_loop_write_mode],
+            inputs=[auto_loop_count, auto_loop_continuous, auto_loop_request],
             outputs=auto_loop_status,
-            js="(target, count, continuous, request, writeMode) => window.llmPromptStudioAutoLoop.start({target, count, continuous, request, writeMode})",
+            js="(count, continuous, request) => window.llmPromptStudioAutoLoop.generateBatch({count, continuous, request})",
+        )
+        auto_loop_run.click(
+            fn=None,
+            inputs=[auto_loop_target, auto_loop_write_mode],
+            outputs=auto_loop_status,
+            js="(target, writeMode) => window.llmPromptStudioAutoLoop.runStored({target, writeMode})",
         )
         auto_loop_cancel.click(
             fn=None,
             inputs=[],
             outputs=auto_loop_status,
             js="() => window.llmPromptStudioAutoLoop.cancel()",
+            queue=False,
+        )
+        auto_loop_clear.click(
+            fn=None,
+            inputs=[],
+            outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.clearQueue()",
             queue=False,
         )
         index.click(_index_wildcards, inputs=wildcard_path, outputs=[wildcard_status, wildcard_results])

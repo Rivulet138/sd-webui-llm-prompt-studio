@@ -7,6 +7,7 @@
 .lps-auto-loop-log { display: grid; gap: .4rem; margin-top: .75rem; max-height: 24rem; overflow: auto; }
 .lps-auto-loop-row { display: grid; grid-template-columns: 3rem 7rem minmax(0, 1fr); gap: .5rem; align-items: center; padding: .45rem .6rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; }
 .lps-auto-loop-row code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.lps-auto-loop-empty { padding: .6rem; color: var(--body-text-color-subdued, #999); }
 .lps-primary { font-weight: 600; }
 .lps-danger { border-color: var(--error-500, #ef4444); }
 #llm_prompt_studio_cache_table, #llm_prompt_studio_handoff_table { overflow-x: auto; }
