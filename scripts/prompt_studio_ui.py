@@ -1829,10 +1829,10 @@ def on_ui_tabs():
                             cache_result = gr.Checkbox(label="在本地缓存本次结果", value=workflow["cache_result"])
                             auto_score = gr.Checkbox(label="使用 LLM 自动评价并评分", value=workflow["auto_score"])
                 with gr.Row():
-                    generate = gr.Button("生成提示词", variant="primary")
+                    generate = gr.Button("生成提示词", variant="primary", elem_id="llm_prompt_studio_generate_button")
                     save_workflow = gr.Button("保存全部工作参数")
                     reset_workflow = gr.Button("恢复默认工作参数")
-                output = gr.Textbox(label="生成的提示词", lines=8)
+                output = gr.Textbox(label="生成的提示词", lines=8, elem_id="llm_prompt_studio_output")
                 system_preview = gr.Textbox(label="最终 System Prompt", lines=12)
                 status = gr.Markdown(elem_id="llm_prompt_studio_status", elem_classes=["lps-status"])
                 workflow_status = gr.Markdown("已自动载入上次保存的工作参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认工作参数；保存后下次会自动填入。")
@@ -1898,6 +1898,42 @@ def on_ui_tabs():
                             inputs=png_batch_file,
                             outputs=[png_batch_payload, png_batch_status],
                         )
+
+                    with gr.Tab("自动生图循环", elem_id="llm_prompt_studio_auto_loop_tab"):
+                        gr.Markdown(
+                            "按顺序执行：LLM 生成 Prompt → 写入 Forge 原生 Prompt → 等待生图完成 → 进入下一轮。"
+                            "循环由当前浏览器页面驱动，页面关闭后会停止。"
+                        )
+                        with gr.Row(elem_classes=["lps-form-row"]):
+                            auto_loop_target = gr.Radio(
+                                label="生图目标", choices=[("txt2img", "txt2img"), ("img2img", "img2img")],
+                                value="txt2img", elem_id="llm_prompt_studio_auto_loop_target",
+                            )
+                            auto_loop_count = gr.Number(
+                                label="循环次数", value=1, minimum=1, precision=0,
+                                elem_id="llm_prompt_studio_auto_loop_count",
+                            )
+                            auto_loop_continuous = gr.Checkbox(
+                                label="持续运行直到取消", value=False,
+                                elem_id="llm_prompt_studio_auto_loop_continuous",
+                            )
+                            auto_loop_write_mode = gr.Radio(
+                                label="Prompt 写入方式", choices=[("覆盖", "replace"), ("追加", "append")],
+                                value="replace", elem_id="llm_prompt_studio_auto_loop_write_mode",
+                            )
+                        auto_loop_request = gr.Textbox(
+                            label="每轮创作要求", lines=4,
+                            placeholder="例如：生成一张不同构图的赛博朋克城市夜景，保持主体和画风一致。",
+                            elem_id="llm_prompt_studio_auto_loop_request",
+                        )
+                        with gr.Row():
+                            auto_loop_start = gr.Button("开始自动循环", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
+                            auto_loop_cancel = gr.Button("取消自动循环", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
+                        auto_loop_status = gr.HTML(
+                            "等待开始。请先确认 Forge 原生 txt2img / img2img 参数。",
+                            elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
+                        )
+                        gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
 
                     with gr.Tab("直接批量导入"):
                         bulk_import = gr.Textbox(label="每行一条 Prompt，可使用“评分<TAB>Prompt”格式", lines=12)
@@ -2114,6 +2150,19 @@ def on_ui_tabs():
             _png_batch_advance_after_append,
             inputs=[png_batch_payload, png_batch_selection, png_batch_append_succeeded],
             outputs=[png_batch_payload, png_batch_selection, png_batch_current, png_batch_status],
+            queue=False,
+        )
+        auto_loop_start.click(
+            fn=None,
+            inputs=[auto_loop_target, auto_loop_count, auto_loop_continuous, auto_loop_request, auto_loop_write_mode],
+            outputs=auto_loop_status,
+            js="(target, count, continuous, request, writeMode) => window.llmPromptStudioAutoLoop.start({target, count, continuous, request, writeMode})",
+        )
+        auto_loop_cancel.click(
+            fn=None,
+            inputs=[],
+            outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.cancel()",
             queue=False,
         )
         index.click(_index_wildcards, inputs=wildcard_path, outputs=[wildcard_status, wildcard_results])

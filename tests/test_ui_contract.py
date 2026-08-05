@@ -26,8 +26,34 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_cache_status",
             "llm_prompt_studio_handoff_status",
             "llm_prompt_studio_cache_table",
+            "llm_prompt_studio_generate_button",
+            "llm_prompt_studio_output",
+            "llm_prompt_studio_auto_loop_tab",
+            "llm_prompt_studio_auto_loop_target",
+            "llm_prompt_studio_auto_loop_count",
+            "llm_prompt_studio_auto_loop_continuous",
+            "llm_prompt_studio_auto_loop_request",
+            "llm_prompt_studio_auto_loop_start",
+            "llm_prompt_studio_auto_loop_cancel",
+            "llm_prompt_studio_auto_loop_status",
+            "llm_prompt_studio_auto_loop_log",
         ):
             self.assertIn(f'elem_id="{elem_id}"', source)
+
+    def test_auto_loop_javascript_contract(self):
+        script = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
+        for marker in (
+            "window.llmPromptStudioAutoLoop",
+            "async function start",
+            "waitForStudioGeneration",
+            "waitForForgeGeneration",
+            "state.cancelled",
+            "state.phase === \"forge\"",
+            "rows.length > 100",
+            "querySelector(`#${tab}_generate`)",
+            "target === \"img2img\"",
+        ):
+            self.assertIn(marker, script)
 
     def test_extension_styles_cover_workflows_tables_and_mobile(self):
         css = (ROOT / "style.css").read_text(encoding="utf-8")
