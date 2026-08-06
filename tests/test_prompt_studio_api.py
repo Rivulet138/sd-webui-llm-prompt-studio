@@ -484,6 +484,10 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "生成失败")
         self.assertEqual(prompt_update.get("__type__"), "update")
         self.assertNotIn("value", prompt_update)
+        shared_workflow = ui._workflow_settings()
+        self.assertEqual(shared_workflow["preset"], "NoobAI Tags")
+        self.assertEqual(shared_workflow["base_model"], "NoobAI")
+        self.assertEqual(shared_workflow["safety"], "SFW")
 
     async def test_app_start_indexes_saved_custom_wildcard_path(self):
         (self.lexicon / "custom.txt").write_text("custom_saved_tag\n", encoding="utf-8")

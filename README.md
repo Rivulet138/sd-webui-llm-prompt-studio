@@ -141,12 +141,15 @@ assets/wildcards/
 内嵌面板只保留无限生成联动需要的控件：
 
 - 本轮创作要求
+- System Prompt 预设
+- 目标底模
+- 内容模式：`SFW` / `NSFW`
 - Prompt 来源：`LLM 自动生成` / `缓存顺序读取`
 - 写入方式：`追加到后面` / `覆盖当前 Prompt`
 - 轮数（`0` 表示持续）
 - `取一条并写入`、`开始连续生成`、`停止`
 
-详细 Provider、System Prompt、底模和后处理参数统一在独立 `LLM Prompt Studio` 页面保存。
+三个生成选项与独立 `LLM Prompt Studio` 页使用同一组选项，并自动载入已保存的工作参数；在生成页、批处理页或任一内嵌面板修改时，其他面板会同步更新。详细 Provider、自定义 System Prompt 和后处理参数仍统一在独立页面保存。
 
 ### Ranbooru 式追加
 

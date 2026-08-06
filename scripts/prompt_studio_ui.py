@@ -108,6 +108,7 @@ WORKFLOW_DEFAULTS = {
 }
 _PROMPT_TARGETS: dict[str, Any] = {}
 _INLINE_SLOTS: set[str] = set()
+_INLINE_WORKFLOW_COMPONENTS: dict[str, dict[str, Any]] = {}
 _INLINE_LOCK = threading.RLock()
 _BATCH_CANCEL = threading.Event()
 _BATCH_LOCK = threading.Lock()
@@ -290,6 +291,24 @@ def _save_workflow_values(updates: dict[str, Any]) -> str:
 
 def _sync_value(value):
     return value
+
+
+def _sync_value_pair(value):
+    return value, value
+
+
+def _sync_value_triplet(value):
+    return value, value, value
+
+
+def _bind_workflow_sync(source, outputs, event="input"):
+    if not outputs:
+        return
+    callbacks = {1: _sync_value, 2: _sync_value_pair, 3: _sync_value_triplet}
+    callback = callbacks.get(len(outputs))
+    if callback is None:
+        raise ValueError(f"Unsupported workflow synchronization target count: {len(outputs)}")
+    getattr(source, event)(callback, inputs=source, outputs=outputs, queue=False)
 
 
 def _save_workflow_settings(
@@ -1425,6 +1444,10 @@ def _inline_generate(
     few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
     structured_mode, region_count, save_score, cache_result,
 ):
+    saved_workflow = _workflow_settings()
+    shared_updates = {"preset": preset, "base_model": base_model, "safety": safety}
+    if any(saved_workflow[key] != value for key, value in shared_updates.items()):
+        _save_workflow_values(shared_updates)
     connection = _connection_settings()
     generated, system, status = _generate(
         request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
@@ -1484,12 +1507,26 @@ def inject_inline_before_negative(component, **kwargs):
 
 
 def _create_inline_panel(slot, prompt_target):
+    workflow = _workflow_settings()
     with gr.Accordion("Prompt 批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
-        gr.Markdown("仅用于连续生图时换 Prompt；详细生成规则请在独立的“生成”面板配置。")
+        gr.Markdown("用于连续生图时换 Prompt；生成预设、目标底模和内容模式与独立面板使用同一组选项。")
         request = gr.Textbox(
             label="本轮创作要求", lines=2, placeholder="例如：复杂二次元场景，不要只生成风格词",
             elem_id=f"llm_prompt_studio_{slot}_inline_request",
         )
+        with gr.Row(elem_classes=["lps-form-row"]):
+            inline_preset = gr.Dropdown(
+                label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"],
+                elem_id=f"llm_prompt_studio_{slot}_inline_preset",
+            )
+            inline_base_model = gr.Dropdown(
+                label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"],
+                elem_id=f"llm_prompt_studio_{slot}_inline_base_model",
+            )
+            inline_safety = gr.Radio(
+                label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"],
+                elem_id=f"llm_prompt_studio_{slot}_inline_safety",
+            )
         with gr.Row(elem_classes=["lps-form-row"]):
             inline_source = gr.Radio(
                 label="Prompt 来源", choices=[("LLM 自动生成", "llm"), ("缓存顺序读取", "cache")], value="llm",
@@ -1508,10 +1545,29 @@ def _create_inline_panel(slot, prompt_target):
             inline_start = gr.Button("开始连续生成", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
             inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
         inline_loop_status = gr.HTML("等待开始。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+        inline_generate = gr.Button("内嵌 LLM 生成", visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_generate")
+        inline_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_output")
+        inline_system_preview = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_system_preview")
+        inline_status = gr.Markdown(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_status")
+        inline_prompt_update = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_prompt_update")
         inline_cache_button = gr.Button("读取下一条缓存", visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_fetch")
         inline_cache_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_output")
         inline_cache_status = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_status")
         inline_cache_cursor = gr.State(0)
+        inline_generate.click(
+            _inline_generate,
+            inputs=[
+                request, gr.State(""), inline_preset, gr.State(workflow["system_override"]),
+                inline_base_model, inline_safety, gr.State(workflow["nsfw_injection"]),
+                gr.State(workflow["user_instruction"]), gr.State(workflow["few_shot_count"]),
+                gr.State(workflow["rag_min_score"]), gr.State(workflow["remove_bad"]),
+                gr.State(workflow["remove_terms"]), gr.State(workflow["shuffle"]),
+                gr.State(workflow["spaces"]), gr.State(workflow["max_tags"]),
+                gr.State(workflow["structured_mode"]), gr.State(workflow["region_count"]),
+                gr.State(workflow["save_score"]), gr.State(workflow["cache_result"]),
+            ],
+            outputs=[inline_output, inline_system_preview, inline_status, inline_prompt_update],
+        )
         inline_cache_button.click(_inline_cached_prompt, inputs=inline_cache_cursor, outputs=[inline_cache_output, inline_cache_status, inline_cache_cursor])
         inline_once.click(
             fn=None,
@@ -1529,6 +1585,12 @@ def _create_inline_panel(slot, prompt_target):
             fn=None, inputs=[], outputs=inline_loop_status,
             js=f"() => window.llmPromptStudioAutoLoop.cancelInline('{slot}')", queue=False,
         )
+        with _INLINE_LOCK:
+            _INLINE_WORKFLOW_COMPONENTS[slot] = {
+                "preset": inline_preset,
+                "base_model": inline_base_model,
+                "safety": inline_safety,
+            }
 
 
 def _wd14_interrogate(image, endpoint, model, threshold):
@@ -2317,12 +2379,20 @@ def on_ui_tabs():
         save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
         save_batch_workflow.click(_save_workflow_settings, inputs=batch_workflow_inputs, outputs=batch_status)
         reset_workflow.click(_reset_workflow_settings, outputs=[*workflow_inputs, workflow_status])
-        preset.change(_sync_value, inputs=preset, outputs=batch_preset, queue=False)
-        batch_preset.input(_sync_value, inputs=batch_preset, outputs=preset, queue=False)
-        base_model.change(_sync_value, inputs=base_model, outputs=batch_base_model, queue=False)
-        batch_base_model.input(_sync_value, inputs=batch_base_model, outputs=base_model, queue=False)
-        safety.change(_sync_value, inputs=safety, outputs=batch_safety, queue=False)
-        batch_safety.input(_sync_value, inputs=batch_safety, outputs=safety, queue=False)
+        with _INLINE_LOCK:
+            inline_workflows = list(_INLINE_WORKFLOW_COMPONENTS.values())
+        shared_workflow_fields = {
+            "preset": (preset, batch_preset),
+            "base_model": (base_model, batch_base_model),
+            "safety": (safety, batch_safety),
+        }
+        for field, (generate_component, batch_component) in shared_workflow_fields.items():
+            inline_components = [components[field] for components in inline_workflows]
+            _bind_workflow_sync(generate_component, [batch_component, *inline_components], event="change")
+            _bind_workflow_sync(batch_component, [generate_component, *inline_components])
+            for current in inline_components:
+                other_inline = [component for component in inline_components if component is not current]
+                _bind_workflow_sync(current, [generate_component, batch_component, *other_inline])
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
         save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint, model])
