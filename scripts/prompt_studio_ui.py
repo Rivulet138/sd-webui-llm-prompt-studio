@@ -1532,10 +1532,6 @@ def _create_inline_panel(slot, prompt_target):
                 label="Prompt 来源", choices=[("LLM 自动生成", "llm"), ("缓存顺序读取", "cache")], value="llm",
                 elem_id=f"llm_prompt_studio_{slot}_inline_source",
             )
-            inline_write_mode = gr.Radio(
-                label="写入方式", choices=[("追加到后面", "append"), ("覆盖当前 Prompt", "replace")], value="append",
-                elem_id=f"llm_prompt_studio_{slot}_inline_write_mode",
-            )
             inline_cycles = gr.Number(
                 label="轮数（0 = 持续）", value=0, minimum=0, precision=0,
                 elem_id=f"llm_prompt_studio_{slot}_inline_cycles",
@@ -1571,15 +1567,15 @@ def _create_inline_panel(slot, prompt_target):
         inline_cache_button.click(_inline_cached_prompt, inputs=inline_cache_cursor, outputs=[inline_cache_output, inline_cache_status, inline_cache_cursor])
         inline_once.click(
             fn=None,
-            inputs=[request, inline_source, inline_write_mode],
+            inputs=[request, inline_source],
             outputs=inline_loop_status,
-            js=f"(request, source, mode) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, source, mode}})",
+            js=f"(request, source) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, source}})",
         )
         inline_start.click(
             fn=None,
-            inputs=[request, inline_source, inline_write_mode, inline_cycles],
+            inputs=[request, inline_source, inline_cycles],
             outputs=inline_loop_status,
-            js=f"(request, source, mode, cycles) => window.llmPromptStudioAutoLoop.inlineLoop({{slot: '{slot}', request, source, mode, cycles}})",
+            js=f"(request, source, cycles) => window.llmPromptStudioAutoLoop.inlineLoop({{slot: '{slot}', request, source, cycles}})",
         )
         inline_cancel.click(
             fn=None, inputs=[], outputs=inline_loop_status,

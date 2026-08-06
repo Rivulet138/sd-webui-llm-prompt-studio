@@ -14,6 +14,7 @@
         lastSaveFailure: "",
         lastBatchRowIds: [],
     };
+    const inlineRuns = { txt2img: null, img2img: null };
 
     function root() {
         return typeof gradioApp === "function" ? gradioApp() : document;
@@ -179,7 +180,10 @@
     }
 
     function assertActive(run) {
-        if (run.cancelled || state.active !== run) throw new Error("已取消");
+        const isCurrent = run.scope === "inline"
+            ? inlineRuns[run.slot] === run
+            : state.active === run;
+        if (run.cancelled || !isCurrent) throw new Error("已取消");
     }
 
     function finishRun(run) {
@@ -187,6 +191,19 @@
             state.active = null;
             saveQueue();
         }
+    }
+
+    function beginInlineRun(slot, target) {
+        if (inlineRuns[slot]) return null;
+        const run = {
+            id: createId("inline"), scope: "inline", slot, phase: "inline", target, cancelled: false,
+        };
+        inlineRuns[slot] = run;
+        return run;
+    }
+
+    function finishInlineRun(run) {
+        if (inlineRuns[run.slot] === run) inlineRuns[run.slot] = null;
     }
 
     async function waitForStudioGeneration(run, beforeStatus, timeoutMs = 300000) {
@@ -306,17 +323,15 @@
     }
 
     async function inlineOnce(config) {
-        if (state.active) return "已有队列任务正在运行";
-        const target = config.slot === "img2img" ? "img2img" : "txt2img";
-        const run = await beginRun("inline", target);
-        if (!run) return "已有队列任务正在运行";
-        run.phase = "inline";
-        run.target = target;
+        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        const target = slot;
+        const run = beginInlineRun(slot, target);
+        if (!run) return "当前内嵌面板已有任务正在运行";
         const basePrompt = String(root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`)?.value || "");
         try {
             const prompt = await getInlinePrompt(config, run);
             assertActive(run);
-            writePrompt(prompt, target, config.mode === "replace" ? "replace" : "append", basePrompt);
+            writePrompt(prompt, target, "append", basePrompt);
             const message = config.source === "cache" ? "已取缓存 Prompt 并写入" : "已生成 Prompt 并写入";
             render("success", message, "当前只更新 Prompt，未启动生图");
             return message;
@@ -325,17 +340,16 @@
             render(message === "已取消" ? "warning" : "error", "内嵌 Prompt 操作已停止", message);
             return message;
         } finally {
-            finishRun(run);
+            finishInlineRun(run);
         }
     }
 
     async function inlineLoop(config) {
-        if (state.active) return "已有队列任务正在运行";
-        const target = config.slot === "img2img" ? "img2img" : "txt2img";
-        const run = await beginRun("inline", target);
-        if (!run) return "已有队列任务正在运行";
+        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        const target = slot;
+        const run = beginInlineRun(slot, target);
+        if (!run) return "当前内嵌面板已有任务正在运行";
         run.phase = "forge";
-        run.target = target;
         const parsedCycles = Number(config.cycles);
         const cycleLimit = Number.isFinite(parsedCycles) ? Math.max(0, Math.floor(parsedCycles)) : 0;
         let completed = 0;
@@ -346,7 +360,7 @@
                 ensureForgeIdle(target);
                 const prompt = await getInlinePrompt(config, run);
                 assertActive(run);
-                writePrompt(prompt, target, config.mode === "replace" ? "replace" : "append", basePrompt);
+                writePrompt(prompt, target, "append", basePrompt);
                 const generate = findButton(`${target}_generate`);
                 if (!generate) throw new Error(`未找到 ${target} 生图按钮`);
                 const beforeStatus = String(find(`${target}_status`)?.textContent || "");
@@ -361,13 +375,14 @@
             render(message === "已取消" ? "warning" : "error", "内嵌连续生成已停止", message);
             return message;
         } finally {
-            finishRun(run);
+            finishInlineRun(run);
         }
     }
 
     function cancelInline(slot) {
-        const run = state.active;
-        if (!run || run.phase !== "inline" || run.target !== (slot === "img2img" ? "img2img" : "txt2img")) return "当前没有该面板的连续任务";
+        const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
+        const run = inlineRuns[normalizedSlot];
+        if (!run) return "当前没有该面板的连续任务";
         run.cancelled = true;
         if (run.target) {
             const interrupt = find(`${run.target}_interrupt`);
@@ -380,6 +395,7 @@
     function writePrompt(prompt, target, mode, basePrompt = "") {
         const targetInput = root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`);
         if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
+        // Ranbooru semantics: every cycle combines the frozen base with only this cycle's prompt.
         const next = mode === "append" && String(basePrompt).trim()
             ? `${String(basePrompt).replace(/[\s,]+$/, "")}, ${String(prompt).replace(/^[\s,]+/, "")}`
             : String(prompt).trim();

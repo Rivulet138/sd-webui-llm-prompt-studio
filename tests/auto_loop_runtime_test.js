@@ -44,12 +44,17 @@ function createRuntime(initialQueue = [], options = {}) {
         llm_prompt_studio_request: new FakeInput(),
         llm_prompt_studio_source_tags: new FakeInput(),
         llm_prompt_studio_output: new FakeInput(),
+        llm_prompt_studio_txt2img_inline_request: new FakeInput(),
+        llm_prompt_studio_txt2img_inline_output: new FakeInput(),
+        llm_prompt_studio_txt2img_inline_cache_output: new FakeInput(),
+        llm_prompt_studio_txt2img_inline_cache_status: new FakeInput("idle"),
         txt2img_prompt: new FakeInput("base"),
         img2img_prompt: new FakeInput("img base"),
     };
     const logHost = { innerHTML: "" };
     const autoStatusHost = { innerHTML: "" };
     const studioStatusHost = { textContent: "idle" };
+    const inlineStatusHost = { textContent: "idle" };
     const forgeStatusHost = { textContent: "idle" };
     const gallery = { innerHTML: "old" };
     const generalButton = { disabled: false, matches: () => true };
@@ -58,6 +63,7 @@ function createRuntime(initialQueue = [], options = {}) {
     const promptHistory = [];
     let interruptClicks = 0;
     const generated = Array.isArray(options.generated) ? [...options.generated] : [options.generated || "new prompt"];
+    const inlineGenerated = Array.isArray(options.inlineGenerated) ? [...options.inlineGenerated] : [options.inlineGenerated || "inline prompt"];
     const dispatchButton = {
         disabled: false,
         matches: () => true,
@@ -70,6 +76,19 @@ function createRuntime(initialQueue = [], options = {}) {
                 studioStatusHost.textContent = "completed";
                 this.disabled = false;
             }, options.llmDelay || 10);
+        },
+    };
+    const inlineGenerate = {
+        disabled: false,
+        matches: () => true,
+        click() {
+            this.disabled = true;
+            const output = inlineGenerated.shift() || "inline prompt";
+            setTimeout(() => {
+                inputs.llm_prompt_studio_txt2img_inline_output.value = output;
+                inlineStatusHost.textContent = "completed";
+                this.disabled = false;
+            }, options.inlineDelay || 10);
         },
     };
     const forgeGenerate = {
@@ -100,6 +119,8 @@ function createRuntime(initialQueue = [], options = {}) {
         llm_prompt_studio_status: studioStatusHost,
         llm_prompt_studio_generate_button: generalButton,
         llm_prompt_studio_auto_loop_dispatch: dispatchButton,
+        llm_prompt_studio_txt2img_inline_generate: inlineGenerate,
+        llm_prompt_studio_txt2img_inline_status: inlineStatusHost,
         txt2img_generate: forgeGenerate,
         txt2img_interrupt: interrupt,
         txt2img_gallery: gallery,
@@ -270,6 +291,40 @@ async function main() {
     assert.equal(continuousRun.queue().length, 2);
     assert.deepEqual(continuousRun.queue().map((row) => row.status), ["completed", "completed"]);
     assert.match(continuousResult, /2/);
+
+    const inlineAppendRun = createRuntime([], {
+        inlineGenerated: ["inline details one", "inline details two"],
+    });
+    const inlineAppendResult = await inlineAppendRun.api.inlineLoop({
+        slot: "txt2img", request: "make a different scene", source: "llm", cycles: 2,
+    });
+    assert.match(inlineAppendResult, /2/);
+    assert.deepEqual(inlineAppendRun.promptHistory(), [
+        "base, inline details one",
+        "base, inline details two",
+    ]);
+
+    const inlineCancelRun = createRuntime([], { forgeDelay: 80, inlineGenerated: ["cancel details"] });
+    const pendingInline = inlineCancelRun.api.inlineLoop({
+        slot: "txt2img", request: "cancel this loop", source: "llm", cycles: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.match(inlineCancelRun.api.cancelInline("txt2img"), /正在停止/);
+    await pendingInline;
+    assert.equal(inlineCancelRun.interruptClicks, 1);
+    const afterCancel = await inlineCancelRun.api.inlineOnce({
+        slot: "txt2img", request: "run again", source: "llm",
+    });
+    assert.match(afterCancel, /已生成 Prompt 并写入/);
+
+    const independentInline = createRuntime([], { llmDelay: 80, inlineGenerated: ["independent details"] });
+    const mainGeneration = independentInline.api.generateBatch({ request: "main queue" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const inlineWhileMainBusy = await independentInline.api.inlineOnce({
+        slot: "txt2img", request: "inline queue", source: "llm",
+    });
+    assert.match(inlineWhileMainBusy, /已生成 Prompt 并写入/);
+    await mainGeneration;
 
     const identicalGallery = createRuntime([
         { index: 1, id: "same-gallery", prompt: "fixed seed prompt", status: "pending", requestId: "same gallery", batchId: "same-gallery-batch" },

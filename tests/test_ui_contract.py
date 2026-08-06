@@ -56,6 +56,10 @@ class PromptStudioUiContractTests(unittest.TestCase):
         self.assertIn("inline_once = gr.Button", source)
         self.assertIn("inline_start = gr.Button", source)
         self.assertIn("inline_cancel = gr.Button", source)
+        inline_source = source[source.index("def _create_inline_panel"):source.index("def _wd14_interrogate")]
+        self.assertNotIn("inline_write_mode = gr.Radio", inline_source)
+        self.assertNotIn('label="写入方式"', inline_source)
+        self.assertNotIn('("覆盖当前 Prompt", "replace")', inline_source)
         self.assertIn('label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"]', source)
         self.assertIn('label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"]', source)
         self.assertIn('label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"]', source)
@@ -117,6 +121,10 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "inlineOnce",
             "inlineLoop",
             "cancelInline",
+            "const inlineRuns = { txt2img: null, img2img: null }",
+            "beginInlineRun",
+            "finishInlineRun",
+            'writePrompt(prompt, target, "append", basePrompt)',
             "读取缓存超时",
             "内嵌连续生成已完成",
         ):
