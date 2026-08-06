@@ -14,7 +14,6 @@
 - 接收 PNG Prompt Collector 的 `prompt_batch.v1` 批次，逐条润色或扩写。
 - 静态词库自动建立和增量刷新索引，无需手动重建。
 
-插件没有 RAG / Few-Shot 生成链路，也没有 LLM 自动评分。缓存评分仅由用户本地手动维护，不会产生额外 Provider 请求。
 
 ## 安装
 
@@ -153,17 +152,6 @@ assets/wildcards/
 
 三个生成选项与独立 `LLM Prompt Studio` 页使用同一组选项，并自动载入已保存的工作参数；在生成页、批处理页或任一内嵌面板修改时，其他面板会同步更新。详细 Provider、自定义 System Prompt 和后处理参数仍统一在独立页面保存。
 
-### Ranbooru 式追加
-
-连续任务开始时冻结当前正向 Prompt 作为基础。追加模式的每一轮都独立组合：
-
-```text
-第 1 轮 = 基础 Prompt + 本轮 Prompt A
-第 2 轮 = 基础 Prompt + 本轮 Prompt B
-第 3 轮 = 基础 Prompt + 本轮 Prompt C
-```
-
-上一轮的 A 不会进入下一轮，也不会无限累积。内嵌面板不再提供覆盖模式。
 
 ## 输出预设
 
