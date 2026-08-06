@@ -115,6 +115,14 @@
         host.innerHTML = `<div class="lps-status lps-status--${tone}" role="status" aria-live="polite"><strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</div>`;
     }
 
+    function renderInline(slot, kind, headline, detail = "") {
+        const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
+        const host = find(`llm_prompt_studio_${normalizedSlot}_inline_loop_status`);
+        if (!host) return;
+        const tone = kind === "success" ? "success" : kind === "error" ? "error" : "warning";
+        host.innerHTML = `<div class="lps-status lps-status--${tone}" role="status" aria-live="polite"><strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</div>`;
+    }
+
     function renderQueue() {
         const host = find("llm_prompt_studio_auto_loop_log");
         if (!host) return;
@@ -342,15 +350,16 @@
         if (!run) return "当前内嵌面板已有任务正在运行";
         const basePrompt = String(root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`)?.value || "");
         try {
+            renderInline(slot, "warning", config.source === "cache" ? "正在读取缓存 Prompt" : "正在生成 Prompt", "当前请求处理中");
             const prompt = await getInlinePrompt(config, run);
             assertActive(run);
             writePrompt(prompt, target, "append", basePrompt);
             const message = config.source === "cache" ? "已取缓存 Prompt 并写入" : "已生成 Prompt 并写入";
-            render("success", message, "当前只更新 Prompt，未启动生图");
+            renderInline(slot, "success", message, "当前只更新 Prompt，未启动生图");
             return message;
         } catch (error) {
             const message = String(error?.message || error);
-            render(message === "已取消" ? "warning" : "error", "内嵌 Prompt 操作已停止", message);
+            renderInline(slot, message === "已取消" ? "warning" : "error", "内嵌 Prompt 操作已停止", message);
             return message;
         } finally {
             finishInlineRun(run);
@@ -371,19 +380,21 @@
             while (cycleLimit === 0 || completed < cycleLimit) {
                 assertActive(run);
                 ensureForgeIdle(target);
+                renderInline(slot, "warning", `第 ${completed + 1} 轮：正在生成 Prompt`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
                 const prompt = await getInlinePrompt(config, run);
                 assertActive(run);
                 writePrompt(prompt, target, "append", basePrompt);
                 const generate = findButton(`${target}_generate`);
                 if (!generate) throw new Error(`未找到 ${target} 生图按钮`);
+                renderInline(slot, "warning", `第 ${completed + 1} 轮：正在 Forge 生图`, "Prompt 已写入，等待生图完成");
                 await runForgeGeneration(target, run, generate);
                 completed += 1;
-                render("success", `内嵌连续生成已完成 ${completed} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
+                renderInline(slot, "success", `内嵌连续生成已完成 ${completed} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
             }
             return `内嵌连续生成完成，共 ${completed} 轮`;
         } catch (error) {
             const message = String(error?.message || error);
-            render(message === "已取消" ? "warning" : "error", "内嵌连续生成已停止", message);
+            renderInline(slot, message === "已取消" ? "warning" : "error", "内嵌连续生成已停止", message);
             return message;
         } finally {
             finishInlineRun(run);
@@ -399,7 +410,7 @@
             const interrupt = find(`${run.target}_interrupt`);
             if (isVisible(interrupt)) interrupt.click();
         }
-        render("warning", "正在停止内嵌连续生成", "当前请求结束后停止");
+        renderInline(normalizedSlot, "warning", "正在停止内嵌连续生成", "当前请求结束后停止");
         return "正在停止内嵌连续生成";
     }
 

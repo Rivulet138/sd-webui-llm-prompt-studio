@@ -55,6 +55,7 @@ function createRuntime(initialQueue = [], options = {}) {
     const autoStatusHost = { innerHTML: "" };
     const studioStatusHost = { textContent: "idle" };
     const inlineStatusHost = { textContent: "idle" };
+    const inlineLoopStatusHost = { innerHTML: "等待开始。" };
     const forgeStatusHost = { textContent: "idle" };
     const gallery = { innerHTML: "old" };
     const generalButton = { disabled: false, matches: () => true };
@@ -134,6 +135,7 @@ function createRuntime(initialQueue = [], options = {}) {
         llm_prompt_studio_auto_loop_dispatch: dispatchButton,
         llm_prompt_studio_txt2img_inline_generate: inlineGenerate,
         llm_prompt_studio_txt2img_inline_status: inlineStatusHost,
+        llm_prompt_studio_txt2img_inline_loop_status: inlineLoopStatusHost,
         txt2img_generate: forgeGenerate,
         txt2img_interrupt: interrupt,
         txt2img_gallery: gallery,
@@ -177,6 +179,7 @@ function createRuntime(initialQueue = [], options = {}) {
     return {
         api: context.llmPromptStudioAutoLoop,
         autoStatusHost,
+        inlineLoopStatusHost,
         logHost,
         values,
         get dispatchClicks() { return dispatchClicks; },
@@ -332,6 +335,15 @@ async function main() {
         "base, inline details one",
         "base, inline details two",
     ]);
+    assert.match(inlineAppendRun.inlineLoopStatusHost.innerHTML, /已完成 2 轮/);
+
+    const inlineProgress = createRuntime([], { inlineGenerated: ["slow details"], inlineDelay: 80 });
+    const inlineProgressRun = inlineProgress.api.inlineLoop({
+        slot: "txt2img", request: "show progress", source: "llm", cycles: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.match(inlineProgress.inlineLoopStatusHost.innerHTML, /正在生成 Prompt/);
+    await inlineProgressRun;
 
     const inlineCancelRun = createRuntime([], { forgeDelay: 80, inlineGenerated: ["cancel details"] });
     const pendingInline = inlineCancelRun.api.inlineLoop({
