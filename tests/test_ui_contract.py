@@ -32,7 +32,6 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_output",
             "llm_prompt_studio_model_id",
             "llm_prompt_studio_cache_result",
-            "llm_prompt_studio_auto_score",
             "llm_prompt_studio_auto_loop_tab",
             "llm_prompt_studio_auto_loop_target",
             "llm_prompt_studio_auto_loop_request",
@@ -47,14 +46,37 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_auto_loop_cancel",
             "llm_prompt_studio_auto_loop_status",
             "llm_prompt_studio_auto_loop_log",
+            "llm_prompt_studio_batch_preset",
+            "llm_prompt_studio_batch_base_model",
+            "llm_prompt_studio_batch_safety",
         ):
             self.assertIn(f'elem_id="{elem_id}"', source)
 
         self.assertNotIn("_save_inline_workflow_settings", source)
+        self.assertIn("inline_once = gr.Button", source)
+        self.assertIn("inline_start = gr.Button", source)
+        self.assertIn("inline_cancel = gr.Button", source)
+        self.assertIn('gr.Accordion("Prompt 批量生成"', source)
+        self.assertIn('gr.Tab("服务端批量生成（仅 Prompt）")', source)
+        self.assertIn("只生成并缓存 Prompt，不会自动启动 Forge 生图", source)
+        self.assertNotIn('gr.Accordion("标签处理与 RAG", open=False):', source)
+        self.assertNotIn("Few-Shot", source)
+        self.assertNotIn('gr.Accordion("RAG 与缓存"', source)
+        self.assertNotIn('inline_generate")', source)
         self.assertNotIn('workflow["batch_score"]', source)
         self.assertNotIn("batch_score, False, False", source)
         self.assertIn("validate_endpoint(endpoint) + \"/tagger/v1/interrogate\"", source)
         self.assertIn("response.read(4 * 1024 * 1024 + 1)", source)
+        self.assertIn("ui.load(\n            _load_active_connection_settings", source)
+        self.assertIn("ui.load(\n            _index_wildcards", source)
+        self.assertIn("wildcard_path.change(\n            _index_wildcards", source)
+        self.assertNotIn("建立 / 刷新本地索引", source)
+        self.assertNotIn('elem_id="llm_prompt_studio_wildcard_index"', source)
+        self.assertIn("DB.recover_stale_handoffs()", source)
+        self.assertIn("DB.existing_source_prompts(sources, preset, base_model)", source)
+        self.assertIn('gr.Accordion("另一条路径：浏览器生图队列（可选）", open=False', source)
+        self.assertIn('headers=["序号", "输入", "生成结果", "状态"]', source)
+        self.assertIn('gr.Accordion("Ranbooru 实时交接箱", open=False', source)
 
     def test_auto_loop_javascript_contract(self):
         script = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
@@ -69,7 +91,7 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "MAX_LOG_ROWS = 100",
             "localStorage",
             "findButton(\"llm_prompt_studio_auto_loop_dispatch\")",
-            "find(`${target}_generate`)",
+            "findButton(`${target}_generate`)",
             "target === \"img2img\"",
             "canonicalPrompt",
             "migrateQueue",
@@ -77,19 +99,27 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "state.requestIds.has(requestId)",
             "duplicateOutputCount",
             "async function generateAndRun",
-            "allowRepeat: continuous",
+            "allowRepeat: true",
             "cycleLimit === 0",
             "setValue(\"llm_prompt_studio_output\", \"\")",
             "writePrompt(row.prompt, target, mode, basePrompt)",
             "requestIds: Array.from(state.requestIds)",
             "state.lastBatchRowIds.slice()",
             "not persistent",
+            "inlineOnce",
+            "inlineLoop",
+            "cancelInline",
+            "读取缓存超时",
+            "内嵌连续生成已完成",
         ):
             self.assertIn(marker, script)
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
-        self.assertIn("structured_mode, region_count, 0, False, False", source)
+        self.assertIn("structured_mode, region_count, 0, False", source)
         self.assertIn("auto_loop_cache_result", source)
         self.assertIn('"auto_loop", source_ref', source)
+        self.assertIn("batch_preset.input(_sync_value", source)
+        self.assertIn("batch_base_model.input(_sync_value", source)
+        self.assertIn("batch_safety.input(_sync_value", source)
 
     def test_auto_loop_queue_migration_and_generated_output_deduplication(self):
         node = shutil.which("node")

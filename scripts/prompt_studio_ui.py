@@ -18,7 +18,7 @@ from starlette.requests import Request
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_system_prompt, build_user_message, call_llm, get_provider_profile, is_sfw_output,
-    discover_ranbooru_cache, evaluate_prompt_quality, load_ranbooru_cache, process_tags,
+    discover_ranbooru_cache, load_ranbooru_cache, process_tags,
     regional_format, validate_endpoint,
 )
 
@@ -99,8 +99,7 @@ WORKFLOW_DEFAULTS = {
     "rag_min_score": 7,
     "save_score": 0,
     "cache_result": True,
-    "auto_score": True,
-    "batch_skip_existing": True,
+    "batch_skip_existing": False,
     "batch_skip_failed": True,
     "wd_endpoint": "http://127.0.0.1:7860",
     "wd_model": "wd14-moat-v2",
@@ -114,10 +113,14 @@ _BATCH_CANCEL = threading.Event()
 _BATCH_LOCK = threading.Lock()
 _BATCH_CONTROL_LOCK = threading.Lock()
 _BATCH_ACTIVE_TASK_ID = ""
+_BATCH_VARIATION_FOCI = (
+    "主体动作与人物互动",
+    "场景布局与环境事件",
+    "镜头构图与景别",
+    "时间天气与现场状态",
+    "道具关系与叙事细节",
+)
 _PNG_BATCH_CANCEL = threading.Event()
-_PNG_BATCH_LOCK = threading.Lock()
-_PNG_BATCH_CONTROL_LOCK = threading.Lock()
-_PNG_BATCH_ACTIVE_TASK_ID = ""
 
 
 def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
@@ -232,7 +235,14 @@ def _detect_ranbooru_cache():
 
 def _workflow_settings() -> dict[str, Any]:
     stored = DB.get_setting("workflow_settings_v1", {}) or {}
-    values = {**WORKFLOW_DEFAULTS, **(stored if isinstance(stored, dict) else {})}
+    try:
+        stored_version = int(stored.get("version") or 0) if isinstance(stored, dict) else 0
+    except (TypeError, ValueError):
+        stored_version = 0
+    stored_values = stored if isinstance(stored, dict) else {}
+    values = {key: stored_values.get(key, default) for key, default in WORKFLOW_DEFAULTS.items()}
+    if stored_version < 2:
+        values["batch_skip_existing"] = False
     preset_values = {value for _, value in PRESET_UI_CHOICES}
     model_values = {value for _, value in MODEL_UI_CHOICES}
     output_values = {value for _, value in OUTPUT_UI_CHOICES}
@@ -261,7 +271,7 @@ def _workflow_settings() -> dict[str, Any]:
             values[key] = max(minimum, min(float(values[key]), maximum))
         except (TypeError, ValueError):
             values[key] = WORKFLOW_DEFAULTS[key]
-    for key in ["remove_bad", "shuffle", "spaces", "cache_result", "auto_score", "batch_skip_existing", "batch_skip_failed"]:
+    for key in ["remove_bad", "shuffle", "spaces", "cache_result", "batch_skip_existing", "batch_skip_failed"]:
         values[key] = bool(values[key])
     for key in [
         "system_override", "nsfw_injection", "user_instruction", "remove_terms",
@@ -274,14 +284,18 @@ def _workflow_settings() -> dict[str, Any]:
 def _save_workflow_values(updates: dict[str, Any]) -> str:
     values = _workflow_settings()
     values.update(updates)
-    DB.set_setting("workflow_settings_v1", {"version": 1, **values})
+    DB.set_setting("workflow_settings_v1", {**values, "version": 2})
     return "工作参数已保存。下次打开完整页和内嵌面板时会自动填入。"
+
+
+def _sync_value(value):
+    return value
 
 
 def _save_workflow_settings(
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
-    few_shot_count, rag_min_score, save_score, cache_result, auto_score,
+    few_shot_count, rag_min_score, save_score, cache_result,
     batch_skip_existing, batch_skip_failed,
     wd_endpoint, wd_model, wd_threshold, wildcard_path,
 ):
@@ -292,7 +306,7 @@ def _save_workflow_settings(
         "remove_bad": bool(remove_bad), "remove_terms": remove_terms, "shuffle": bool(shuffle),
         "spaces": bool(spaces), "max_tags": int(max_tags or 0),
         "few_shot_count": int(few_shot_count or 0), "rag_min_score": float(rag_min_score or 0),
-        "save_score": float(save_score or 0), "cache_result": bool(cache_result), "auto_score": bool(auto_score),
+        "save_score": float(save_score or 0), "cache_result": bool(cache_result),
         "batch_skip_existing": bool(batch_skip_existing), "batch_skip_failed": bool(batch_skip_failed),
         "wd_endpoint": wd_endpoint, "wd_model": wd_model,
         "wd_threshold": float(wd_threshold or 0), "wildcard_path": wildcard_path,
@@ -303,7 +317,7 @@ def _workflow_component_values(values: dict[str, Any]) -> list[Any]:
     return [values[key] for key in [
         "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction",
         "structured_mode", "region_count", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags",
-        "few_shot_count", "rag_min_score", "save_score", "cache_result", "auto_score",
+        "few_shot_count", "rag_min_score", "save_score", "cache_result",
         "batch_skip_existing", "batch_skip_failed",
         "wd_endpoint", "wd_model", "wd_threshold", "wildcard_path",
     ]]
@@ -368,6 +382,15 @@ def _load_provider_settings(provider):
     return (
         settings["endpoint"], settings["model"], settings["temperature"], settings["timeout"],
         settings["max_tokens"], settings["send_temperature"],
+        _credential_status(settings["provider"], settings["endpoint"]),
+    )
+
+
+def _load_active_connection_settings():
+    settings = _connection_settings()
+    return (
+        settings["provider"], settings["endpoint"], settings["model"], settings["temperature"],
+        settings["timeout"], settings["max_tokens"], settings["send_temperature"],
         _credential_status(settings["provider"], settings["endpoint"]),
     )
 
@@ -443,52 +466,6 @@ def _save_record(record_id, prompt, negative, output_mode, base_model, score, ta
 
 def _save_record_as_new(prompt, negative, output_mode, base_model, score, tags, query="", min_score=0, filter_output_mode="全部", filter_base_model="全部"):
     return _save_record("", prompt, negative, output_mode, base_model, score, tags, query, min_score, filter_output_mode, filter_base_model)
-
-
-def _score_selected_records(
-    selected_ids, provider, endpoint, model, api_key, timeout, send_temperature,
-    query="", min_score=0, filter_output_mode="全部", filter_base_model="全部",
-):
-    ids = _selected_values(selected_ids)[:200]
-    if not ids:
-        yield "请先选择需要 LLM 评分的缓存记录。", gr.update(), gr.update()
-        return
-    try:
-        resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
-    except Exception as error:
-        yield f"LLM 评分无法开始：{_safe_error(error)}", gr.update(), gr.update()
-        return
-
-    completed, failures = 0, []
-    for position, record_id in enumerate(ids, start=1):
-        try:
-            parsed_id = int(record_id)
-        except (TypeError, ValueError):
-            failures.append(f"无效记录 ID {record_id}")
-            continue
-        record = DB.get_prompt(parsed_id)
-        if not record:
-            failures.append(f"ID {record_id} 不存在")
-            continue
-        try:
-            evaluation = evaluate_prompt_quality(
-                provider, endpoint, model, resolved_key, record["prompt"], record["tags"],
-                record["output_mode"], record["base_model"], int(timeout or 90), bool(send_temperature),
-            )
-            DB.save_prompt(
-                record["prompt"], record["negative_prompt"], record["output_mode"], record["base_model"],
-                evaluation["score"], record["tags"], parsed_id, "llm", evaluation["reason"], model,
-            )
-            completed += 1
-        except Exception as error:
-            failures.append(f"ID {record_id}: {_safe_error(error)}")
-        yield f"LLM 评分进度 {position}/{len(ids)}：成功 {completed}，失败 {len(failures)}", gr.update(), gr.update()
-
-    table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model, ids)
-    message = f"LLM 评分完成：成功 {completed}，失败 {len(failures)}。只有成功评分的记录会进入高分 RAG。"
-    if failures:
-        message += " 最近错误：" + "；".join(failures[-3:])
-    yield message, table, choices
 
 
 def _delete_records(ids, query="", min_score=0, output_mode="全部", base_model="全部"):
@@ -699,13 +676,13 @@ def _sync_ranbooru_link(
         stats = DB.sync_external_prompts(result["records"])
         invalidated = DB.invalidate_external_prompts(
             "ranbooru", result["invalid_source_refs"],
-            "Ranbooru 自然语言缓存已失效：源 Tag 已变化，需要重新转换并由 LLM 评价",
+            "Ranbooru 自然语言缓存已失效：源 Tag 已变化，需要重新转换；相关缓存已重置为未评分",
         )
         table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
         message = (
             f"Ranbooru 同步完成：新增 {stats['inserted']}，源内容更新 {stats['updated']}，"
             f"未变化 {stats['unchanged']}，失效评分 {invalidated}。新记录和发生变化的记录均为未评分，"
-            "需要在缓存库选择后执行 LLM 评分才能进入高分 RAG。"
+            "可在缓存库手动调整评分。"
         )
         if result["stale_natural"]:
             message += f" 跳过失效自然语言缓存 {result['stale_natural']} 条。"
@@ -732,7 +709,6 @@ def _parse_batch_sources(source_text: str) -> tuple[list[str], dict[str, int]]:
             continue
         if value in seen:
             duplicates += 1
-            continue
         seen.add(value)
         sources.append(value)
     return sources, {"ignored": ignored, "duplicates": duplicates}
@@ -740,18 +716,23 @@ def _parse_batch_sources(source_text: str) -> tuple[list[str], dict[str, int]]:
 
 def _preview_batch_sources(source_text, skip_existing, preset, base_model):
     sources, stats = _parse_batch_sources(source_text)
-    cached = sum(1 for source in sources if skip_existing and DB.has_source_prompt(source, preset, base_model))
+    cached_sources = DB.existing_source_prompts(sources, preset, base_model) if skip_existing else set()
+    cached = sum(1 for source in sources if source in cached_sources)
     rows = []
     for index, source in enumerate(sources[:200], start=1):
-        state = "将跳过：已有缓存" if skip_existing and DB.has_source_prompt(source, preset, base_model) else "等待生成"
-        rows.append([index, source, state])
+        state = "将跳过：已有缓存" if source in cached_sources else "等待生成"
+        rows.append([index, source, "", state])
     message = (
-        f"队列共 {len(sources)} 条；重复输入 {stats['duplicates']} 条；空行或注释 {stats['ignored']} 条；"
+        f"队列共 {len(sources)} 条；重复输入 {stats['duplicates']} 条（均保留为独立任务）；空行或注释 {stats['ignored']} 条；"
         f"按当前规则将跳过已有缓存 {cached} 条。"
     )
     if len(sources) > 200:
         message += " 预览仅显示前 200 条。"
     return gr.update(value=rows), message
+
+
+def _batch_issue_key(item: dict[str, Any]) -> str:
+    return str(item.get("key") or f"{item.get('index', '')}:{item.get('source', '')}")
 
 
 def _batch_issue_views(issues, selected=None):
@@ -765,14 +746,14 @@ def _batch_issue_views(issues, selected=None):
         preview = " ".join(str(item["source"]).split())
         if len(preview) > 72:
             preview = preview[:69] + "..."
-        choices.append((f"#{item.get('index', '')} · {item.get('status', '')} · {preview}", str(item["source"])))
+        choices.append((f"#{item.get('index', '')} · {item.get('status', '')} · {preview}", _batch_issue_key(item)))
     available = {value for _, value in choices}
     retained = [value for value in _selected_values(selected) if value in available]
     return gr.update(value=rows), gr.update(choices=choices, value=retained), records
 
 
 def _select_all_batch_issues(issues):
-    values = [str(item.get("source") or "") for item in (issues or []) if isinstance(item, dict) and item.get("source")]
+    values = [_batch_issue_key(item) for item in (issues or []) if isinstance(item, dict) and item.get("source")]
     return gr.update(value=values)
 
 
@@ -780,9 +761,9 @@ def _clear_batch_issue_selection():
     return gr.update(value=[])
 
 
-def _batch_output(status, table, cache_choices, issues, selected=None):
+def _batch_output(status, table, cache_choices, issues, selected=None, result_rows=None):
     issue_table, issue_choices, issue_state = _batch_issue_views(issues, selected)
-    return status, table, cache_choices, issue_table, issue_choices, issue_state
+    return status, table, cache_choices, issue_table, issue_choices, issue_state, gr.update(value=result_rows) if result_rows is not None else gr.update()
 
 
 def _batch_generate(
@@ -804,8 +785,17 @@ def _batch_generate(
     with _BATCH_CONTROL_LOCK:
         _BATCH_ACTIVE_TASK_ID = task_id
         _BATCH_CANCEL.clear()
+    cached_sources = {
+        source for source in set(sources)
+        if skip_existing and DB.has_source_prompt(source, preset, base_model)
+    }
     pending, inserted, duplicates, score_updates, skipped, failed, request_count = [], 0, 0, 0, 0, 0, 0
     issues = []
+    result_rows = [[index, source, "", "等待处理"] for index, source in enumerate(sources[:200], start=1)]
+
+    def set_result(index, prompt, state):
+        if 1 <= index <= len(result_rows):
+            result_rows[index - 1] = [index, sources[index - 1], str(prompt or ""), state]
 
     def flush_pending():
         nonlocal inserted, duplicates, score_updates
@@ -821,6 +811,7 @@ def _batch_generate(
         for index, source in enumerate(sources, start=1):
             if _BATCH_CANCEL.is_set():
                 for remaining_index, remaining_source in enumerate(sources[index - 1:], start=index):
+                    set_result(remaining_index, "", "已取消")
                     issues.append({
                         "index": remaining_index, "source": remaining_source, "status": "已取消",
                         "reason": "批量任务已取消，尚未处理", "attempts": 0,
@@ -829,14 +820,15 @@ def _batch_generate(
                 table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
                 yield _batch_output(
                     f"任务已取消：处理 {index - 1}/{len(sources)}，新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
-                    table, choices, issues,
+                    table, choices, issues, result_rows=result_rows,
                 )
                 return
-            if skip_existing and DB.has_source_prompt(source, preset, base_model):
+            if source in cached_sources:
                 skipped += 1
+                set_result(index, "", "已跳过：批次前已有缓存")
                 issues.append({
                     "index": index, "source": source, "status": "已跳过",
-                    "reason": "已有相同输入、输出预设和目标底模的缓存", "attempts": 0,
+                    "reason": "批次开始前已有相同输入、输出预设和目标底模的缓存", "attempts": 0,
                 })
                 continue
             generated, last_status = "", ""
@@ -846,24 +838,33 @@ def _batch_generate(
                     source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-                    0, False, False,
+                    0, False, "", "", False,
+                    (
+                        f"这是同一批次中的独立任务第 {index}/{len(sources)} 条。"
+                        f"本条必须围绕原要求生成一条新的完整 Prompt，重点改变{_BATCH_VARIATION_FOCI[(index - 1) % len(_BATCH_VARIATION_FOCI)]}；"
+                        "不得复用同批其他结果，不得只替换风格词或同义词来制造差异；"
+                        "至少改变三项非风格内容（动作、构图、环境、时间天气、道具或叙事细节），只返回一条 Prompt。"
+                    ),
                 )
             except Exception as error:
                 generated, last_status = "", f"生成失败：{_safe_error(error)}"
             if generated:
+                set_result(index, generated, "生成成功")
                 pending.append({
                     "prompt": generated, "output_mode": preset, "base_model": base_model, "score": 0,
-                    "score_source": "unrated", "score_reason": "批量生成未评分；需要用户显式执行 LLM 评分",
+                    "score_source": "unrated", "score_reason": "批量生成未评分",
                     "score_model": "", "tags": source,
                 })
             else:
                 failed += 1
+                set_result(index, "", last_status or "生成错误")
                 issues.append({
                     "index": index, "source": source, "status": "生成错误",
                     "reason": last_status or "未返回结果", "attempts": 1,
                 })
                 if not skip_failed and not _BATCH_CANCEL.is_set():
                     for remaining_index, remaining_source in enumerate(sources[index:], start=index + 1):
+                        set_result(remaining_index, "", "未处理")
                         issues.append({
                             "index": remaining_index, "source": remaining_source, "status": "未处理",
                             "reason": "前一项单次请求失败，批量任务已停止", "attempts": 0,
@@ -872,7 +873,7 @@ def _batch_generate(
                     table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
                     yield _batch_output(
                         f"批量任务因错误停止：处理 {index}/{len(sources)}，新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
-                        table, choices, issues,
+                        table, choices, issues, result_rows=result_rows,
                     )
                     return
             if len(pending) >= 10 or index == len(sources):
@@ -880,12 +881,12 @@ def _batch_generate(
                 table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
                 yield _batch_output(
                     f"进度 {index}/{len(sources)}：LLM 请求 {request_count}，新增 {inserted}，重复 {duplicates}，评分更新 {score_updates}，跳过 {skipped}，失败 {failed}" + (f"；最近状态：{last_status}" if last_status and not generated else ""),
-                    table, choices, issues,
+                    table, choices, issues, result_rows=result_rows,
                 )
         table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
         yield _batch_output(
             f"批量任务完成：LLM 请求 {request_count}，新增 {inserted}，重复 {duplicates}，评分更新 {score_updates}，跳过 {skipped}，失败 {failed}；问题汇总 {len(issues)} 条",
-            table, choices, issues,
+            table, choices, issues, result_rows=result_rows,
         )
     finally:
         try:
@@ -907,14 +908,17 @@ def _retry_batch_issues(
 ):
     issues = [dict(item) for item in (issue_records or []) if isinstance(item, dict) and item.get("source")]
     requested = set(_selected_values(selected_sources))
-    selected = [item for item in issues if str(item["source"]) in requested]
+    selected = [
+        item for item in issues
+        if _batch_issue_key(item) in requested or str(item["source"]) in requested
+    ]
     if not selected:
         yield _batch_output("请先勾选需要手动重试的错误或跳过项。", gr.update(), gr.update(), issues, selected_sources)
         return
 
-    selected_values = {str(item["source"]) for item in selected}
-    original_indices = {str(item["source"]): item.get("index", "") for item in selected}
-    remaining = [item for item in issues if str(item["source"]) not in selected_values]
+    selected_keys = {_batch_issue_key(item) for item in selected}
+    selected_indices = [item.get("index", "") for item in selected]
+    remaining = [item for item in issues if _batch_issue_key(item) not in selected_keys]
     source_text = "\n".join(str(item["source"]) for item in selected)
     generator = _batch_generate(
         source_text, False, skip_failed,
@@ -923,15 +927,33 @@ def _retry_batch_issues(
         remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
         query, min_score, filter_output_mode, filter_base_model, selected, task_id,
     )
-    for status, table, cache_choices, _issue_table, _issue_choices, retry_issues in generator:
+    for status, table, cache_choices, _issue_table, _issue_choices, retry_issues, result_rows in generator:
         remapped = []
         for item in retry_issues:
             updated = dict(item)
-            updated["index"] = original_indices.get(str(updated.get("source") or ""), updated.get("index", ""))
+            try:
+                retry_position = int(updated.get("index") or 0) - 1
+            except (TypeError, ValueError):
+                retry_position = -1
+            if 0 <= retry_position < len(selected_indices):
+                updated["index"] = selected_indices[retry_position]
             remapped.append(updated)
         combined = sorted([*remaining, *remapped], key=lambda item: int(item.get("index") or 0))
         retained_selection = selected_sources if status == "已有批量任务正在运行。" else None
-        yield _batch_output(f"手动重试：{status}", table, cache_choices, combined, retained_selection)
+        remapped_rows = []
+        for row in result_rows.get("value", []) if isinstance(result_rows, dict) else []:
+            updated_row = list(row)
+            try:
+                retry_position = int(updated_row[0]) - 1
+            except (TypeError, ValueError, IndexError):
+                retry_position = -1
+            if 0 <= retry_position < len(selected_indices):
+                updated_row[0] = selected_indices[retry_position]
+            remapped_rows.append(updated_row)
+        yield _batch_output(
+            f"手动重试：{status}", table, cache_choices, combined, retained_selection,
+            result_rows=remapped_rows,
+        )
 
 
 def _index_wildcards(path):
@@ -953,6 +975,8 @@ def _save_llm_settings(provider, endpoint, model, api_key, temperature, timeout,
     try:
         endpoint = validate_endpoint(endpoint)
         model = str(model or "").strip()
+        if not model:
+            raise ValueError("LLM model ID is required")
         settings = {
             "endpoint": endpoint,
             "model": model,
@@ -969,7 +993,7 @@ def _save_llm_settings(provider, endpoint, model, api_key, temperature, timeout,
     DB.set_setting("llm_connections_v2", {"version": 2, "active_provider": provider, "providers": providers})
     key_saved = CREDENTIALS.save(provider, endpoint, api_key)
     key_available = key_saved or CREDENTIALS.has_matching(provider, endpoint)
-    message = f"{provider} 设置已保存。模型 ID：{model or '未指定（使用服务端默认模型）'}。URL、模型 ID 和生成参数下次会自动恢复。"
+    message = f"{provider} 设置已保存。模型 ID：{model}。URL、模型 ID 和生成参数下次会自动恢复。"
     if key_available:
         message += " API Key 已按 Provider 与 URL 保存在服务端，下次可留空。"
     elif get_provider_profile(provider).get("requires_api_key"):
@@ -985,26 +1009,6 @@ def _clear_llm_credentials(provider, endpoint):
     except ValueError as error:
         return f"清除失败：{_safe_error(error)}"
     return "已清除当前 Provider 与 URL 对应的 API Key。" if cleared else "当前连接没有已保存的 API Key。"
-
-
-def _score_prompt_for_cache(
-    enabled, fallback_score, prompt, source, preset, base_model,
-    provider, endpoint, model, api_key, timeout, send_temperature,
-):
-    if not enabled:
-        return float(fallback_score or 0), "manual", "自动评分已关闭", "使用手动评分；该记录不会进入 LLM 高分 RAG"
-    try:
-        resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
-        evaluation = evaluate_prompt_quality(
-            provider, endpoint, model, resolved_key, prompt, source, preset, base_model,
-            int(timeout or 90), bool(send_temperature),
-        )
-        score = float(evaluation["score"])
-        reason = str(evaluation["reason"])
-        return score, "llm", reason, f"LLM 评分 {score:.1f}/10：{_safe_error(reason)}"
-    except Exception as error:
-        reason = f"LLM 评分失败：{_safe_error(error)}"
-        return 0.0, "unrated", reason, reason + "；已按 0 分保存，不进入高分 RAG"
 
 
 def _finalize_generated_prompt(
@@ -1036,16 +1040,18 @@ def _generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-    save_score, cache_result, auto_score, source_kind="", source_ref="", cache_unrated=False,
+    save_score, cache_result, source_kind="", source_ref="", cache_unrated=False,
+    batch_directive="",
 ):
     source = str(source_tags or request or "").strip()
     if not source:
         return "", "", "请输入创作要求或源 Danbooru 标签。"
-    examples = DB.retrieve(
-        source, int(few_shot_count or 0), float(rag_min_score or 0), preset, base_model,
-    ) if int(few_shot_count or 0) else []
+    examples = []
     static_tags = DB.wildcard_matches(source, 40)
-    system = build_system_prompt(preset, base_model, safety, nsfw_injection, user_instruction, examples, static_tags, system_override)
+    system = build_system_prompt(
+        preset, base_model, safety, nsfw_injection, user_instruction, examples,
+        static_tags, system_override, batch_directive,
+    )
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
         result = call_llm(provider, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0), bool(send_temperature))
@@ -1058,29 +1064,24 @@ def _generate(
         )
     except ValueError as error:
         return "", system, f"生成失败：{error}"
-    score_status = ""
     if cache_result:
         if cache_unrated:
             score, score_source = 0.0, "unrated"
-            score_reason, score_status = "自动工作流未评分", "结果已按未评分保存，不进入高分 RAG"
+            score_reason = "自动工作流未评分"
         else:
-            score, score_source, score_reason, score_status = _score_prompt_for_cache(
-                auto_score, save_score, result, source, preset, base_model,
-                provider, endpoint, model, api_key, timeout, send_temperature,
-            )
+            score, score_source = float(save_score or 0), "manual"
+            score_reason = "生成时手动评分"
         effective_source_ref = source_ref
         if source_kind == "auto_loop" and source_ref:
             result_hash = hashlib.sha256(result.encode("utf-8")).hexdigest()[:20]
             effective_source_ref = f"{source_ref}:{result_hash}"
         DB.save_prompt(
             result, "", preset, base_model, score, source,
-            score_source=score_source, score_reason=score_reason, score_model=model if score_source == "llm" else "",
+            score_source=score_source, score_reason=score_reason, score_model="",
             source_kind=source_kind or None, source_ref=effective_source_ref or None,
             dedupe=True,
         )
-    status = f"生成完成，使用 {len(examples)} 条 RAG 示例" + ("，结果已缓存" if cache_result else "")
-    if score_status:
-        status += f"；{score_status}"
+    status = "生成完成" + ("，结果已缓存" if cache_result else "")
     return result, system, status
 
 
@@ -1108,13 +1109,13 @@ def _generate_auto_loop(
             request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
             provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-            structured_mode, region_count, 0, True, False, "auto_loop", source_ref, True,
+            structured_mode, region_count, 0, True, "auto_loop", source_ref, True,
         )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
-        few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-        structured_mode, region_count, 0, False, False,
+            few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
+            structured_mode, region_count, 0, False,
     )
 
 
@@ -1308,21 +1309,17 @@ def _png_batch_move(payload, selection, offset):
     return selected, current
 
 
-def _cancel_png_batch(task_id=""):
-    with _PNG_BATCH_CONTROL_LOCK:
-        if not task_id or str(task_id) != _PNG_BATCH_ACTIVE_TASK_ID:
-            return "当前没有正在运行的 PNG 批处理。"
-        _PNG_BATCH_CANCEL.set()
+def _cancel_png_batch():
+    _PNG_BATCH_CANCEL.set()
     return "已请求取消；当前 LLM 请求返回后停止，已完成结果会保留。"
 
 
 def _png_batch_run(
     payload, action, preset, system_override, base_model, safety, nsfw_injection,
     user_instruction, provider, endpoint, model, api_key, temperature, timeout,
-    max_tokens, send_temperature, task_id, remove_bad=True, remove_terms="", shuffle=False,
+    max_tokens, send_temperature, remove_bad=True, remove_terms="", shuffle=False,
     spaces=False, max_tags=0, structured_mode="Plain Prompt", region_count=1,
 ):
-    global _PNG_BATCH_ACTIVE_TASK_ID
     try:
         data = _normalize_png_batch_payload(payload or {})
     except Exception as error:
@@ -1331,15 +1328,7 @@ def _png_batch_run(
     if not data["records"]:
         yield _png_batch_json(data), [], 1, "", "批次为空，请先导入逐图 Prompt。"
         return
-    if not _PNG_BATCH_LOCK.acquire(blocking=False):
-        selected, current = _png_batch_current(data, 1)
-        yield _png_batch_json(data), _png_batch_table(data), selected, current, "已有 PNG 批处理正在运行。"
-        return
-
-    task_id = str(task_id or "")
-    with _PNG_BATCH_CONTROL_LOCK:
-        _PNG_BATCH_ACTIVE_TASK_ID = task_id
-        _PNG_BATCH_CANCEL.clear()
+    _PNG_BATCH_CANCEL.clear()
     records = [dict(record) for record in data["records"]]
     progress_interval = max(1, (len(records) + 99) // 100)
     skipped_existing = reused = 0
@@ -1391,11 +1380,7 @@ def _png_batch_run(
         cancelled = sum(1 for record in records if record.get("status") == "已取消")
         yield _png_batch_json(result), _png_batch_table(result), selected, current, f"批处理结束：完成 {completed}，相同 Prompt 复用 {reused}，已有结果跳过 {skipped_existing}，失败 {failed}，取消 {cancelled}。"
     finally:
-        with _PNG_BATCH_CONTROL_LOCK:
-            if _PNG_BATCH_ACTIVE_TASK_ID == task_id:
-                _PNG_BATCH_ACTIVE_TASK_ID = ""
-                _PNG_BATCH_CANCEL.clear()
-        _PNG_BATCH_LOCK.release()
+        _PNG_BATCH_CANCEL.clear()
 
 
 def _png_batch_advance_after_append(payload, selection, succeeded):
@@ -1438,7 +1423,7 @@ def _test_connection(provider, endpoint, model, api_key, temperature, timeout, m
 def _inline_generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-    structured_mode, region_count, save_score, cache_result, auto_score,
+    structured_mode, region_count, save_score, cache_result,
 ):
     connection = _connection_settings()
     generated, system, status = _generate(
@@ -1446,9 +1431,22 @@ def _inline_generate(
         connection["provider"], connection["endpoint"], connection["model"], "",
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-        structured_mode, region_count, save_score, cache_result, auto_score,
+        structured_mode, region_count, save_score, cache_result,
     )
     return generated, system, status, generated if generated else gr.update()
+
+
+def _inline_cached_prompt(cursor=0):
+    try:
+        records = [record for record in DB.list_prompts(limit=1000) if str(record.get("prompt") or "").strip()]
+        if not records:
+            return "", "缓存为空，请先生成或导入 Prompt。", int(cursor or 0)
+        position = int(cursor or 0) % len(records)
+        record = records[position]
+        next_cursor = position + 1
+        return str(record["prompt"]).strip(), f"已取出缓存第 {position + 1}/{len(records)} 条；下一次将继续向后读取。", next_cursor
+    except Exception as error:
+        return "", f"读取缓存失败：{_safe_error(error)}", int(cursor or 0)
 
 
 def _unwrap_component(component):
@@ -1486,46 +1484,51 @@ def inject_inline_before_negative(component, **kwargs):
 
 
 def _create_inline_panel(slot, prompt_target):
-    workflow = _workflow_settings()
-    with gr.Accordion("LLM 提示词工作室", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
-        gr.Markdown("生成结果会直接写入上方正向提示词。连接、模型 ID 与凭据统一使用“LLM 提示词工作室 > 连接设置”中已保存的配置。")
+    with gr.Accordion("Prompt 批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
+        gr.Markdown("仅用于连续生图时换 Prompt；详细生成规则请在独立的“生成”面板配置。")
+        request = gr.Textbox(
+            label="本轮创作要求", lines=2, placeholder="例如：复杂二次元场景，不要只生成风格词",
+            elem_id=f"llm_prompt_studio_{slot}_inline_request",
+        )
+        with gr.Row(elem_classes=["lps-form-row"]):
+            inline_source = gr.Radio(
+                label="Prompt 来源", choices=[("LLM 自动生成", "llm"), ("缓存顺序读取", "cache")], value="llm",
+                elem_id=f"llm_prompt_studio_{slot}_inline_source",
+            )
+            inline_write_mode = gr.Radio(
+                label="写入方式", choices=[("追加到后面", "append"), ("覆盖当前 Prompt", "replace")], value="append",
+                elem_id=f"llm_prompt_studio_{slot}_inline_write_mode",
+            )
+            inline_cycles = gr.Number(
+                label="轮数（0 = 持续）", value=0, minimum=0, precision=0,
+                elem_id=f"llm_prompt_studio_{slot}_inline_cycles",
+            )
         with gr.Row():
-            with gr.Column(scale=3):
-                request = gr.Textbox(label="创作要求", lines=3, placeholder="描述希望生成的画面")
-                source_tags = gr.Textbox(
-                    label="源 Danbooru 标签（可选，优先使用）",
-                    lines=2,
-                    elem_id=f"llm_prompt_studio_{slot}_source_tags",
-                )
-                preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
-                system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=3, value=workflow["system_override"], placeholder="留空则使用所选预设")
-                user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"], placeholder="例如：最多 30 个标签，不使用权重")
-            with gr.Column(scale=2):
-                base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
-                safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
-                nsfw_injection = gr.Textbox(label="NSFW 策略注入", lines=2, value=workflow["nsfw_injection"], placeholder="仅在 NSFW 模式下生效")
-                structured_mode = gr.Radio(label="输出格式", choices=OUTPUT_UI_CHOICES, value=workflow["structured_mode"])
-                region_count = gr.Slider(label="区域数量", minimum=1, maximum=8, value=workflow["region_count"], step=1)
-        with gr.Accordion("标签处理与 RAG", open=False):
-            with gr.Row():
-                remove_bad = gr.Checkbox(label="移除不良标签", value=workflow["remove_bad"])
-                shuffle = gr.Checkbox(label="随机打乱标签", value=workflow["shuffle"])
-                spaces = gr.Checkbox(label='将“_”转换为空格', value=workflow["spaces"])
-                max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=workflow["max_tags"], step=1)
-            remove_terms = gr.Textbox(label="额外排除标签 / 通配规则", value=workflow["remove_terms"], placeholder="watermark, *_text")
-            with gr.Row():
-                few_shot_count = gr.Slider(label="Few-Shot 示例数", minimum=0, maximum=8, value=workflow["few_shot_count"], step=1)
-                rag_min_score = gr.Slider(label="RAG 最低评分", minimum=0, maximum=10, value=workflow["rag_min_score"], step=0.5)
-                save_score = gr.Slider(label="手动评分（关闭自动评分时使用）", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
-                cache_result = gr.Checkbox(label="缓存生成结果", value=workflow["cache_result"])
-                auto_score = gr.Checkbox(label="使用 LLM 自动评分", value=workflow["auto_score"])
-        with gr.Row():
-            generate = gr.Button("生成并写入正向提示词", variant="primary")
-        output = gr.Textbox(label="生成的提示词", lines=5)
-        system_preview = gr.Textbox(label="最终 System Prompt 与策略", lines=8)
-        status = gr.Markdown("已自动填入上次保存的提示词参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认提示词参数。")
-        inputs = [request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result, auto_score]
-        generate.click(_inline_generate, inputs=inputs, outputs=[output, system_preview, status, prompt_target])
+            inline_once = gr.Button("取一条并写入", elem_id=f"llm_prompt_studio_{slot}_inline_once")
+            inline_start = gr.Button("开始连续生成", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
+            inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
+        inline_loop_status = gr.HTML("等待开始。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+        inline_cache_button = gr.Button("读取下一条缓存", visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_fetch")
+        inline_cache_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_output")
+        inline_cache_status = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_status")
+        inline_cache_cursor = gr.State(0)
+        inline_cache_button.click(_inline_cached_prompt, inputs=inline_cache_cursor, outputs=[inline_cache_output, inline_cache_status, inline_cache_cursor])
+        inline_once.click(
+            fn=None,
+            inputs=[request, inline_source, inline_write_mode],
+            outputs=inline_loop_status,
+            js=f"(request, source, mode) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, source, mode}})",
+        )
+        inline_start.click(
+            fn=None,
+            inputs=[request, inline_source, inline_write_mode, inline_cycles],
+            outputs=inline_loop_status,
+            js=f"(request, source, mode, cycles) => window.llmPromptStudioAutoLoop.inlineLoop({{slot: '{slot}', request, source, mode, cycles}})",
+        )
+        inline_cancel.click(
+            fn=None, inputs=[], outputs=inline_loop_status,
+            js=f"() => window.llmPromptStudioAutoLoop.cancelInline('{slot}')", queue=False,
+        )
 
 
 def _wd14_interrogate(image, endpoint, model, threshold):
@@ -1558,9 +1561,8 @@ def _api_generate(payload: dict[str, Any]):
         "provider": saved_connection["provider"], "endpoint": saved_connection["endpoint"], "model": saved_connection["model"], "api_key": "",
         "temperature": saved_connection["temperature"], "timeout": saved_connection["timeout"],
         "max_tokens": saved_connection["max_tokens"], "send_temperature": saved_connection["send_temperature"],
-        "few_shot_count": 3, "rag_min_score": 0,
         "remove_bad": True, "remove_terms": "", "shuffle": False, "spaces": False, "max_tags": 0,
-        "structured_mode": "Plain Prompt", "region_count": 1, "save_score": 0, "cache_result": False, "auto_score": True,
+        "structured_mode": "Plain Prompt", "region_count": 1, "save_score": 0, "cache_result": False,
         "nsfw_injection": "", "user_instruction": "", "source_tags": "",
     }
     payload = dict(payload or {})
@@ -1580,7 +1582,7 @@ def _api_generate(payload: dict[str, Any]):
     require_choice("base_model", BASE_MODEL_GUIDANCE, "base model profile")
     require_choice("safety", {"SFW", "NSFW"}, "safety mode")
     require_choice("structured_mode", {"Plain Prompt", "Regional JSON", "Regional Markdown"}, "structured output mode")
-    for field in ("send_temperature", "remove_bad", "shuffle", "spaces", "cache_result", "auto_score"):
+    for field in ("send_temperature", "remove_bad", "shuffle", "spaces", "cache_result"):
         if field in payload and type(payload[field]) is not bool:
             raise ValueError(f"API field {field} must be a boolean")
     if "provider" in payload and payload["provider"] != saved_connection["provider"]:
@@ -1589,7 +1591,9 @@ def _api_generate(payload: dict[str, Any]):
         raise ValueError("API endpoint must match the connection saved in the plugin UI")
     values = {**defaults, **(payload or {})}
     generated, system, status = _generate(values.get("request", ""), *[values[key] for key in [
-        "source_tags", "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction", "provider", "endpoint", "model", "api_key", "temperature", "timeout", "max_tokens", "send_temperature", "few_shot_count", "rag_min_score", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags", "structured_mode", "region_count", "save_score", "cache_result", "auto_score"
+        "source_tags", "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction", "provider", "endpoint", "model", "api_key", "temperature", "timeout", "max_tokens", "send_temperature"
+    ]], 0, 0, *[values[key] for key in [
+        "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags", "structured_mode", "region_count", "save_score", "cache_result"
     ]])
     if not generated:
         raise ValueError(status)
@@ -1727,7 +1731,7 @@ def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
             connection["send_temperature"], workflow["few_shot_count"], workflow["rag_min_score"],
             workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
             workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
-            0, False, False, "ranbooru", prompt_source_ref, True,
+            0, False, "ranbooru", prompt_source_ref, True,
         )
     except Exception as error:
         generated = ""
@@ -1863,6 +1867,9 @@ def _clear_finished_handoffs():
 
 
 def on_app_started(_, app):
+    recovered_handoffs = DB.recover_stale_handoffs()
+    if recovered_handoffs:
+        LOGGER.warning("recovered %s stale Ranbooru handoff claims", recovered_handoffs)
     saved_workflow = DB.get_setting("workflow_settings_v1", {}) or {}
     wildcard_source = Path(saved_workflow.get("wildcard_path") or DEFAULT_WILDCARDS) if isinstance(saved_workflow, dict) else DEFAULT_WILDCARDS
     if wildcard_source.is_dir():
@@ -1937,7 +1944,8 @@ def on_ui_tabs():
     initial_records = DB.list_prompts()
     initial_handoff_table, initial_handoff_choices, initial_handoff_status = _handoff_views()
     with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio") as ui:
-        gr.Markdown("## LLM 提示词工作室\n本地静态词库、RAG Few-Shot、提示词缓存与 Forge 扩展集成。")
+        gr.Markdown("## LLM 提示词工作室\n本地静态词库、提示词缓存与 Forge 扩展集成。")
+        gr.Markdown("核心流程：生成单条 Prompt；批处理多条任务；缓存与联动负责筛选、评分、导入导出和 Ranbooru。连接设置只需首次配置，工具按需使用。")
         with gr.Tabs(elem_id="llm_prompt_studio_main_tabs"):
             with gr.Tab("生成", elem_id="llm_prompt_studio_generate_tab"):
                 with gr.Row():
@@ -1957,7 +1965,7 @@ def on_ui_tabs():
                         base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
                         with gr.Accordion("高级 Prompt 约束", open=False):
-                            system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=6, value=workflow["system_override"], placeholder="留空则使用所选预设。安全策略、用户要求、RAG 和静态词库会自动追加。")
+                            system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=6, value=workflow["system_override"], placeholder="留空则使用所选预设。安全策略、用户要求和静态词库会自动追加。")
                             nsfw_injection = gr.Textbox(label="NSFW System Prompt 注入", lines=2, value=workflow["nsfw_injection"], placeholder="仅在 NSFW 模式下生效")
                             user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"], placeholder="例如：只返回最多 35 个标签，不使用权重")
                     with gr.Column(scale=2):
@@ -1969,12 +1977,11 @@ def on_ui_tabs():
                             shuffle = gr.Checkbox(label="随机打乱标签", value=workflow["shuffle"])
                             spaces = gr.Checkbox(label='将“_”转换为空格', value=workflow["spaces"])
                             max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=workflow["max_tags"], step=1)
-                        with gr.Accordion("RAG 与缓存", open=False):
-                            few_shot_count = gr.Slider(label="Few-Shot 示例数", minimum=0, maximum=8, value=workflow["few_shot_count"], step=1)
-                            rag_min_score = gr.Slider(label="RAG 最低缓存评分", minimum=0, maximum=10, value=workflow["rag_min_score"], step=0.5)
-                            save_score = gr.Slider(label="手动评分（关闭自动评分时使用）", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
+                        few_shot_count = gr.State(0)
+                        rag_min_score = gr.State(0)
+                        with gr.Accordion("缓存", open=False):
+                            save_score = gr.Slider(label="缓存评分", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
                             cache_result = gr.Checkbox(label="在本地缓存本次结果", value=workflow["cache_result"], elem_id="llm_prompt_studio_cache_result")
-                            auto_score = gr.Checkbox(label="使用 LLM 自动评价并评分", value=workflow["auto_score"], elem_id="llm_prompt_studio_auto_score")
                 with gr.Row():
                     generate = gr.Button("生成提示词", variant="primary", elem_id="llm_prompt_studio_generate_button")
                     save_workflow = gr.Button("保存全部工作参数")
@@ -1985,11 +1992,23 @@ def on_ui_tabs():
                 workflow_status = gr.Markdown("已自动载入上次保存的工作参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认工作参数；保存后下次会自动填入。")
 
             with gr.Tab("批处理", elem_id="llm_prompt_studio_batch_tab"):
+                with gr.Row(elem_classes=["lps-form-row"]):
+                    batch_preset = gr.Dropdown(
+                        label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"],
+                        elem_id="llm_prompt_studio_batch_preset",
+                    )
+                    batch_base_model = gr.Dropdown(
+                        label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"],
+                        elem_id="llm_prompt_studio_batch_base_model",
+                    )
+                    batch_safety = gr.Radio(
+                        label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"],
+                        elem_id="llm_prompt_studio_batch_safety",
+                    )
                 with gr.Tabs():
-                    with gr.Tab("LLM 批量生成"):
+                    with gr.Tab("服务端批量生成（仅 Prompt）"):
                         gr.Markdown(
-                            "同一批输入可以直接生成并缓存到 SQLite，也可以生成到 Forge 生图队列后逐条追加/覆盖 Prompt。"
-                            "每条去重后的输入只发送一次 LLM 请求。"
+                            "服务端逐行调用 LLM，只生成并缓存 Prompt，不会自动启动 Forge 生图；下方浏览器队列是独立链路。重复要求也会分别调用 LLM。"
                         )
                         batch_sources = gr.Textbox(
                             label="批量创作要求（每行一条）", lines=12,
@@ -1998,16 +2017,23 @@ def on_ui_tabs():
                         )
                         auto_loop_request = batch_sources
                         with gr.Row():
-                            batch_skip_existing = gr.Checkbox(label="跳过相同输入的已有缓存", value=workflow["batch_skip_existing"])
+                            batch_skip_existing = gr.Checkbox(
+                                label="跳过批次开始前已有缓存的要求（取消勾选可重复生成）",
+                                value=workflow["batch_skip_existing"],
+                            )
                             batch_skip_failed = gr.Checkbox(label="单条失败后跳过并继续", value=workflow["batch_skip_failed"])
-                        gr.Markdown("批量结果统一保存为未评分；需要进入 RAG 时，请在缓存库中明确选择并执行 LLM 评分。")
+                        gr.Markdown("批量结果统一保存为未评分，可稍后在缓存编辑器中手动调整评分。")
                         with gr.Row():
                             batch_preview_button = gr.Button("预览生成队列")
                             batch_generate = gr.Button("开始生成并缓存", variant="primary")
                             batch_cancel = gr.Button("取消批量任务", variant="stop")
                             save_batch_workflow = gr.Button("保存批量与工作参数")
                         batch_preview_status = gr.Markdown()
-                        batch_queue = gr.Dataframe(headers=["序号", "输入", "状态"], datatype=["number", "str", "str"], interactive=False, wrap=True, label="队列预览")
+                        batch_queue = gr.Dataframe(
+                            value=[], headers=["序号", "输入", "生成结果", "状态"],
+                            datatype=["number", "str", "str", "str"], interactive=False, wrap=True,
+                            label="批量输入与生成结果（最多显示 200 条）",
+                        )
                         batch_status = gr.Markdown("尚未开始批量任务。取消会在当前 HTTP 请求返回后生效，已完成结果会保留。", elem_id="llm_prompt_studio_batch_status", elem_classes=["lps-status"])
                         batch_task_id = gr.State(lambda: uuid.uuid4().hex)
                         batch_issue_state = gr.State([])
@@ -2021,11 +2047,8 @@ def on_ui_tabs():
                             batch_select_all_issues = gr.Button("全选错误与跳过项")
                             batch_clear_issue_selection = gr.Button("清空选择")
                             batch_retry_selected = gr.Button("重新提交所选（每条一次）", variant="primary")
-                        with gr.Accordion("Forge Prompt 队列与自动生图", open=True, elem_id="llm_prompt_studio_auto_loop_tab"):
-                            gr.Markdown(
-                                "生成到浏览器队列后，可以先检查再投入生图，也可以一键生成并立即生图。"
-                                "勾选 SQLite 缓存时只保存结果和来源，不自动评分；需要进入高分 RAG 的记录可稍后在缓存库执行 LLM 评分。"
-                            )
+                        with gr.Accordion("另一条路径：浏览器生图队列（可选）", open=False, elem_id="llm_prompt_studio_auto_loop_tab"):
+                            gr.Markdown("这里不会读取上方已生成结果，而会重新调用 LLM 建立浏览器队列，再逐条写入 txt2img/img2img 并生图。")
                             with gr.Row(elem_classes=["lps-form-row"]):
                                 auto_loop_target = gr.Radio(
                                     label="生图目标", choices=[("txt2img", "txt2img"), ("img2img", "img2img")],
@@ -2048,8 +2071,8 @@ def on_ui_tabs():
                                     elem_id="llm_prompt_studio_auto_loop_cycles",
                                 )
                             with gr.Row():
-                                auto_loop_start = gr.Button("生成到生图队列", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
-                                auto_loop_generate_run = gr.Button("生成并立即生图", variant="primary", elem_id="llm_prompt_studio_auto_loop_generate_run")
+                                auto_loop_start = gr.Button("重新调用 LLM 并加入生图队列", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
+                                auto_loop_generate_run = gr.Button("重新调用 LLM 并立即生图", variant="primary", elem_id="llm_prompt_studio_auto_loop_generate_run")
                                 auto_loop_run = gr.Button("投入已有队列生图", elem_id="llm_prompt_studio_auto_loop_run")
                                 auto_loop_clear = gr.Button("清空队列", elem_id="llm_prompt_studio_auto_loop_clear")
                                 auto_loop_cancel = gr.Button("取消当前阶段", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
@@ -2089,7 +2112,6 @@ def on_ui_tabs():
                         gr.Markdown("", elem_id="llm_prompt_studio_png_batch_results")
                         png_batch_status = gr.HTML("等待导入 JSON。", elem_id="llm_prompt_studio_png_batch_status", elem_classes=["lps-status"])
                         png_batch_append_succeeded = gr.Checkbox(value=False, visible=False, elem_id="llm_prompt_studio_png_batch_append_succeeded")
-                        png_batch_task_id = gr.State(lambda: uuid.uuid4().hex)
                         png_batch_file.change(
                             _png_batch_load,
                             inputs=png_batch_file,
@@ -2124,7 +2146,6 @@ def on_ui_tabs():
                 with gr.Row():
                     load_selected = gr.Button("载入所选单条")
                     preview_selected = gr.Button("预览所选")
-                    score_selected = gr.Button("使用 LLM 评分所选")
                     delete_selected = gr.Button("删除所选", variant="stop")
                 selection_preview = gr.Textbox(label="选择 / 删除预览", lines=6, interactive=False)
                 table = gr.Dataframe(
@@ -2133,7 +2154,7 @@ def on_ui_tabs():
                     datatype=["number", "number", "number", "str", "str", "str", "str", "str", "str", "str", "str", "str", "str"],
                     interactive=False, wrap=True, elem_id="llm_prompt_studio_cache_table", elem_classes=["lps-table"],
                 )
-                with gr.Accordion("记录编辑器", open=True):
+                with gr.Accordion("记录编辑器", open=False):
                     with gr.Row():
                         record_id = gr.Textbox(label="当前内部 ID", interactive=False)
                         record_output_mode = gr.Dropdown(label="格式", choices=PRESET_UI_CHOICES, value=workflow["preset"])
@@ -2150,7 +2171,7 @@ def on_ui_tabs():
                     with gr.Row():
                         preview_positions = gr.Button("预览这些序号")
                         delete_positions = gr.Button("删除这些序号", variant="stop")
-                with gr.Accordion("Ranbooru 缓存联动", open=True):
+                with gr.Accordion("Ranbooru 缓存联动", open=False):
                     ranbooru_database_path = gr.Textbox(
                         label="Ranbooru tag_cache.db 路径", value=ranbooru_link["database_path"],
                     )
@@ -2199,7 +2220,7 @@ def on_ui_tabs():
                         datatype=["number", "str", "str", "number", "str", "str", "str", "str"],
                         interactive=False, wrap=True, label="Ranbooru 同步预览",
                     )
-                    with gr.Accordion("Ranbooru 实时交接箱", open=True):
+                    with gr.Accordion("Ranbooru 实时交接箱", open=False):
                         handoff_selection = gr.Dropdown(
                             label="选择交接记录",
                             choices=initial_handoff_choices.get("choices", []),
@@ -2254,8 +2275,11 @@ def on_ui_tabs():
                 with gr.Tabs(elem_id="llm_prompt_studio_tools_tabs"):
                     with gr.Tab("静态词库", elem_id="llm_prompt_studio_wildcards_tab"):
                         wildcard_path = gr.Textbox(label="静态词库目录", value=workflow["wildcard_path"], elem_id="llm_prompt_studio_wildcard_path")
-                        index = gr.Button("建立 / 刷新本地索引", elem_id="llm_prompt_studio_wildcard_index", elem_classes=["lps-primary"])
-                        wildcard_status = gr.Markdown(elem_id="llm_prompt_studio_wildcard_status", elem_classes=["lps-status"])
+                        wildcard_status = gr.Markdown(
+                            "索引会在插件启动、页面加载和目录变更时自动增量刷新。",
+                            elem_id="llm_prompt_studio_wildcard_status",
+                            elem_classes=["lps-status"],
+                        )
                         wildcard_query = gr.Textbox(label="搜索已索引词条", elem_id="llm_prompt_studio_wildcard_query")
                         wildcard_results = gr.Dropdown(label="匹配结果", choices=[], multiselect=True, elem_id="llm_prompt_studio_wildcard_results")
                     with gr.Tab("WD14 + LLM", elem_id="llm_prompt_studio_wd14_tab"):
@@ -2273,33 +2297,55 @@ def on_ui_tabs():
         workflow_inputs = [
             preset, system_override, base_model, safety, nsfw_injection, user_instruction,
             structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
-            few_shot_count, rag_min_score, save_score, cache_result, auto_score,
+            few_shot_count, rag_min_score, save_score, cache_result,
             batch_skip_existing, batch_skip_failed,
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
-        generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result, auto_score], outputs=[output, system_preview, status])
+        batch_workflow_inputs = [
+            batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction,
+            structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
+            few_shot_count, rag_min_score, save_score, cache_result,
+            batch_skip_existing, batch_skip_failed,
+            wd_endpoint, wd_model, wd_threshold, wildcard_path,
+        ]
+        generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
         auto_loop_dispatch.click(
             _generate_auto_loop,
-            inputs=[request, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, auto_loop_cache_result],
+            inputs=[request, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, auto_loop_cache_result],
             outputs=[output, system_preview, status],
         )
         save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
-        save_batch_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=batch_status)
+        save_batch_workflow.click(_save_workflow_settings, inputs=batch_workflow_inputs, outputs=batch_status)
         reset_workflow.click(_reset_workflow_settings, outputs=[*workflow_inputs, workflow_status])
+        preset.change(_sync_value, inputs=preset, outputs=batch_preset, queue=False)
+        batch_preset.input(_sync_value, inputs=batch_preset, outputs=preset, queue=False)
+        base_model.change(_sync_value, inputs=base_model, outputs=batch_base_model, queue=False)
+        batch_base_model.input(_sync_value, inputs=batch_base_model, outputs=base_model, queue=False)
+        safety.change(_sync_value, inputs=safety, outputs=batch_safety, queue=False)
+        batch_safety.input(_sync_value, inputs=batch_safety, outputs=safety, queue=False)
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
         save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint, model])
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
+        ui.load(
+            _load_active_connection_settings,
+            outputs=[provider, endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status],
+        )
+        ui.load(
+            _index_wildcards,
+            inputs=wildcard_path,
+            outputs=[wildcard_status, wildcard_results],
+        )
         png_batch_payload.input(_png_batch_refresh, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_table, png_batch_selection, png_batch_current, png_batch_status])
         png_batch_previous.click(_png_batch_move, inputs=[png_batch_payload, png_batch_selection, gr.State(-1)], outputs=[png_batch_selection, png_batch_current])
         png_batch_next.click(_png_batch_move, inputs=[png_batch_payload, png_batch_selection, gr.State(1)], outputs=[png_batch_selection, png_batch_current])
         png_batch_selection.change(_png_batch_current, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_selection, png_batch_current])
         png_batch_run.click(
             _png_batch_run,
-            inputs=[png_batch_payload, png_batch_action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, png_batch_task_id, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count],
+            inputs=[png_batch_payload, png_batch_action, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count],
             outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status],
         )
-        png_batch_cancel.click(_cancel_png_batch, inputs=png_batch_task_id, outputs=png_batch_status, queue=False)
+        png_batch_cancel.click(_cancel_png_batch, outputs=png_batch_status, queue=False)
         png_batch_export.click(_png_batch_export_file, inputs=png_batch_payload, outputs=png_batch_export)
         png_append_event = png_batch_append_button.click(
             fn=None,
@@ -2345,7 +2391,11 @@ def on_ui_tabs():
             js="() => window.llmPromptStudioAutoLoop.clearQueue()",
             queue=False,
         )
-        index.click(_index_wildcards, inputs=wildcard_path, outputs=[wildcard_status, wildcard_results])
+        wildcard_path.change(
+            _index_wildcards,
+            inputs=wildcard_path,
+            outputs=[wildcard_status, wildcard_results],
+        )
         wildcard_query.change(_search_wildcards, inputs=wildcard_query, outputs=wildcard_results)
         interrogate.click(_wd14_interrogate, inputs=[image, wd_endpoint, wd_model, wd_threshold], outputs=[wd_tags, wd_status])
         transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[transform_output, wd_status])
@@ -2395,29 +2445,24 @@ def on_ui_tabs():
         selected_records.input(_load_selected_record, inputs=selected_records, outputs=record_outputs)
         load_selected.click(_load_selected_record, inputs=selected_records, outputs=record_outputs)
         preview_selected.click(_preview_selected, inputs=selected_records, outputs=[selection_preview, delete_preview_state])
-        score_selected.click(
-            _score_selected_records,
-            inputs=[selected_records, provider, endpoint, model, api_key, timeout, send_temperature, *cache_filter_inputs],
-            outputs=[cache_status, table, selected_records],
-        )
         delete_selected.click(_delete_previewed_records, inputs=[selected_records, delete_preview_state, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
         save.click(_save_record, inputs=[record_id, record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
         save_as_new.click(_save_record_as_new, inputs=[record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
         bulk_preview_button.click(_preview_bulk_cache, inputs=[bulk_import, bulk_output_mode, bulk_base_model, bulk_default_score], outputs=[bulk_preview, bulk_import_status])
         bulk_import_button.click(_bulk_cache, inputs=[bulk_import, bulk_output_mode, bulk_base_model, bulk_default_score, *cache_filter_inputs], outputs=[bulk_import_status, table, selected_records])
-        batch_preview_button.click(_preview_batch_sources, inputs=[batch_sources, batch_skip_existing, preset, base_model], outputs=[batch_queue, batch_preview_status])
+        batch_preview_button.click(_preview_batch_sources, inputs=[batch_sources, batch_skip_existing, batch_preset, batch_base_model], outputs=[batch_queue, batch_preview_status])
         batch_generate.click(
             _batch_generate,
-            inputs=[batch_sources, batch_skip_existing, batch_skip_failed, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_issue_state, batch_task_id],
-            outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state],
+            inputs=[batch_sources, batch_skip_existing, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_issue_state, batch_task_id],
+            outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state, batch_queue],
         )
         batch_cancel.click(_cancel_batch_generation, inputs=batch_task_id, outputs=batch_status)
         batch_select_all_issues.click(_select_all_batch_issues, inputs=batch_issue_state, outputs=batch_issue_selection)
         batch_clear_issue_selection.click(_clear_batch_issue_selection, outputs=batch_issue_selection)
         batch_retry_selected.click(
             _retry_batch_issues,
-            inputs=[batch_issue_selection, batch_issue_state, batch_skip_failed, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_task_id],
-            outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state],
+            inputs=[batch_issue_selection, batch_issue_state, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_task_id],
+            outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state, batch_queue],
         )
         preview_positions.click(_preview_positions, inputs=position_spec, outputs=[cache_status, table, selected_records])
         delete_positions.click(_delete_positions, inputs=[position_spec, *cache_filter_inputs], outputs=[cache_status, table, selected_records])

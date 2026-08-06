@@ -55,6 +55,7 @@ function createRuntime(initialQueue = [], options = {}) {
     const generalButton = { disabled: false, matches: () => true };
     let dispatchClicks = 0;
     let generateClicks = 0;
+    const promptHistory = [];
     let interruptClicks = 0;
     const generated = Array.isArray(options.generated) ? [...options.generated] : [options.generated || "new prompt"];
     const dispatchButton = {
@@ -73,8 +74,10 @@ function createRuntime(initialQueue = [], options = {}) {
     };
     const forgeGenerate = {
         disabled: false,
+        matches: () => true,
         click() {
             generateClicks += 1;
+            promptHistory.push(inputs.txt2img_prompt.value);
             this.disabled = true;
             setTimeout(() => {
                 forgeStatusHost.textContent = options.forgeFailure ? "Error: generation failed" : "completed";
@@ -85,6 +88,7 @@ function createRuntime(initialQueue = [], options = {}) {
     };
     const interrupt = {
         offsetParent: {},
+        matches: () => true,
         click() {
             interruptClicks += 1;
             forgeGenerate.disabled = false;
@@ -145,6 +149,7 @@ function createRuntime(initialQueue = [], options = {}) {
         get generateClicks() { return generateClicks; },
         get interruptClicks() { return interruptClicks; },
         promptValue(target = "txt2img") { return inputs[`${target}_prompt`].value; },
+        promptHistory() { return [...promptHistory]; },
         queue() {
             const raw = values.get(QUEUE_KEY);
             const stored = raw ? JSON.parse(raw) : [];
@@ -154,19 +159,6 @@ function createRuntime(initialQueue = [], options = {}) {
 }
 
 async function main() {
-    const unsupportedValues = new Map([[QUEUE_KEY, "[]"]]);
-    const unsupportedBrowser = createRuntime([], { values: unsupportedValues, generated: ["must not dispatch"], noWebLocks: true });
-    const secondUnsupportedBrowser = createRuntime([], { values: unsupportedValues, generated: ["also must not dispatch"], noWebLocks: true });
-    const [unsupportedMessage, secondUnsupportedMessage] = await Promise.all([
-        unsupportedBrowser.api.generateBatch({ request: "unsupported browser one" }),
-        secondUnsupportedBrowser.api.generateBatch({ request: "unsupported browser two" }),
-    ]);
-    assert.equal(unsupportedBrowser.dispatchClicks, 0);
-    assert.equal(secondUnsupportedBrowser.dispatchClicks, 0);
-    assert.match(unsupportedBrowser.autoStatusHost.innerHTML, /Web Locks/);
-    assert.match(unsupportedMessage, /Web Locks/);
-    assert.match(secondUnsupportedMessage, /Web Locks/);
-
     const migrated = createRuntime([
         { index: 4, prompt: "  same   prompt ", status: "pending", requestId: "same request" },
         { index: 8, prompt: "same prompt", status: "completed", requestId: "same request" },
@@ -197,31 +189,39 @@ async function main() {
     assert.match(persistenceFailure.autoStatusHost.innerHTML, /not persistent/i);
     assert.match(persistedMessage, /1/);
 
-    const leaseValues = new Map([[QUEUE_KEY, "[]"]]);
-    const leaseOwner = createRuntime([], { values: leaseValues, generated: ["owned prompt"], llmDelay: 80 });
-    const ownedRun = leaseOwner.api.generateBatch({ request: "owner request" });
+    const localBusy = createRuntime([], { generated: ["owned prompt"], llmDelay: 80 });
+    const ownedRun = localBusy.api.generateBatch({ request: "owner request" });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const blockedTab = createRuntime([], { values: leaseValues, generated: ["must not dispatch"] });
-    const blockedMessage = await blockedTab.api.generateBatch({ request: "other request" });
-    assert.equal(blockedTab.dispatchClicks, 0);
-    assert.match(blockedMessage, /另一标签页/);
+    const blockedMessage = await localBusy.api.generateBatch({ request: "other request" });
+    assert.equal(localBusy.dispatchClicks, 1);
+    assert.match(blockedMessage, /已有队列任务/);
     await ownedRun;
 
-    const racedLease = createRuntime([], { generated: ["must not dispatch"], foreignLeaseAfterSet: true });
-    const racedMessage = await racedLease.api.generateBatch({ request: "raced request" });
-    assert.equal(racedLease.dispatchClicks, 0);
-    assert.match(racedMessage, /另一标签页/);
+    const staleLeaseValues = new Map([[QUEUE_KEY, JSON.stringify({
+        version: 2, rows: [], requestIds: [], activeOwner: "old-tab", activeUntil: Date.now() + 60_000,
+    })]]);
+    const staleLease = createRuntime([], { values: staleLeaseValues, generated: ["fresh after reload"] });
+    assert.doesNotMatch(staleLease.autoStatusHost.innerHTML, /另一标签页/);
+    await staleLease.api.generateBatch({ request: "reload request" });
+    assert.equal(staleLease.dispatchClicks, 1);
 
     const sharedValues = new Map([[QUEUE_KEY, "[]"]]);
     const firstRun = createRuntime([], { values: sharedValues, generated: ["first result"] });
     await firstRun.api.generateBatch({ request: "Repeat   Request" });
-    const secondRun = createRuntime([], { values: sharedValues, generated: ["must not run"] });
+    const secondRun = createRuntime([], { values: sharedValues, generated: ["second result"] });
     const repeated = await secondRun.api.generateBatch({ request: "repeat request" });
-    assert.equal(secondRun.dispatchClicks, 0);
-    assert.match(repeated, /0/);
-    secondRun.api.clearQueue();
-    await secondRun.api.generateBatch({ request: "repeat request" });
     assert.equal(secondRun.dispatchClicks, 1);
+    assert.match(repeated, /1/);
+
+    const explicitSkip = createRuntime([], { values: sharedValues, generated: ["must not run"] });
+    const skipped = await explicitSkip.api.generateBatch({ request: "repeat request", allowRepeat: false });
+    assert.equal(explicitSkip.dispatchClicks, 0);
+    assert.match(skipped, /0/);
+
+    const repeatedLines = createRuntime([], { generated: ["variation one", "variation two"] });
+    await repeatedLines.api.generateBatch({ request: "same request\nsame request" });
+    assert.equal(repeatedLines.dispatchClicks, 2);
+    assert.deepEqual(repeatedLines.queue().map((row) => row.prompt), ["variation one", "variation two"]);
 
     const onlyNew = createRuntime([
         { index: 1, id: "old", prompt: "historical pending", status: "pending", requestId: "old request", batchId: "old-batch" },
@@ -248,6 +248,14 @@ async function main() {
     assert.equal(appendRun.queue()[0].status, "completed");
     assert.equal(appendRun.promptValue(), "base, new details");
     assert.match(appendRun.logHost.innerHTML, /new details/);
+
+    const multiAppendRun = createRuntime([
+        { index: 1, id: "append-one", prompt: "first details", status: "pending", requestId: "append one", batchId: "append-batch" },
+        { index: 2, id: "append-two", prompt: "second details", status: "pending", requestId: "append two", batchId: "append-batch" },
+    ]);
+    await multiAppendRun.api.runStored({ target: "txt2img", writeMode: "append" });
+    assert.deepEqual(multiAppendRun.promptHistory(), ["base, first details", "base, second details"]);
+    assert.equal(multiAppendRun.promptValue(), "base, second details");
 
     const continuousRun = createRuntime([], { generated: ["cycle prompt", "cycle prompt"] });
     const continuousResult = await continuousRun.api.generateAndRun({

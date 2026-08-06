@@ -30,7 +30,6 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "wildcards": ui.DEFAULT_WILDCARDS,
             "call_llm": ui.call_llm,
             "generate": ui._generate,
-            "evaluate_prompt_quality": ui.evaluate_prompt_quality,
             "modules": sys.modules.get("modules"),
             "modules.shared": sys.modules.get("modules.shared"),
         }
@@ -59,7 +58,6 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         ui.DEFAULT_WILDCARDS = self.originals["wildcards"]
         ui.call_llm = self.originals["call_llm"]
         ui._generate = self.originals["generate"]
-        ui.evaluate_prompt_quality = self.originals["evaluate_prompt_quality"]
         with ui._BATCH_CONTROL_LOCK:
             ui._BATCH_ACTIVE_TASK_ID = ""
             ui._BATCH_CANCEL.clear()
@@ -137,7 +135,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["natural_prompt"], payload["natural_prompt"])
 
     async def test_ranbooru_handoff_process_sends_once_and_keeps_failed_record(self):
-        ui.DB.set_setting("workflow_settings_v1", {"auto_score": True})
+        ui.DB.set_setting("workflow_settings_v1", {})
         calls = []
 
         def fail_llm(*_args, **_kwargs):
@@ -163,7 +161,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui._handoff_safety("e"), "NSFW")
 
     async def test_ranbooru_handoff_unexpected_exception_is_not_retried_and_is_recorded(self):
-        ui.DB.set_setting("workflow_settings_v1", {"auto_score": True})
+        ui.DB.set_setting("workflow_settings_v1", {})
         calls = []
 
         def fail_generate(*_args, **_kwargs):
@@ -187,7 +185,6 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_ranbooru_handoff_process_caches_with_source_provenance(self):
         ui.DB.set_setting("workflow_settings_v1", {
             "preset": "NoobAI Tags", "base_model": "NoobAI",
-            "auto_score": True,
         })
         calls = []
 
@@ -196,7 +193,6 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             return "1girl, red_hair"
 
         ui.call_llm = generate_once
-        ui.evaluate_prompt_quality = lambda *_args, **_kwargs: self.fail("handoff must not send an LLM scoring request")
         payload = {
             "ranbooru_id": 19,
             "database_key": "abcdef0123456789",
@@ -363,6 +359,32 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ui.CREDENTIALS.resolve("", "Anthropic", anthropic["endpoint"]), "")
         self.assertEqual(ui.CREDENTIALS.resolve("", "Google Gemini", gemini["endpoint"]), "gemini-key")
 
+    async def test_saved_model_is_restored_after_database_reopen_and_page_load(self):
+        message, _, _ = ui._save_llm_settings(
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "local-model", "", 0.35, 90, 1024, True,
+        )
+        self.assertIn("模型 ID：local-model", message)
+
+        ui.DB = StudioDB(ui.DB.path)
+        loaded = ui._load_active_connection_settings()
+
+        self.assertEqual(loaded[0], "OpenAI Compatible")
+        self.assertEqual(loaded[1], "http://127.0.0.1:1234/v1")
+        self.assertEqual(loaded[2], "local-model")
+
+    async def test_empty_model_cannot_overwrite_saved_connection(self):
+        before = ui._connection_settings("OpenAI Compatible")
+
+        message, endpoint_update, model_update = ui._save_llm_settings(
+            "OpenAI Compatible", "http://127.0.0.1:9999/v1", "", "", 0.5, 120, 2048, True,
+        )
+
+        self.assertIn("保存失败", message)
+        self.assertIn("LLM model ID is required", message)
+        self.assertEqual(endpoint_update, ui.gr.update())
+        self.assertEqual(model_update, ui.gr.update())
+        self.assertEqual(ui._connection_settings("OpenAI Compatible"), before)
+
     async def test_provider_ui_choices_are_derived_from_registry(self):
         self.assertEqual(
             [provider for _, provider in ui.PROVIDER_UI_CHOICES],
@@ -436,7 +458,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         app = FastAPI()
         ui.on_app_started(None, app)
 
-        for field in ("send_temperature", "remove_bad", "shuffle", "spaces", "cache_result", "auto_score"):
+        for field in ("send_temperature", "remove_bad", "shuffle", "spaces", "cache_result"):
             for value in ("false", 0, None):
                 payload = {"request": "test", field: value}
                 with self.subTest(field=field, value=value):
@@ -452,7 +474,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         try:
             generated, system, status, prompt_update = ui._inline_generate(
                 "request", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
-                0, 0, True, "", False, False, 0, "Plain Prompt", 1, 0, False, False,
+                0, 0, True, "", False, False, 0, "Plain Prompt", 1, 0, False,
             )
         finally:
             ui._generate = original_generate
@@ -494,7 +516,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         message = ui._save_workflow_settings(
             "NoobAI Tags", "custom system", "NoobAI", "NSFW", "local policy", "最多 40 个标签",
             "Regional JSON", 4, True, "watermark", True, True, 40,
-            5, 8.5, 9, True, True,
+            5, 8.5, 9, True,
             False, True,
             "http://127.0.0.1:7861", "wd-test", 0.42, str(self.lexicon),
         )
@@ -504,35 +526,41 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored["preset"], "NoobAI Tags")
         self.assertEqual(restored["base_model"], "NoobAI")
         self.assertEqual(restored["structured_mode"], "Regional JSON")
-        self.assertTrue(restored["auto_score"])
         self.assertTrue(restored["batch_skip_failed"])
+        self.assertFalse(restored["batch_skip_existing"])
+        self.assertEqual(ui.DB.get_setting("workflow_settings_v1")["version"], 2)
         self.assertEqual(restored["wd_model"], "wd-test")
         self.assertEqual(restored["wildcard_path"], str(self.lexicon))
 
         reset_values = ui._reset_workflow_settings()
-        self.assertEqual(len(reset_values), 25)
+        self.assertEqual(len(reset_values), 24)
         self.assertEqual(reset_values[0], ui.WORKFLOW_DEFAULTS["preset"])
         self.assertIn("已恢复默认", reset_values[-1])
         self.assertIsNone(ui.DB.get_setting("workflow_settings_v1"))
 
-    async def test_generated_cache_uses_llm_score_and_provenance(self):
-        ui.evaluate_prompt_quality = lambda *_args, **_kwargs: {"score": 8.7, "reason": "Model-compatible ordering"}
+    async def test_legacy_workflow_migrates_batch_cache_skipping_to_opt_in(self):
+        ui.DB.set_setting("workflow_settings_v1", {"version": 1, "batch_skip_existing": True})
 
+        restored = ui._workflow_settings()
+
+        self.assertFalse(restored["batch_skip_existing"])
+
+    async def test_generated_cache_uses_manual_score_without_extra_llm_request(self):
         generated, _system, status = ui._generate(
             "red-haired mage", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "judge-model", "",
             0.35, 90, 1024, True, 0, 0,
             True, "", False, False, 0, "Plain Prompt", 1,
-            4, True, True,
+            4, True,
         )
         record = ui.DB.list_prompts()[0]
 
         self.assertTrue(generated)
-        self.assertEqual(record["score"], 8.7)
-        self.assertEqual(record["score_source"], "llm")
-        self.assertEqual(record["score_model"], "judge-model")
-        self.assertEqual(record["score_reason"], "Model-compatible ordering")
-        self.assertIn("LLM 评分 8.7/10", status)
+        self.assertEqual(record["score"], 4)
+        self.assertEqual(record["score_source"], "manual")
+        self.assertEqual(record["score_model"], "")
+        self.assertEqual(record["score_reason"], "生成时手动评分")
+        self.assertIn("生成完成", status)
 
     async def test_generation_rejects_prompt_emptied_by_postprocessing(self):
         ui.call_llm = lambda *_args, **_kwargs: "watermark, signature"
@@ -542,7 +570,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
             0.35, 90, 1024, True, 0, 0,
             True, "", False, False, 0, "Plain Prompt", 1,
-            0, True, False,
+            0, True,
         )
 
         self.assertEqual(generated, "")
@@ -555,7 +583,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
             0.35, 90, 1024, True, 0, 0,
             True, "", False, False, 0, "Plain Prompt", 1,
-            0, True, False,
+            0, True,
         )
 
         ui._generate(*args)
@@ -563,39 +591,19 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(ui.DB.list_prompts()), 1)
 
-    async def test_failed_llm_score_is_cached_as_unrated_zero(self):
-        def fail_score(*_args, **_kwargs):
-            raise RuntimeError("judge unavailable")
-
-        ui.evaluate_prompt_quality = fail_score
+    async def test_cache_score_does_not_call_llm_evaluator(self):
         _generated, _system, status = ui._generate(
             "red-haired mage", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "judge-model", "",
             0.35, 90, 1024, True, 0, 0,
             True, "", False, False, 0, "Plain Prompt", 1,
-            9, True, True,
+            9, True,
         )
         record = ui.DB.list_prompts()[0]
 
-        self.assertEqual(record["score"], 0)
-        self.assertEqual(record["score_source"], "unrated")
-        self.assertIn("不进入高分 RAG", status)
-
-    async def test_selected_manual_cache_can_be_scored_by_llm(self):
-        record_id = ui.DB.save_prompt("manual prompt", output_mode="NoobAI Tags", base_model="NoobAI", score=9, tags="source")
-        ui.evaluate_prompt_quality = lambda *_args, **_kwargs: {"score": 7.6, "reason": "Good source fidelity"}
-
-        results = list(ui._score_selected_records(
-            [str(record_id)], "OpenAI Compatible", "http://127.0.0.1:1234/v1", "judge-model", "",
-            90, True, "", 0, "全部", "全部",
-        ))
-        status, _table, _choices = results[-1]
-        record = ui.DB.get_prompt(record_id)
-
-        self.assertIn("成功 1", status)
-        self.assertEqual(record["score"], 7.6)
-        self.assertEqual(record["score_source"], "llm")
-        self.assertEqual(record["score_reason"], "Good source fidelity")
+        self.assertEqual(record["score"], 9)
+        self.assertEqual(record["score_source"], "manual")
+        self.assertIn("生成完成", status)
 
     async def test_manual_cache_edit_invalidates_previous_llm_score(self):
         record_id = ui.DB.save_prompt(
@@ -688,13 +696,16 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "8\tfirst prompt\nsecond prompt\n# note", "NoobAI Tags", "NoobAI", 6,
         )
 
-        self.assertEqual(len(queue["value"]), 2)
+        self.assertEqual(len(queue["value"]), 3)
+        self.assertEqual(len(queue["value"][0]), 4)
+        self.assertEqual(queue["value"][0][2], "")
         self.assertIn("重复输入 1 条", status)
+        self.assertIn("均保留为独立任务", status)
         self.assertEqual(direct["value"][0][1], 8)
         self.assertEqual(direct["value"][1][1], 6)
         self.assertIn("2 条可导入", direct_status)
 
-    async def test_batch_sends_each_unique_prompt_once_and_collects_errors_and_cached_skips(self):
+    async def test_batch_sends_each_input_line_and_collects_errors_and_cached_skips(self):
         ui.DB.save_prompt("already cached", "", "NoobAI Tags", "NoobAI", 7, "cached")
         attempts = {}
 
@@ -706,16 +717,55 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         ui._generate = fake_generate
         results = list(ui._batch_generate(*self._batch_args("once\nonce\ncached\nbad")))
-        status, _table, _choices, issue_table, issue_choices, issue_state = results[-1]
+        status, _table, _choices, issue_table, issue_choices, issue_state, result_rows = results[-1]
 
-        self.assertEqual(attempts, {"once": 1, "bad": 1})
-        self.assertIn("LLM 请求 2", status)
+        self.assertEqual(attempts, {"once": 2, "bad": 1})
+        self.assertIn("LLM 请求 3", status)
         self.assertIn("问题汇总 2 条", status)
         self.assertEqual([item["status"] for item in issue_state], ["已跳过", "生成错误"])
         self.assertEqual(issue_state[1]["attempts"], 1)
         self.assertEqual(len(issue_table["value"]), 2)
         self.assertEqual(len(issue_choices["choices"]), 2)
+        self.assertEqual(result_rows["value"][0][2], "1girl, generated once")
+        self.assertEqual(result_rows["value"][0][3], "生成成功")
         self.assertTrue(ui.DB.has_source_prompt("once", "NoobAI Tags", "NoobAI"))
+
+    async def test_batch_repeats_same_request_and_keeps_distinct_results(self):
+        attempt = 0
+        directives = []
+
+        def fake_generate(source, *_args):
+            nonlocal attempt
+            attempt += 1
+            directives.append(_args[-1])
+            return f"1girl, scene_{attempt}", "", "生成完成"
+
+        ui._generate = fake_generate
+        results = list(ui._batch_generate(*self._batch_args("same request\nsame request", False, True)))
+        status = results[-1][0]
+        records = ui.DB.list_prompts()
+
+        self.assertEqual(attempt, 2)
+        self.assertIn("LLM 请求 2", status)
+        self.assertEqual({record["prompt"] for record in records}, {"1girl, scene_1", "1girl, scene_2"})
+        self.assertIn("独立任务第 1/2 条", directives[0])
+        self.assertIn("独立任务第 2/2 条", directives[1])
+        self.assertNotEqual(directives[0], directives[1])
+
+    async def test_batch_cache_skip_only_considers_records_existing_at_batch_start(self):
+        attempt = 0
+
+        def fake_generate(source, *_args):
+            nonlocal attempt
+            attempt += 1
+            return f"1girl, variation_{attempt}", "", "生成完成"
+
+        ui._generate = fake_generate
+        repeated = "\n".join(["same request"] * 12)
+        results = list(ui._batch_generate(*self._batch_args(repeated, True, True)))
+
+        self.assertEqual(attempt, 12)
+        self.assertIn("LLM 请求 12", results[-1][0])
 
     async def test_batch_parser_does_not_silently_truncate_large_queues(self):
         sources, stats = ui._parse_batch_sources("\n".join(f"prompt {index}" for index in range(10001)))
@@ -740,7 +790,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result[0], "generated")
-        self.assertEqual(captured["args"][-3:], (0, False, False))
+        self.assertEqual(captured["args"][-3:], (1, 0, False))
 
         result = ui._generate_auto_loop(
             "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
@@ -749,7 +799,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "Plain Prompt", 1, True,
         )
         self.assertEqual(result[0], "generated")
-        self.assertEqual(captured["args"][-6:-3], (0, True, False))
+        self.assertEqual(captured["args"][-6:-3], (1, 0, True))
         self.assertEqual(captured["args"][-3], "auto_loop")
         self.assertTrue(captured["args"][-2].startswith("auto_loop:"))
         self.assertTrue(captured["args"][-1])
@@ -792,7 +842,6 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_cache_is_unrated_without_llm_evaluation_request(self):
         ui._generate = lambda source, *_args: (f"generated {source}", "", "生成完成")
-        ui.evaluate_prompt_quality = lambda *_args, **_kwargs: self.fail("batch scoring must not call the LLM")
 
         results = list(ui._batch_generate(*self._batch_args("alpha", False, True)))
         status = results[-1][0]
@@ -812,7 +861,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         ui._generate = fake_generate
         results = list(ui._batch_generate(*self._batch_args("bad\nlater", False, False)))
-        status, _table, _choices, _issue_table, _issue_choices, issue_state = results[-1]
+        status, _table, _choices, _issue_table, _issue_choices, issue_state, _result_rows = results[-1]
 
         self.assertEqual(calls, ["bad"])
         self.assertIn("因错误停止", status)
@@ -833,7 +882,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             {"index": 5, "source": "beta", "status": "生成错误", "reason": "超时", "attempts": 3},
         ]
         retry_args = (
-            ["alpha"], issues, True,
+            ["2:alpha"], issues, True,
             "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
             0.35, 90, 1024, True, 0, 0,
@@ -841,14 +890,38 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "", 0, "全部", "全部",
         )
         results = list(ui._retry_batch_issues(*retry_args))
-        status, _table, _choices, issue_table, issue_choices, issue_state = results[-1]
+        status, _table, _choices, issue_table, issue_choices, issue_state, _result_rows = results[-1]
 
         self.assertEqual(calls, ["alpha"])
         self.assertIn("手动重试", status)
         self.assertEqual([item["source"] for item in issue_state], ["beta"])
         self.assertEqual(issue_table["value"][0][0], 5)
-        self.assertEqual(issue_choices["choices"][0][1], "beta")
+        self.assertEqual(issue_choices["choices"][0][1], "5:beta")
         self.assertTrue(ui.DB.has_source_prompt("alpha", "NoobAI Tags", "NoobAI"))
+
+    async def test_manual_retry_selects_only_one_duplicate_issue(self):
+        calls = []
+        ui._generate = lambda source, *_args: (calls.append(source) or f"generated {source}", "", "生成完成")
+        issues = [
+            {"index": 1, "source": "same", "status": "生成错误", "reason": "超时", "attempts": 1},
+            {"index": 2, "source": "same", "status": "生成错误", "reason": "超时", "attempts": 1},
+        ]
+        retry_args = (
+            ["1:same"], issues, True,
+            "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.35, 90, 1024, True, 0, 0,
+            True, "", False, False, 0, "Plain Prompt", 1,
+            "", 0, "全部", "全部",
+        )
+
+        results = list(ui._retry_batch_issues(*retry_args))
+        _status, _table, _choices, issue_table, issue_choices, issue_state, _result_rows = results[-1]
+
+        self.assertEqual(calls, ["same"])
+        self.assertEqual([item["index"] for item in issue_state], [2])
+        self.assertEqual(issue_table["value"][0][0], 2)
+        self.assertEqual([choice[1] for choice in issue_choices["choices"]], ["2:same"])
 
     async def test_batch_cancel_collects_every_unprocessed_source(self):
         calls = []
@@ -860,7 +933,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         ui._generate = fake_generate
         results = list(ui._batch_generate(*self._batch_args("first\nsecond\nthird", False, True)))
-        status, _table, _choices, _issue_table, _issue_choices, issue_state = results[-1]
+        status, _table, _choices, _issue_table, _issue_choices, issue_state, _result_rows = results[-1]
 
         self.assertEqual(calls, ["first"])
         self.assertIn("任务已取消：处理 1/3", status)
@@ -869,7 +942,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ui.DB.has_source_prompt("first", "NoobAI Tags", "NoobAI"))
 
         selected = ui._select_all_batch_issues(issue_state)
-        self.assertEqual(selected["value"], ["second", "third"])
+        self.assertEqual(selected["value"], ["2:second", "3:third"])
 
     async def test_manual_retry_lock_contention_does_not_duplicate_issues(self):
         issues = [
@@ -877,7 +950,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             {"index": 5, "source": "beta", "status": "生成错误", "reason": "超时", "attempts": 3},
         ]
         retry_args = (
-            ["alpha"], issues, True,
+            ["2:alpha"], issues, True,
             "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
             0.35, 90, 1024, True, 0, 0,
@@ -891,11 +964,11 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             ui._BATCH_LOCK.release()
 
-        status, _table, _choices, _issue_table, issue_choices, issue_state = results[-1]
+        status, _table, _choices, _issue_table, issue_choices, issue_state, _result_rows = results[-1]
         self.assertIn("已有批量任务正在运行", status)
         self.assertEqual([item["source"] for item in issue_state], ["alpha", "beta"])
-        self.assertEqual([choice[1] for choice in issue_choices["choices"]], ["alpha", "beta"])
-        self.assertEqual(issue_choices["value"], ["alpha"])
+        self.assertEqual([choice[1] for choice in issue_choices["choices"]], ["2:alpha", "5:beta"])
+        self.assertEqual(issue_choices["value"], ["2:alpha"])
 
     async def test_only_the_owning_session_can_cancel_a_batch(self):
         with ui._BATCH_CONTROL_LOCK:

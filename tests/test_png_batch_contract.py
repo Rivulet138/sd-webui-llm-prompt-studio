@@ -138,7 +138,7 @@ class PngBatchContractTests(unittest.TestCase):
             updates = list(ui._png_batch_run(
                 payload, "Expand", "Danbooru Tags", "", "Auto / checkpoint default",
                 "SFW", "", "", "OpenAI-compatible", "http://127.0.0.1:1234",
-                "model", "", 0.3, 30, 1000, True, "large-test",
+                "model", "", 0.3, 30, 1000, True,
             ))
         finally:
             ui._expand_or_polish = original
@@ -170,7 +170,7 @@ class PngBatchContractTests(unittest.TestCase):
             updates = list(ui._png_batch_run(
                 payload, "Expand", "Danbooru Tags", "", "Auto / checkpoint default",
                 "SFW", "", "", "OpenAI-compatible", "http://127.0.0.1:1234",
-                "model", "", 0.3, 30, 1000, True, "skip-completed-test",
+                "model", "", 0.3, 30, 1000, True,
             ))
         finally:
             ui._expand_or_polish = original
@@ -198,7 +198,7 @@ class PngBatchContractTests(unittest.TestCase):
                 updates = list(ui._png_batch_run(
                     payload, "Expand", "Danbooru Tags", "", "Auto / checkpoint default",
                     "SFW", "", "", "OpenAI-compatible", "http://127.0.0.1:1234",
-                    "model", "", 0.3, 30, 1000, True, f"dedupe-{result[0]}",
+                    "model", "", 0.3, 30, 1000, True,
                 ))
             finally:
                 ui._expand_or_polish = original
@@ -242,7 +242,7 @@ class PngBatchContractTests(unittest.TestCase):
             updates = list(ui._png_batch_run(
                 payload, "Expand", "Danbooru Tags", "", "Auto / checkpoint default",
                 "SFW", "", "", "OpenAI-compatible", "http://127.0.0.1:1234",
-                "model", "", 0.3, 30, 1000, True, "test-task",
+                "model", "", 0.3, 30, 1000, True,
             ))
         finally:
             ui._expand_or_polish = original

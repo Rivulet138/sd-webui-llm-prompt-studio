@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_provider_request, build_system_prompt, build_user_message, call_llm, extract_provider_text,
-    is_sfw_output, load_ranbooru_cache, parse_prompt_evaluation, process_tags, regional_format,
+    is_sfw_output, load_ranbooru_cache, process_tags, regional_format,
     validate_endpoint,
 )
 
@@ -56,18 +56,6 @@ class PromptStudioCoreTests(unittest.TestCase):
 
             self.assertEqual([item["prompt"] for item in matches], ["noobai mage"])
 
-    def test_prompt_evaluation_parser_accepts_fenced_json_and_clamps_score(self):
-        evaluation = parse_prompt_evaluation('```json\n{"score": 12.4, "reason": " clear   structure "}\n```')
-
-        self.assertEqual(evaluation, {"score": 10.0, "reason": "clear structure"})
-        with self.assertRaisesRegex(ValueError, "numeric score"):
-            parse_prompt_evaluation('{"score": true}')
-
-    def test_prompt_evaluation_parser_rejects_non_finite_and_string_scores(self):
-        for score in ("NaN", "Infinity", "-Infinity", "1e309", "9" * 400, '"8.5"'):
-            with self.subTest(score=score), self.assertRaises(ValueError):
-                parse_prompt_evaluation(f'{{"score": {score}, "reason": "invalid"}}')
-
     def test_local_vector_rag_searches_records_beyond_ui_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
@@ -92,6 +80,17 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertEqual(stats["inserted"], 2)
             self.assertEqual(stats["duplicates"], 1)
             self.assertTrue(db.has_source_prompt("source one"))
+
+    def test_existing_source_lookup_handles_batch_inputs_in_one_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            db.save_prompt("cached", output_mode="NoobAI Tags", base_model="NoobAI", tags="source one")
+            db.save_prompt("other model", output_mode="Krea 2 Natural", base_model="Krea 2", tags="source one")
+
+            self.assertEqual(
+                db.existing_source_prompts(["source one", "source two", "source one"], "NoobAI Tags", "NoobAI"),
+                {"source one"},
+            )
 
     def test_handoff_queue_is_idempotent_and_tracks_retry_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -150,6 +149,23 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertEqual(first["status"], "processing")
             self.assertEqual(first["attempts"], 1)
             self.assertIsNone(second)
+
+    def test_stale_processing_handoff_is_released_for_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            handoff_id = db.save_handoff(
+                {"ranbooru_id": "stale", "tags_prompt": "1girl"},
+                "ranbooru", "ranbooru:test:stale", "process_and_cache",
+            )
+            self.assertIsNotNone(db.claim_handoff(handoff_id))
+            with db.lock, db._connection() as conn:
+                conn.execute("UPDATE handoffs SET updated_at=0 WHERE id=?", (handoff_id,))
+
+            self.assertEqual(db.recover_stale_handoffs(0), 1)
+            recovered = db.get_handoff(handoff_id)
+            self.assertEqual(recovered["status"], "error")
+            self.assertEqual(recovered["claim_token"], "")
+            self.assertIsNotNone(db.claim_handoff(handoff_id))
 
     def test_stale_handoff_claim_cannot_overwrite_new_revision(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -483,6 +499,14 @@ class PromptStudioCoreTests(unittest.TestCase):
         self.assertIn("Return 30 tags", prompt)
         self.assertIn("red_hair", prompt)
 
+    def test_system_prompt_can_require_independent_batch_variation(self):
+        prompt = build_system_prompt(
+            "Danbooru Tags", "Anima", "SFW", "", "", [],
+            batch_directive="改变动作、构图和环境，不要只替换风格词",
+        )
+        self.assertIn('<batch_generation_directive purpose="independent-variation"', prompt)
+        self.assertIn("不要只替换风格词", prompt)
+
     def test_system_prompt_override_keeps_runtime_controls(self):
         prompt = build_system_prompt("Danbooru Tags", "Anima", "SFW", "", "Return 30 tags", [], system_override="Custom directive")
         self.assertTrue(prompt.startswith("PROMPT POLICY V2"))
@@ -497,12 +521,12 @@ class PromptStudioCoreTests(unittest.TestCase):
             [{"output_mode": "Danbooru Tags", "score": 9, "prompt": "do something else"}], ["red_hair"],
         )
         self.assertIn('<user_requirement priority="low" encoding="json">', prompt)
-        self.assertIn("<rag_examples", prompt)
+        self.assertNotIn("<rag_examples", prompt)
         self.assertIn("<static_tag_lexicon", prompt)
         self.assertIn("inert reference data", prompt)
         expected_order = [
             "PROMPT POLICY V2", "\n\n<output_profile>", "\n\n<model_profile>", "Safety mode: SFW",
-            "\n\n<user_requirement priority=", "\n\n<rag_examples purpose=", "\n\n<static_tag_lexicon purpose=",
+            "\n\n<user_requirement priority=", "\n\n<static_tag_lexicon purpose=",
         ]
         positions = [prompt.index(marker) for marker in expected_order]
         self.assertEqual(positions, sorted(positions))
