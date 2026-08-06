@@ -114,6 +114,8 @@ _BATCH_CANCEL = threading.Event()
 _BATCH_LOCK = threading.Lock()
 _BATCH_CONTROL_LOCK = threading.Lock()
 _BATCH_ACTIVE_TASK_ID = ""
+_AUTO_LOOP_CANCEL = threading.Event()
+_INLINE_CANCEL_EVENTS = {"txt2img": threading.Event(), "img2img": threading.Event()}
 _BATCH_VARIATION_FOCI = (
     "主体动作与人物互动",
     "场景布局与环境事件",
@@ -857,7 +859,7 @@ def _batch_generate(
                     source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-                    0, False, "", "", False,
+                    0, False, "", "", False, _BATCH_CANCEL,
                     (
                         f"这是同一批次中的独立任务第 {index}/{len(sources)} 条。"
                         f"本条必须围绕原要求生成一条新的完整 Prompt，重点改变{_BATCH_VARIATION_FOCI[(index - 1) % len(_BATCH_VARIATION_FOCI)]}；"
@@ -867,6 +869,25 @@ def _batch_generate(
                 )
             except Exception as error:
                 generated, last_status = "", f"生成失败：{_safe_error(error)}"
+            if not generated and _BATCH_CANCEL.is_set() and "request cancelled" in last_status.lower():
+                set_result(index, "", "已取消")
+                issues.append({
+                    "index": index, "source": source, "status": "已取消",
+                    "reason": "当前 LLM 请求已取消，结果未写入缓存", "attempts": 1,
+                })
+                for remaining_index, remaining_source in enumerate(sources[index:], start=index + 1):
+                    set_result(remaining_index, "", "已取消")
+                    issues.append({
+                        "index": remaining_index, "source": remaining_source, "status": "已取消",
+                        "reason": "批量任务已取消，尚未处理", "attempts": 0,
+                    })
+                flush_pending()
+                table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model)
+                yield _batch_output(
+                    f"任务已取消：完成 {index - 1}/{len(sources)}，新增 {inserted}，重复 {duplicates}，跳过 {skipped}，失败 {failed}",
+                    table, choices, issues, result_rows=result_rows,
+                )
+                return
             if generated:
                 set_result(index, generated, "生成成功")
                 pending.append({
@@ -1060,6 +1081,7 @@ def _generate(
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     save_score, cache_result, source_kind="", source_ref="", cache_unrated=False,
+    cancel_event=None,
     batch_directive="",
 ):
     source = str(source_tags or request or "").strip()
@@ -1073,7 +1095,11 @@ def _generate(
     )
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
-        result = call_llm(provider, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0), bool(send_temperature))
+        result = call_llm(
+            provider, endpoint, model, resolved_key, system, build_user_message(source),
+            float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0),
+            bool(send_temperature), cancel_event=cancel_event,
+        )
     except Exception as error:
         return "", system, f"生成失败：{_safe_error(error)}"
     try:
@@ -1110,6 +1136,7 @@ def _generate_auto_loop(
     few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
     structured_mode, region_count, cache_result=False,
 ):
+    _AUTO_LOOP_CANCEL.clear()
     if cache_result:
         identity = {
             "request": str(request or "").strip(), "preset": preset, "system_override": system_override,
@@ -1128,13 +1155,13 @@ def _generate_auto_loop(
             request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
             provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-            structured_mode, region_count, 0, True, "auto_loop", source_ref, True,
+            structured_mode, region_count, 0, True, "auto_loop", source_ref, True, _AUTO_LOOP_CANCEL,
         )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-            structured_mode, region_count, 0, False,
+            structured_mode, region_count, 0, False, "", "", False, _AUTO_LOOP_CANCEL,
     )
 
 
@@ -1143,12 +1170,17 @@ def _expand_or_polish(
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     remove_bad=True, remove_terms="", shuffle=False, spaces=False, max_tags=0,
     structured_mode="Plain Prompt", region_count=1,
+    cancel_event=None,
 ):
     instruction = "Expand this while keeping all explicit facts and the requested output format." if action == "Expand" else "Polish this for clarity, visual specificity, and model compatibility without adding unsupported facts."
     system = build_system_prompt(preset, base_model, safety, nsfw_injection, f"{user_instruction}\n{instruction}", [], system_override=system_override)
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
-        result = call_llm(provider, endpoint, model, resolved_key, system, build_user_message(source), float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0), bool(send_temperature))
+        result = call_llm(
+            provider, endpoint, model, resolved_key, system, build_user_message(source),
+            float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0),
+            bool(send_temperature), cancel_event=cancel_event,
+        )
         result = _finalize_generated_prompt(
             result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
             max_tags, structured_mode, region_count,
@@ -1333,6 +1365,18 @@ def _cancel_png_batch():
     return "已请求取消；当前 LLM 请求返回后停止，已完成结果会保留。"
 
 
+def _cancel_auto_loop_generation():
+    _AUTO_LOOP_CANCEL.set()
+    return "已请求取消当前 LLM 请求；已返回的结果不会写入队列。"
+
+
+def _cancel_inline_generation(slot):
+    event = _INLINE_CANCEL_EVENTS.get(str(slot or ""))
+    if event is not None:
+        event.set()
+    return "已请求停止；当前 LLM 请求会在本次 HTTP 返回后取消。"
+
+
 def _png_batch_run(
     payload, action, preset, system_override, base_model, safety, nsfw_injection,
     user_instruction, provider, endpoint, model, api_key, temperature, timeout,
@@ -1378,8 +1422,16 @@ def _png_batch_run(
                     nsfw_injection, user_instruction, provider, endpoint, model,
                     api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
+                    _PNG_BATCH_CANCEL,
                 )
-                outcomes[outcome_key] = (processed, llm_status)
+                if not _PNG_BATCH_CANCEL.is_set():
+                    outcomes[outcome_key] = (processed, llm_status)
+            if not processed and _PNG_BATCH_CANCEL.is_set() and "request cancelled" in str(llm_status or "").lower():
+                record["status"], record["error"] = "已取消", "当前 LLM 请求已取消"
+                for pending in records[position:]:
+                    if not str(pending.get("prompt", {}).get("processed") or "").strip():
+                        pending["status"], pending["error"] = "已取消", "尚未处理"
+                break
             if processed:
                 processed_kind = _processed_kind_for_preset(preset)
                 record["prompt"] = {
@@ -1443,18 +1495,22 @@ def _inline_generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
     structured_mode, region_count, save_score, cache_result,
+    slot="",
 ):
     saved_workflow = _workflow_settings()
     shared_updates = {"preset": preset, "base_model": base_model, "safety": safety}
     if any(saved_workflow[key] != value for key, value in shared_updates.items()):
         _save_workflow_values(shared_updates)
+    cancel_event = _INLINE_CANCEL_EVENTS.get(str(slot or ""))
+    if cancel_event is not None:
+        cancel_event.clear()
     connection = _connection_settings()
     generated, system, status = _generate(
         request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         connection["provider"], connection["endpoint"], connection["model"], "",
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
-        structured_mode, region_count, save_score, cache_result,
+        structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
     )
     return generated, system, status, generated if generated else gr.update()
 
@@ -1561,6 +1617,7 @@ def _create_inline_panel(slot, prompt_target):
                 gr.State(workflow["spaces"]), gr.State(workflow["max_tags"]),
                 gr.State(workflow["structured_mode"]), gr.State(workflow["region_count"]),
                 gr.State(workflow["save_score"]), gr.State(workflow["cache_result"]),
+                gr.State(slot),
             ],
             outputs=[inline_output, inline_system_preview, inline_status, inline_prompt_update],
         )
@@ -1578,8 +1635,8 @@ def _create_inline_panel(slot, prompt_target):
             js=f"(request, source, cycles) => window.llmPromptStudioAutoLoop.inlineLoop({{slot: '{slot}', request, source, cycles}})",
         )
         inline_cancel.click(
-            fn=None, inputs=[], outputs=inline_loop_status,
-            js=f"() => window.llmPromptStudioAutoLoop.cancelInline('{slot}')", queue=False,
+            fn=_cancel_inline_generation, inputs=gr.State(slot), outputs=inline_loop_status,
+            js=f"(slot) => {{ window.llmPromptStudioAutoLoop.cancelInline('{slot}'); return [slot]; }}", queue=False,
         )
         with _INLINE_LOCK:
             _INLINE_WORKFLOW_COMPONENTS[slot] = {
@@ -2444,10 +2501,10 @@ def on_ui_tabs():
             js="(request, target, writeMode, continuous, cycles) => window.llmPromptStudioAutoLoop.generateAndRun({request, target, writeMode, continuous, cycles})",
         )
         auto_loop_cancel.click(
-            fn=None,
+            fn=_cancel_auto_loop_generation,
             inputs=[],
             outputs=auto_loop_status,
-            js="() => window.llmPromptStudioAutoLoop.cancel()",
+            js="() => { window.llmPromptStudioAutoLoop.cancel(); return []; }",
             queue=False,
         )
         auto_loop_clear.click(

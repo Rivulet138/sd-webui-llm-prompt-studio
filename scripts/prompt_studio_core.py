@@ -5,6 +5,8 @@ Designed to be importable both by Forge's extension loader and unit tests.
 from __future__ import annotations
 
 import csv
+import datetime
+import email.utils
 import hashlib
 import json
 import math
@@ -13,6 +15,8 @@ import random
 import re
 import secrets
 import sqlite3
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -33,6 +37,9 @@ DEFAULT_RANBOORU_CACHE = ROOT.parent / "sd-webui-ranbooru-reforge" / "user" / "c
 RANBOORU_CONTENT_MODES = {"tags", "natural", "both"}
 RANBOORU_RATING_FILTERS = {"all", "sfw", "nsfw"}
 MAX_RANBOORU_SOURCE_RECORDS = 100000
+LLM_MAX_RETRIES = 2
+LLM_RETRY_BACKOFF_SECONDS = 0.25
+LLM_RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 BAD_TAGS = {
     "watermark", "signature", "text", "english text", "chinese text",
@@ -1392,6 +1399,34 @@ def _extract_error_message(body: bytes) -> str:
     return ""
 
 
+class LLMRequestError(RuntimeError):
+    """A request failure with enough metadata for safe, bounded retry."""
+
+    def __init__(self, message: str, *, retryable: bool = False, status_code: int | None = None, retry_after: float | None = None):
+        super().__init__(message)
+        self.retryable = bool(retryable)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(error: urllib.error.HTTPError) -> float | None:
+    value = error.headers.get("Retry-After") if error.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, min(float(value), 30.0))
+    except (TypeError, ValueError):
+        try:
+            parsed = email.utils.parsedate_to_datetime(value)
+            if parsed is None:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return max(0.0, min(parsed.timestamp() - time.time(), 30.0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
 def _request_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 90) -> dict[str, Any]:
     request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers or {"Content-Type": "application/json"}, method="POST")
     try:
@@ -1409,9 +1444,19 @@ def _request_json(url: str, payload: dict[str, Any], headers: dict[str, str] | N
     except urllib.error.HTTPError as error:
         detail = _extract_error_message(error.read(64 * 1024))
         suffix = f": {detail}" if detail else f": {error.reason}"
-        raise RuntimeError(f"LLM HTTP {error.code}{suffix}") from error
+        raise LLMRequestError(
+            f"LLM HTTP {error.code}{suffix}",
+            retryable=error.code in LLM_RETRYABLE_STATUS_CODES,
+            status_code=error.code,
+            retry_after=_retry_after_seconds(error),
+        ) from error
     except urllib.error.URLError as error:
-        raise RuntimeError(f"LLM connection failed: {error.reason}") from error
+        reason = error.reason
+        retryable = isinstance(reason, (TimeoutError, socket.timeout, ConnectionError, socket.gaierror)) and not isinstance(reason, ssl.SSLError)
+        raise LLMRequestError(f"LLM connection failed: {reason}", retryable=retryable) from error
+    except (TimeoutError, socket.timeout, ConnectionResetError, OSError) as error:
+        retryable = isinstance(error, (TimeoutError, socket.timeout, ConnectionError, socket.gaierror)) and not isinstance(error, ssl.SSLError)
+        raise LLMRequestError(f"LLM connection failed: {error}", retryable=retryable) from error
 
 
 def extract_provider_text(provider: str, data: dict[str, Any]) -> str:
@@ -1453,9 +1498,44 @@ def extract_provider_text(provider: str, data: dict[str, Any]) -> str:
     return text
 
 
-def call_llm(provider: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 0.35, timeout: int = 90, max_tokens: int = 1024, send_temperature: bool = True) -> str:
+def call_llm(
+    provider: str,
+    endpoint: str,
+    model: str,
+    api_key: str,
+    system: str,
+    user: str,
+    temperature: float = 0.35,
+    timeout: int = 90,
+    max_tokens: int = 1024,
+    send_temperature: bool = True,
+    max_retries: int = LLM_MAX_RETRIES,
+    cancel_event: threading.Event | None = None,
+) -> str:
     url, payload, headers = build_provider_request(provider, endpoint, model, api_key, system, user, temperature, max_tokens, send_temperature)
-    return extract_provider_text(provider, _request_json(url, payload, headers=headers, timeout=timeout))
+    retries = max(0, min(int(max_retries), 5))
+    for attempt in range(retries + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise LLMRequestError("LLM request cancelled", retryable=False)
+        try:
+            return extract_provider_text(provider, _request_json(url, payload, headers=headers, timeout=timeout))
+        except LLMRequestError as error:
+            if not error.retryable or attempt >= retries:
+                if error.retryable and retries:
+                    raise LLMRequestError(
+                        f"{error}（已重试 {attempt} 次）",
+                        retryable=True,
+                        status_code=error.status_code,
+                        retry_after=error.retry_after,
+                    ) from error
+                raise
+            delay = error.retry_after if error.retry_after is not None else LLM_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+            delay = max(0.0, min(float(delay), 30.0))
+            if cancel_event is not None:
+                if cancel_event.wait(delay):
+                    raise LLMRequestError("LLM request cancelled", retryable=False) from error
+            else:
+                time.sleep(delay)
 
 
 def regional_format(prompt: str, mode: str, regions: int) -> str:

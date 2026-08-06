@@ -64,6 +64,7 @@ function createRuntime(initialQueue = [], options = {}) {
     let interruptClicks = 0;
     const generated = Array.isArray(options.generated) ? [...options.generated] : [options.generated || "new prompt"];
     const inlineGenerated = Array.isArray(options.inlineGenerated) ? [...options.inlineGenerated] : [options.inlineGenerated || "inline prompt"];
+    const forgeFailures = Array.isArray(options.forgeFailures) ? [...options.forgeFailures] : [];
     const dispatchButton = {
         disabled: false,
         matches: () => true,
@@ -72,8 +73,13 @@ function createRuntime(initialQueue = [], options = {}) {
             this.disabled = true;
             const output = generated.shift() || "new prompt";
             setTimeout(() => {
-                inputs.llm_prompt_studio_output.value = output;
-                studioStatusHost.textContent = "completed";
+                if (typeof output === "object" && output.error) {
+                    inputs.llm_prompt_studio_output.value = "";
+                    studioStatusHost.textContent = output.error;
+                } else {
+                    inputs.llm_prompt_studio_output.value = output;
+                    studioStatusHost.textContent = "completed";
+                }
                 this.disabled = false;
             }, options.llmDelay || 10);
         },
@@ -85,8 +91,13 @@ function createRuntime(initialQueue = [], options = {}) {
             this.disabled = true;
             const output = inlineGenerated.shift() || "inline prompt";
             setTimeout(() => {
-                inputs.llm_prompt_studio_txt2img_inline_output.value = output;
-                inlineStatusHost.textContent = "completed";
+                if (typeof output === "object" && output.error) {
+                    inputs.llm_prompt_studio_txt2img_inline_output.value = "";
+                    inlineStatusHost.textContent = output.error;
+                } else {
+                    inputs.llm_prompt_studio_txt2img_inline_output.value = output;
+                    inlineStatusHost.textContent = "completed";
+                }
                 this.disabled = false;
             }, options.inlineDelay || 10);
         },
@@ -99,8 +110,10 @@ function createRuntime(initialQueue = [], options = {}) {
             promptHistory.push(inputs.txt2img_prompt.value);
             this.disabled = true;
             setTimeout(() => {
-                forgeStatusHost.textContent = options.forgeFailure ? "Error: generation failed" : "completed";
-                if (!options.forgeFailure && !options.keepGalleryUnchanged) gallery.innerHTML = `image-${generateClicks}`;
+                const transientFailure = forgeFailures.shift();
+                const failure = transientFailure || (options.forgeFailure ? "Error: generation failed" : "");
+                forgeStatusHost.textContent = failure || "completed";
+                if (!failure && !options.keepGalleryUnchanged) gallery.innerHTML = `image-${generateClicks}`;
                 this.disabled = false;
             }, options.forgeDelay || 10);
         },
@@ -244,6 +257,14 @@ async function main() {
     assert.equal(repeatedLines.dispatchClicks, 2);
     assert.deepEqual(repeatedLines.queue().map((row) => row.prompt), ["variation one", "variation two"]);
 
+    const exhaustedLlm = createRuntime([], {
+        generated: [{ error: "LLM HTTP 503: retries exhausted" }, "must not be requested"],
+    });
+    const exhaustedLlmResult = await exhaustedLlm.api.generateBatch({ request: "retry request" });
+    assert.equal(exhaustedLlm.dispatchClicks, 1);
+    assert.equal(exhaustedLlm.queue().length, 0);
+    assert.match(exhaustedLlmResult, /503/);
+
     const onlyNew = createRuntime([
         { index: 1, id: "old", prompt: "historical pending", status: "pending", requestId: "old request", batchId: "old-batch" },
     ], { generated: ["fresh prompt"] });
@@ -261,6 +282,14 @@ async function main() {
     const failed = await forgeFailure.api.runStored({ target: "txt2img", writeMode: "replace" });
     assert.match(failed, /fail|error/i);
     assert.equal(forgeFailure.queue()[0].status, "pending");
+
+    const timedOutForge = createRuntime([
+        { index: 1, id: "retry-forge", prompt: "retry forge", status: "pending", requestId: "retry forge", batchId: "retry-batch" },
+    ], { forgeFailures: ["Error: generation timeout"], forgeDelay: 10 });
+    const timedOutForgeResult = await timedOutForge.api.runStored({ target: "txt2img", writeMode: "replace" });
+    assert.match(timedOutForgeResult, /timeout/);
+    assert.equal(timedOutForge.generateClicks, 1);
+    assert.equal(timedOutForge.queue()[0].status, "pending");
 
     const appendRun = createRuntime([
         { index: 1, id: "append", prompt: "new details", status: "pending", requestId: "append request", batchId: "append-batch" },
@@ -311,7 +340,9 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.match(inlineCancelRun.api.cancelInline("txt2img"), /正在停止/);
     await pendingInline;
-    assert.equal(inlineCancelRun.interruptClicks, 1);
+    // Cancellation happened while the inline LLM request was still running;
+    // no Forge interrupt is needed until a generation has actually started.
+    assert.equal(inlineCancelRun.interruptClicks, 0);
     const afterCancel = await inlineCancelRun.api.inlineOnce({
         slot: "txt2img", request: "run again", source: "llm",
     });

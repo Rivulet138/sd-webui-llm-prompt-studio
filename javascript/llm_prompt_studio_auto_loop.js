@@ -3,6 +3,7 @@
 
     const QUEUE_KEY = "llm_prompt_studio_auto_loop_queue_v1";
     const MAX_LOG_ROWS = 100;
+    const LLM_WAIT_TIMEOUT_MS = 1900000;
     const STATUS = Object.freeze({ pending: "pending", running: "running", completed: "completed" });
     const FAILURE_PATTERN = /fail|error|timeout|refused|interrupted|失败|错误|超时|拒绝|中断/i;
     const state = {
@@ -206,10 +207,11 @@
         if (inlineRuns[run.slot] === run) inlineRuns[run.slot] = null;
     }
 
-    async function waitForStudioGeneration(run, beforeStatus, timeoutMs = 300000) {
-        const button = findButton("llm_prompt_studio_auto_loop_dispatch");
-        const output = input("llm_prompt_studio_output");
-        const statusHost = find("llm_prompt_studio_status");
+    async function waitForStudioGeneration(run, beforeStatus, timeoutMs = 300000, controls = null) {
+        const button = controls?.button || findButton("llm_prompt_studio_auto_loop_dispatch");
+        const output = controls?.output || input("llm_prompt_studio_output");
+        const statusHost = controls?.statusHost || find("llm_prompt_studio_status");
+        const beforeOutput = String(controls?.beforeOutput ?? output?.value ?? "");
         let sawBusy = false;
         const started = Date.now();
         while (Date.now() - started < timeoutMs) {
@@ -224,12 +226,13 @@
                 await wait(50);
                 assertActive(run);
                 const result = String(output?.value || "").trim();
-                if (result && !FAILURE_PATTERN.test(String(statusHost?.textContent || ""))) return result;
+                if (result && (result !== beforeOutput || currentStatus !== beforeStatus)
+                    && !FAILURE_PATTERN.test(String(statusHost?.textContent || ""))) return result;
                 throw new Error(currentStatus || "LLM Prompt 生成失败：未返回结果");
             }
             await wait(25);
         }
-        throw new Error("LLM Prompt 生成超时");
+        throw new Error("LLM Prompt 生成超时（服务端重试已耗尽）");
     }
 
     async function waitForForgeGeneration(tab, run, beforeStatus, timeoutMs = 1800000) {
@@ -241,13 +244,13 @@
             const busy = isForgeBusy(tab);
             sawBusy ||= busy;
             const currentStatus = String(statusHost?.textContent || "");
-            if (currentStatus !== beforeStatus && FAILURE_PATTERN.test(currentStatus)) throw new Error(currentStatus);
             if (sawBusy && !busy) {
-                if (!FAILURE_PATTERN.test(currentStatus)) return;
+                if (FAILURE_PATTERN.test(currentStatus)) throw new Error(currentStatus);
+                return;
             }
             await wait(25);
         }
-        throw new Error(`${tab} generation timeout`);
+        throw new Error(`${tab} generation timeout; prompt returned to pending`);
     }
 
     function ensureLlmIdle() {
@@ -296,24 +299,34 @@
         const output = input(isInline ? inlineId(slot, "output") : "llm_prompt_studio_output");
         const status = isInline ? find(inlineId(slot, "status")) : find("llm_prompt_studio_status");
         if (!button || !requestInput || !output || !status) throw new Error("未找到主生成面板");
+        if (button.disabled) throw new Error("LLM Studio 当前已有生成任务");
         setValue(isInline ? inlineId(slot, "request") : "llm_prompt_studio_request", request);
         if (!isInline && input("llm_prompt_studio_source_tags")) setValue("llm_prompt_studio_source_tags", "");
         const beforeStatus = String(status.textContent || "");
         const beforeOutput = String(output.value || "");
         button.click();
-        const started = Date.now();
-        while (Date.now() - started < 300000) {
-            assertActive(run);
-            const busy = Boolean(button.disabled);
-            const currentStatus = String(status.textContent || "");
-            const prompt = String(output.value || "").trim();
-            if (!busy && (currentStatus !== beforeStatus || prompt !== beforeOutput)) {
-                if (!prompt || FAILURE_PATTERN.test(currentStatus)) throw new Error(currentStatus || "LLM Prompt 生成失败");
-                return prompt;
-            }
-            await wait(25);
-        }
-        throw new Error("LLM Prompt 生成超时");
+        return waitForStudioGeneration(run, beforeStatus, LLM_WAIT_TIMEOUT_MS, {
+            button, output, statusHost: status, beforeOutput,
+        });
+    }
+
+    async function runForgeGeneration(tab, run, generate) {
+        const beforeStatus = String(find(`${tab}_status`)?.textContent || "");
+        generate.click();
+        await waitForForgeGeneration(tab, run, beforeStatus);
+    }
+
+    async function runStudioGeneration(run, request, button) {
+        assertActive(run);
+        setValue("llm_prompt_studio_request", request);
+        setValue("llm_prompt_studio_source_tags", "");
+        setValue("llm_prompt_studio_output", "");
+        const beforeStatus = String(find("llm_prompt_studio_status")?.textContent || "");
+        const output = input("llm_prompt_studio_output");
+        button.click();
+        return waitForStudioGeneration(run, beforeStatus, LLM_WAIT_TIMEOUT_MS, {
+            button, output, statusHost: find("llm_prompt_studio_status"), beforeOutput: "",
+        });
     }
 
     async function getInlinePrompt(config, run) {
@@ -363,9 +376,7 @@
                 writePrompt(prompt, target, "append", basePrompt);
                 const generate = findButton(`${target}_generate`);
                 if (!generate) throw new Error(`未找到 ${target} 生图按钮`);
-                const beforeStatus = String(find(`${target}_status`)?.textContent || "");
-                generate.click();
-                await waitForForgeGeneration(target, run, beforeStatus);
+                await runForgeGeneration(target, run, generate);
                 completed += 1;
                 render("success", `内嵌连续生成已完成 ${completed} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
             }
@@ -443,12 +454,7 @@
                     continue;
                 }
                 const button = ensureLlmIdle();
-                setValue("llm_prompt_studio_request", request);
-                setValue("llm_prompt_studio_source_tags", "");
-                setValue("llm_prompt_studio_output", "");
-                const beforeStatus = String(find("llm_prompt_studio_status")?.textContent || "");
-                button.click();
-                const prompt = await waitForStudioGeneration(run, beforeStatus);
+                const prompt = await runStudioGeneration(run, request, button);
                 assertActive(run);
                 state.requestIds.add(requestId);
                 const promptKey = canonicalPrompt(prompt);
@@ -511,10 +517,7 @@
                 writePrompt(row.prompt, target, mode, basePrompt);
                 const generate = findButton(`${target}_generate`);
                 if (!generate) throw new Error(`未找到 ${target} 生图按钮`);
-                const statusHost = find(`${target}_status`);
-                const beforeStatus = String(statusHost?.textContent || "");
-                generate.click();
-                await waitForForgeGeneration(target, run, beforeStatus);
+                await runForgeGeneration(target, run, generate);
                 assertActive(run);
                 row.status = STATUS.completed;
                 currentRow = null;

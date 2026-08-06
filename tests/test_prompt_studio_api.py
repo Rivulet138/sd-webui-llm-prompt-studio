@@ -794,7 +794,9 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result[0], "generated")
-        self.assertEqual(captured["args"][-3:], (1, 0, False))
+        self.assertEqual(captured["args"][-7:-4], (1, 0, False))
+        self.assertEqual(captured["args"][-4:-1], ("", "", False))
+        self.assertIs(captured["args"][-1], ui._AUTO_LOOP_CANCEL)
 
         result = ui._generate_auto_loop(
             "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
@@ -803,10 +805,11 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "Plain Prompt", 1, True,
         )
         self.assertEqual(result[0], "generated")
-        self.assertEqual(captured["args"][-6:-3], (1, 0, True))
-        self.assertEqual(captured["args"][-3], "auto_loop")
-        self.assertTrue(captured["args"][-2].startswith("auto_loop:"))
-        self.assertTrue(captured["args"][-1])
+        self.assertEqual(captured["args"][-7:-4], (1, 0, True))
+        self.assertEqual(captured["args"][-4], "auto_loop")
+        self.assertTrue(captured["args"][-3].startswith("auto_loop:"))
+        self.assertTrue(captured["args"][-2])
+        self.assertIs(captured["args"][-1], ui._AUTO_LOOP_CANCEL)
 
     async def test_auto_loop_cache_is_unrated_and_model_configuration_is_part_of_identity(self):
         common = (
@@ -947,6 +950,20 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         selected = ui._select_all_batch_issues(issue_state)
         self.assertEqual(selected["value"], ["2:second", "3:third"])
+
+    async def test_batch_cancel_during_retry_marks_current_item_cancelled(self):
+        def fake_generate(source, *_args):
+            ui._BATCH_CANCEL.set()
+            return "", "", "生成失败：LLM request cancelled"
+
+        ui._generate = fake_generate
+        results = list(ui._batch_generate(*self._batch_args("first\nsecond", False, True)))
+        status, _table, _choices, _issue_table, _issue_choices, issues, rows = results[-1]
+
+        self.assertIn("任务已取消", status)
+        self.assertEqual([item["status"] for item in issues], ["已取消", "已取消"])
+        self.assertEqual([row[3] for row in rows["value"]], ["已取消", "已取消"])
+        self.assertFalse(ui.DB.has_source_prompt("first", "NoobAI Tags", "NoobAI"))
 
     async def test_manual_retry_lock_contention_does_not_duplicate_issues(self):
         issues = [

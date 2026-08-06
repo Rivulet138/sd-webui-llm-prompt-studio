@@ -7,17 +7,80 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
-    build_provider_request, build_system_prompt, build_user_message, call_llm, extract_provider_text,
+    LLMRequestError, build_provider_request, build_system_prompt, build_user_message, call_llm, extract_provider_text,
     is_sfw_output, load_ranbooru_cache, process_tags, regional_format,
     validate_endpoint,
 )
 
 
 class PromptStudioCoreTests(unittest.TestCase):
+    def test_call_llm_retries_transient_failures_then_returns_once(self):
+        response = {"choices": [{"message": {"content": "recovered prompt"}}]}
+        with patch(
+            "prompt_studio_core._request_json",
+            side_effect=[
+                LLMRequestError("LLM connection failed: timed out", retryable=True),
+                LLMRequestError("LLM HTTP 503: busy", retryable=True, status_code=503),
+                response,
+            ],
+        ) as request_json, patch("prompt_studio_core.time.sleep") as sleep:
+            result = call_llm(
+                "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "",
+                "system", "user", max_retries=2,
+            )
+
+        self.assertEqual(result, "recovered prompt")
+        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_call_llm_does_not_retry_permanent_http_failure(self):
+        with patch(
+            "prompt_studio_core._request_json",
+            side_effect=LLMRequestError("LLM HTTP 401: unauthorized", retryable=False, status_code=401),
+        ) as request_json, patch("prompt_studio_core.time.sleep") as sleep:
+            with self.assertRaisesRegex(LLMRequestError, "401"):
+                call_llm(
+                    "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "",
+                    "system", "user", max_retries=2,
+                )
+
+        self.assertEqual(request_json.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_call_llm_reports_exhausted_retry_count(self):
+        with patch(
+            "prompt_studio_core._request_json",
+            side_effect=LLMRequestError("LLM HTTP 429: busy", retryable=True, status_code=429),
+        ) as request_json, patch("prompt_studio_core.time.sleep"):
+            with self.assertRaisesRegex(LLMRequestError, "已重试 2 次"):
+                call_llm(
+                    "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "",
+                    "system", "user", max_retries=2,
+                )
+
+        self.assertEqual(request_json.call_count, 3)
+
+    def test_call_llm_cancellation_stops_before_transient_retry(self):
+        cancelled = threading.Event()
+
+        def fail_once(*_args, **_kwargs):
+            cancelled.set()
+            raise LLMRequestError("LLM HTTP 503: busy", retryable=True, status_code=503)
+
+        with patch("prompt_studio_core._request_json", side_effect=fail_once) as request_json:
+            with self.assertRaisesRegex(LLMRequestError, "cancelled"):
+                call_llm(
+                    "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "",
+                    "system", "user", max_retries=2, cancel_event=cancelled,
+                )
+
+        self.assertEqual(request_json.call_count, 1)
+
     def test_tag_processing_matches_expected_cleanup(self):
         result = process_tags("1girl, blue_eyes, watermark, blue_eyes, text", remove_bad=True, underscores_to_spaces=True)
         self.assertEqual(result, "1girl, blue eyes")
