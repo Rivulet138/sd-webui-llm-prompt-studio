@@ -123,6 +123,90 @@ _BATCH_VARIATION_FOCI = (
     "时间天气与现场状态",
     "道具关系与叙事细节",
 )
+_INDEPENDENT_BATCH_BLUEPRINTS = (
+    "a crowded public place with layered foreground, middle ground, and background action",
+    "a quiet enclosed interior with a strong light source and a meaningful object interaction",
+    "an outdoor journey or rescue event with visible movement and environmental obstacles",
+    "a festival, market, or social gathering with several simultaneous interactions",
+    "an intimate character moment interrupted by an unexpected event or discovery",
+    "a work, craft, or investigation scene showing tools, process, and cause-and-effect details",
+    "a dramatic change of weather or time that materially affects the scene and action",
+    "an unusual scale contrast, such as a tiny subject in a vast place or a giant subject in a confined place",
+    "a before-and-after transition captured at the turning point of a story",
+    "a location with a distinct architectural layout that drives the composition and movement",
+)
+_INDEPENDENT_BATCH_DYNAMICS = (
+    "an urgent rescue or escape with a visible obstacle and consequence",
+    "a careful craft, repair, or construction process with specific tools",
+    "a tense negotiation or disagreement expressed through action and spatial relationships",
+    "a discovery that changes what the subject is doing at that exact moment",
+    "a coordinated group task with distinct roles and simultaneous activity",
+    "a chase, pursuit, or race whose route is readable in the environment",
+    "a quiet observation that reveals a hidden detail elsewhere in the scene",
+    "a performance or demonstration with a reacting audience",
+    "an arrival or departure with luggage, vehicles, gates, or thresholds",
+    "a natural or mechanical failure that forces an immediate response",
+    "an exchange of an important object that establishes a clear story relationship",
+)
+_INDEPENDENT_BATCH_COMPOSITIONS = (
+    "a wide establishing view with several readable depth layers",
+    "a close interaction framed through foreground objects",
+    "a high-angle view that exposes paths, layout, and crowd movement",
+    "a low-angle view emphasizing scale while keeping the environment specific",
+    "a side-on composition organized around opposing movement",
+    "a view from behind the subject toward the event they are facing",
+    "an asymmetrical composition with the key event away from the center",
+    "a compressed long-distance view with overlapping environmental layers",
+    "a doorway, window, arch, or corridor used as an active frame",
+    "a diagonal composition built around travel between near and far points",
+    "a split-depth composition where foreground and background actions affect each other",
+)
+_INDEPENDENT_BATCH_CONDITIONS = (
+    "early morning after overnight rain",
+    "harsh midday light during strong wind",
+    "late afternoon as weather begins to change",
+    "blue hour with practical lights turning on",
+    "night under uneven artificial illumination",
+    "dense fog that reveals only selected depth layers",
+    "falling snow that visibly affects movement and surfaces",
+    "heavy rain with runoff, reflections, and shelter behavior",
+    "dry heat with dust and hard shadows",
+    "calm overcast light immediately before a major event",
+)
+_INDEPENDENT_BATCH_LOCK = threading.Lock()
+_independent_batch_sequence = 0
+_MIN_INDEPENDENT_BATCH_TEMPERATURE = 0.9
+
+
+def _independent_batch_directive(sequence: int = 0) -> str:
+    """Create a fresh, stateless diversity constraint for one batch request."""
+    global _independent_batch_sequence
+    requested_sequence = int(sequence or 0)
+    if requested_sequence > 0:
+        plan_index = requested_sequence - 1
+    else:
+        with _INDEPENDENT_BATCH_LOCK:
+            plan_index = _independent_batch_sequence
+            _independent_batch_sequence += 1
+    blueprint = _INDEPENDENT_BATCH_BLUEPRINTS[plan_index % len(_INDEPENDENT_BATCH_BLUEPRINTS)]
+    plan_index //= len(_INDEPENDENT_BATCH_BLUEPRINTS)
+    dynamic = _INDEPENDENT_BATCH_DYNAMICS[plan_index % len(_INDEPENDENT_BATCH_DYNAMICS)]
+    plan_index //= len(_INDEPENDENT_BATCH_DYNAMICS)
+    composition = _INDEPENDENT_BATCH_COMPOSITIONS[plan_index % len(_INDEPENDENT_BATCH_COMPOSITIONS)]
+    plan_index //= len(_INDEPENDENT_BATCH_COMPOSITIONS)
+    condition = _INDEPENDENT_BATCH_CONDITIONS[plan_index % len(_INDEPENDENT_BATCH_CONDITIONS)]
+    nonce = uuid.uuid4().hex[:12]
+    return (
+        "This is one independent one-shot batch request. Do not use conversation history, previous outputs, "
+        "or any assumed continuation. Preserve the user's core subject and content restrictions, but create "
+        "a clearly different content type for this item using this required blueprint: "
+        f"{blueprint}. Required event dynamic: {dynamic}. Required composition: {composition}. "
+        f"Required time or weather condition: {condition}. Change at least four non-style dimensions: "
+        "subject action or interaction, setting, "
+        "composition or camera distance, time or weather, props, and narrative event. Do not obtain variety "
+        "by changing only art style, quality words, synonyms, or tag order. Return exactly one complete Prompt. "
+        f"独立请求标识: {nonce}."
+    )
 _PNG_BATCH_CANCEL = threading.Event()
 
 
@@ -860,7 +944,7 @@ def _batch_generate(
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     0, False, "", "", False, _BATCH_CANCEL,
-                    (
+                    _independent_batch_directive(index) + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{len(sources)} 条。"
                         f"本条必须围绕原要求生成一条新的完整 Prompt，重点改变{_BATCH_VARIATION_FOCI[(index - 1) % len(_BATCH_VARIATION_FOCI)]}；"
                         "不得复用同批其他结果，不得只替换风格词或同义词来制造差异；"
@@ -1095,9 +1179,12 @@ def _generate(
     )
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
+        request_temperature = float(temperature or 0.35)
+        if batch_directive:
+            request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
         result = call_llm(
             provider, endpoint, model, resolved_key, system, build_user_message(source),
-            float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0),
+            request_temperature, int(timeout or 90), int(max_tokens or 0),
             bool(send_temperature), cancel_event=cancel_event,
         )
     except Exception as error:
@@ -1156,12 +1243,14 @@ def _generate_auto_loop(
             provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, True, "auto_loop", source_ref, True, _AUTO_LOOP_CANCEL,
+            _independent_batch_directive(),
         )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, False, "", "", False, _AUTO_LOOP_CANCEL,
+            _independent_batch_directive(),
     )
 
 
@@ -1511,6 +1600,7 @@ def _inline_generate(
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
         structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
+        _independent_batch_directive(),
     )
     return generated, system, status, generated if generated else gr.update()
 

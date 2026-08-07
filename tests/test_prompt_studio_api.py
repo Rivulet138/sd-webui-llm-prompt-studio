@@ -30,6 +30,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "wildcards": ui.DEFAULT_WILDCARDS,
             "call_llm": ui.call_llm,
             "generate": ui._generate,
+            "independent_sequence": ui._independent_batch_sequence,
             "modules": sys.modules.get("modules"),
             "modules.shared": sys.modules.get("modules.shared"),
         }
@@ -58,6 +59,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         ui.DEFAULT_WILDCARDS = self.originals["wildcards"]
         ui.call_llm = self.originals["call_llm"]
         ui._generate = self.originals["generate"]
+        with ui._INDEPENDENT_BATCH_LOCK:
+            ui._independent_batch_sequence = self.originals["independent_sequence"]
         with ui._BATCH_CONTROL_LOCK:
             ui._BATCH_ACTIVE_TASK_ID = ""
             ui._BATCH_CANCEL.clear()
@@ -756,6 +759,78 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("独立任务第 2/2 条", directives[1])
         self.assertNotEqual(directives[0], directives[1])
 
+    async def test_batch_calls_llm_with_fresh_stateless_diversity_directives(self):
+        calls = []
+
+        def capture_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            return f"1girl, independent_scene_{len(calls)}"
+
+        ui.call_llm = capture_call
+        results = list(ui._batch_generate(*self._batch_args("alpha\nbeta\ngamma", False, True)))
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("LLM 请求 3", results[-1][0])
+        self.assertEqual([call[0][6] for call in calls], [0.9, 0.9, 0.9])
+        self.assertEqual(
+            [call[0][5] for call in calls],
+            [
+                ui.build_user_message("alpha"),
+                ui.build_user_message("beta"),
+                ui.build_user_message("gamma"),
+            ],
+        )
+        systems = [call[0][4] for call in calls]
+        self.assertEqual(len(set(systems)), 3)
+        for index, system in enumerate(systems, start=1):
+            self.assertIn("independent one-shot batch request", system)
+            self.assertIn(ui._INDEPENDENT_BATCH_BLUEPRINTS[index - 1], system)
+            self.assertNotIn("independent_scene_", system)
+        for args, kwargs in calls:
+            self.assertEqual(len(args), 10)
+            self.assertNotIn("history", kwargs)
+            self.assertNotIn("messages", kwargs)
+
+        high_temperature_args = list(self._batch_args("delta", False, True))
+        high_temperature_args[13] = 1.1
+        list(ui._batch_generate(*high_temperature_args))
+        self.assertEqual(calls[-1][0][6], 1.1)
+
+    async def test_batch_diversity_plan_does_not_repeat_across_supported_queue_size(self):
+        semantic_directives = {
+            ui._independent_batch_directive(index).split("独立请求标识:", 1)[0]
+            for index in range(1, 10002)
+        }
+
+        self.assertEqual(len(semantic_directives), 10001)
+
+    async def test_inline_generation_uses_fresh_stateless_request_each_time(self):
+        calls = []
+
+        def capture_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            return f"1girl, inline_scene_{len(calls)}"
+
+        ui.call_llm = capture_call
+        with ui._INDEPENDENT_BATCH_LOCK:
+            ui._independent_batch_sequence = 0
+        inline_args = (
+            "same request", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            0, 0, True, "", False, False, 0, "Plain Prompt", 1, 0, False, "txt2img",
+        )
+
+        first = ui._inline_generate(*inline_args)
+        second = ui._inline_generate(*inline_args)
+
+        self.assertEqual([first[0], second[0]], ["1girl, inline_scene_1", "1girl, inline_scene_2"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call[0][6] for call in calls], [0.9, 0.9])
+        self.assertEqual(calls[0][0][5], calls[1][0][5])
+        self.assertNotEqual(calls[0][0][4], calls[1][0][4])
+        self.assertIn(ui._INDEPENDENT_BATCH_BLUEPRINTS[0], calls[0][0][4])
+        self.assertIn(ui._INDEPENDENT_BATCH_BLUEPRINTS[1], calls[1][0][4])
+        self.assertNotIn("inline_scene_1", calls[1][0][4])
+
     async def test_batch_cache_skip_only_considers_records_existing_at_batch_start(self):
         attempt = 0
 
@@ -794,9 +869,10 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result[0], "generated")
-        self.assertEqual(captured["args"][-7:-4], (1, 0, False))
-        self.assertEqual(captured["args"][-4:-1], ("", "", False))
-        self.assertIs(captured["args"][-1], ui._AUTO_LOOP_CANCEL)
+        self.assertEqual(captured["args"][-8:-5], (1, 0, False))
+        self.assertEqual(captured["args"][-5:-2], ("", "", False))
+        self.assertIs(captured["args"][-2], ui._AUTO_LOOP_CANCEL)
+        self.assertIn("independent one-shot batch request", captured["args"][-1])
 
         result = ui._generate_auto_loop(
             "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
@@ -805,11 +881,12 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "Plain Prompt", 1, True,
         )
         self.assertEqual(result[0], "generated")
-        self.assertEqual(captured["args"][-7:-4], (1, 0, True))
-        self.assertEqual(captured["args"][-4], "auto_loop")
-        self.assertTrue(captured["args"][-3].startswith("auto_loop:"))
-        self.assertTrue(captured["args"][-2])
-        self.assertIs(captured["args"][-1], ui._AUTO_LOOP_CANCEL)
+        self.assertEqual(captured["args"][-8:-5], (1, 0, True))
+        self.assertEqual(captured["args"][-5], "auto_loop")
+        self.assertTrue(captured["args"][-4].startswith("auto_loop:"))
+        self.assertTrue(captured["args"][-3])
+        self.assertIs(captured["args"][-2], ui._AUTO_LOOP_CANCEL)
+        self.assertIn("independent one-shot batch request", captured["args"][-1])
 
     async def test_auto_loop_cache_is_unrated_and_model_configuration_is_part_of_identity(self):
         common = (
