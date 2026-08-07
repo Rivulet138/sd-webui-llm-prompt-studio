@@ -6,6 +6,7 @@
     const LLM_WAIT_TIMEOUT_MS = 1900000;
     const STATUS = Object.freeze({ pending: "pending", running: "running", completed: "completed" });
     const FAILURE_PATTERN = /fail|error|timeout|refused|interrupted|失败|错误|超时|拒绝|中断/i;
+    const SUCCESS_PATTERN = /completed|finished|done|success|生成完成|已完成/i;
     const state = {
         queue: [],
         requestIds: new Set(),
@@ -16,6 +17,7 @@
         lastBatchRowIds: [],
     };
     const inlineRuns = { txt2img: null, img2img: null };
+    let backgroundTimer = undefined;
 
     function root() {
         return typeof gradioApp === "function" ? gradioApp() : document;
@@ -47,8 +49,81 @@
         element.dispatchEvent(new Event("change", { bubbles: true }));
     }
 
+    function createBackgroundTimer() {
+        if (
+            typeof window.Worker !== "function"
+            || typeof window.Blob !== "function"
+            || typeof window.URL?.createObjectURL !== "function"
+        ) return null;
+        try {
+            const source = "self.onmessage=function(event){setTimeout(function(){self.postMessage(event.data.id);},event.data.ms);};";
+            const url = window.URL.createObjectURL(new window.Blob([source], { type: "text/javascript" }));
+            const worker = new window.Worker(url);
+            window.URL.revokeObjectURL(url);
+            const pending = new Map();
+            let sequence = 0;
+            worker.onmessage = (event) => {
+                const resolve = pending.get(event.data);
+                if (!resolve) return;
+                pending.delete(event.data);
+                resolve();
+            };
+            worker.onerror = () => {
+                for (const resolve of pending.values()) resolve();
+                pending.clear();
+                backgroundTimer = null;
+            };
+            return (ms) => new Promise((resolve) => {
+                sequence += 1;
+                pending.set(sequence, resolve);
+                worker.postMessage({ id: sequence, ms });
+            });
+        } catch {
+            return null;
+        }
+    }
+
     function wait(ms) {
+        if (Boolean(document.hidden)) {
+            if (backgroundTimer === undefined) backgroundTimer = createBackgroundTimer();
+            if (backgroundTimer) return backgroundTimer(ms);
+        }
         return new Promise((resolve) => window.setTimeout(resolve, ms));
+    }
+
+    async function waitForUiSignal(ms, elements) {
+        if (typeof window.MutationObserver !== "function") {
+            await wait(ms);
+            return;
+        }
+        let wake;
+        const mutation = new Promise((resolve) => { wake = resolve; });
+        const observer = new window.MutationObserver(wake);
+        for (const element of elements.filter(Boolean)) {
+            observer.observe(element, {
+                attributes: true,
+                childList: true,
+                characterData: true,
+                subtree: true,
+            });
+        }
+        try {
+            await Promise.race([wait(ms), mutation]);
+        } finally {
+            observer.disconnect();
+        }
+    }
+
+    function createTimeoutBudget(timeoutMs) {
+        const now = () => typeof window.performance?.now === "function"
+            ? window.performance.now()
+            : Date.now();
+        const deadline = now() + timeoutMs;
+        return {
+            expired() {
+                return now() >= deadline;
+            },
+        };
     }
 
     function escapeHtml(value) {
@@ -170,19 +245,37 @@
         }
     }
 
-    function isVisible(element) {
+    function isControlShown(element) {
         if (!element) return false;
         const style = window.getComputedStyle(element);
-        return style.display !== "none" && style.visibility !== "hidden" && element.offsetParent !== null;
+        return style.display !== "none";
     }
 
     function isForgeBusy(tab) {
-        return isVisible(find(`${tab}_interrupt`)) || Boolean(findButton(`${tab}_generate`)?.disabled);
+        return isControlShown(find(`${tab}_interrupt`))
+            || isControlShown(find(`${tab}_interrupting`))
+            || Boolean(findButton(`${tab}_generate`)?.disabled);
+    }
+
+    function currentForgeTaskId(tab) {
+        try {
+            return String(window.localStorage.getItem(`${tab}_task_id`) || "");
+        } catch {
+            return "";
+        }
+    }
+
+    function ownsActiveForgeTask(run) {
+        if (!run?.forgeStarted || !run.target) return false;
+        if (run.forgeTaskId) return currentForgeTaskId(run.target) === run.forgeTaskId;
+        return isForgeBusy(run.target);
     }
 
     async function beginRun(phase, target = null) {
         if (state.active) return null;
-        const run = { id: createId("run"), phase, target, cancelled: false };
+        const run = {
+            id: createId("run"), phase, target, cancelled: false, forgeStarted: false, forgeTaskId: "",
+        };
         state.active = run;
         saveQueue();
         return run;
@@ -206,6 +299,7 @@
         if (inlineRuns[slot]) return null;
         const run = {
             id: createId("inline"), scope: "inline", slot, phase: "inline", target, cancelled: false,
+            forgeStarted: false, forgeTaskId: "",
         };
         inlineRuns[slot] = run;
         return run;
@@ -221,8 +315,8 @@
         const statusHost = controls?.statusHost || find("llm_prompt_studio_status");
         const beforeOutput = String(controls?.beforeOutput ?? output?.value ?? "");
         let sawBusy = false;
-        const started = Date.now();
-        while (Date.now() - started < timeoutMs) {
+        const budget = createTimeoutBudget(timeoutMs);
+        while (true) {
             assertActive(run);
             const busy = Boolean(button?.disabled);
             sawBusy ||= busy;
@@ -240,25 +334,37 @@
                     throw new Error(finalStatus || "LLM Prompt 生成失败：未返回结果");
                 }
             }
-            await wait(25);
+            if (budget.expired()) break;
+            await waitForUiSignal(250, [button, output, statusHost]);
         }
         throw new Error("LLM Prompt 生成超时（服务端重试已耗尽）");
     }
 
-    async function waitForForgeGeneration(tab, run, beforeStatus, timeoutMs = 1800000) {
+    async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000) {
         const statusHost = find(`${tab}_status`);
-        let sawBusy = false;
-        const started = Date.now();
-        while (Date.now() - started < timeoutMs) {
+        const interrupt = find(`${tab}_interrupt`);
+        const interrupting = find(`${tab}_interrupting`);
+        const generate = findButton(`${tab}_generate`);
+        let sawBusy = Boolean(taskId);
+        const budget = createTimeoutBudget(timeoutMs);
+        while (true) {
             assertActive(run);
-            const busy = isForgeBusy(tab);
+            const currentTaskId = currentForgeTaskId(tab);
+            const taskTracked = Boolean(taskId) && currentTaskId === taskId;
+            const taskReplaced = Boolean(taskId) && Boolean(currentTaskId) && currentTaskId !== taskId;
+            const busy = taskId ? taskTracked : isForgeBusy(tab);
             sawBusy ||= busy;
             const currentStatus = String(statusHost?.textContent || "");
-            if (sawBusy && !busy) {
+            const statusCompleted = currentStatus !== beforeStatus && SUCCESS_PATTERN.test(currentStatus);
+            if (taskReplaced) {
+                throw new Error(`${tab} generation task ownership changed; prompt returned to pending`);
+            }
+            if (!busy && (sawBusy || statusCompleted)) {
                 if (FAILURE_PATTERN.test(currentStatus)) throw new Error(currentStatus);
                 return;
             }
-            await wait(25);
+            if (budget.expired()) break;
+            await waitForUiSignal(250, [statusHost, interrupt, interrupting, generate]);
         }
         throw new Error(`${tab} generation timeout; prompt returned to pending`);
     }
@@ -323,7 +429,15 @@
     async function runForgeGeneration(tab, run, generate) {
         const beforeStatus = String(find(`${tab}_status`)?.textContent || "");
         generate.click();
-        await waitForForgeGeneration(tab, run, beforeStatus);
+        const taskId = currentForgeTaskId(tab);
+        run.forgeStarted = true;
+        run.forgeTaskId = taskId;
+        try {
+            await waitForForgeGeneration(tab, run, beforeStatus, taskId);
+        } finally {
+            run.forgeStarted = false;
+            run.forgeTaskId = "";
+        }
     }
 
     async function runStudioGeneration(run, request, button) {
@@ -410,7 +524,7 @@
         run.cancelled = true;
         if (run.target) {
             const interrupt = find(`${run.target}_interrupt`);
-            if (isVisible(interrupt)) interrupt.click();
+            if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
         }
         renderInline(normalizedSlot, "warning", "正在停止内嵌连续生成", "当前请求结束后停止");
         return "正在停止内嵌连续生成";
@@ -607,7 +721,7 @@
         run.cancelled = true;
         if (run.phase === "forge" && run.target) {
             const interrupt = find(`${run.target}_interrupt`);
-            if (isVisible(interrupt)) interrupt.click();
+            if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
         }
         render("warning", "正在取消当前阶段", "迟到结果不会写入队列");
         return "正在取消当前阶段";

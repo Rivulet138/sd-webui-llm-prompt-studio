@@ -21,6 +21,34 @@ class FakeInput {
 function createRuntime(initialQueue = [], options = {}) {
     const values = options.values || new Map([[QUEUE_KEY, JSON.stringify(initialQueue)]]);
     let injectedForeignLease = false;
+    const mutationObservers = new Set();
+    function notifyMutation(element) {
+        for (const observer of mutationObservers) {
+            if (observer.targets.has(element)) observer.callback();
+        }
+    }
+    class FakeMutationObserver {
+        constructor(callback) {
+            this.callback = callback;
+            this.targets = new Set();
+        }
+
+        observe(element) {
+            this.targets.add(element);
+            mutationObservers.add(this);
+        }
+
+        disconnect() {
+            mutationObservers.delete(this);
+            this.targets.clear();
+        }
+    }
+    class FakeWorker {
+        postMessage(message) {
+            setTimeout(() => this.onmessage?.({ data: message.id }), message.ms);
+        }
+    }
+    class FakeBlob {}
     const localStorage = {
         getItem(key) {
             if (options.throwOnGet) throw new Error("read denied");
@@ -29,6 +57,7 @@ function createRuntime(initialQueue = [], options = {}) {
         setItem(key, value) {
             if (options.throwOnSet) throw new Error("quota exceeded");
             values.set(key, String(value));
+            if (key !== QUEUE_KEY) return;
             const written = JSON.parse(String(value));
             if (options.foreignLeaseAfterSet && written.activeOwner && !injectedForeignLease) {
                 injectedForeignLease = true;
@@ -38,6 +67,9 @@ function createRuntime(initialQueue = [], options = {}) {
                     activeUntil: Date.now() + 60_000,
                 }));
             }
+        },
+        removeItem(key) {
+            values.delete(key);
         },
     };
     const inputs = {
@@ -61,7 +93,9 @@ function createRuntime(initialQueue = [], options = {}) {
     const generalButton = { disabled: false, matches: () => true };
     let dispatchClicks = 0;
     let generateClicks = 0;
+    let forgeBusy = false;
     const promptHistory = [];
+    const events = [];
     let interruptClicks = 0;
     const generated = Array.isArray(options.generated) ? [...options.generated] : [options.generated || "new prompt"];
     const inlineGenerated = Array.isArray(options.inlineGenerated) ? [...options.inlineGenerated] : [options.inlineGenerated || "inline prompt"];
@@ -71,7 +105,9 @@ function createRuntime(initialQueue = [], options = {}) {
         matches: () => true,
         click() {
             dispatchClicks += 1;
+            events.push(`llm-click-${dispatchClicks}`);
             if (!options.dispatchNoDisable) this.disabled = true;
+            notifyMutation(this);
             const output = generated.shift() || "new prompt";
             setTimeout(() => {
                 if (typeof output === "object" && output.error) {
@@ -81,7 +117,11 @@ function createRuntime(initialQueue = [], options = {}) {
                     inputs.llm_prompt_studio_output.value = output;
                     studioStatusHost.textContent = "completed";
                 }
+                events.push(`llm-complete-${dispatchClicks}`);
                 this.disabled = false;
+                notifyMutation(inputs.llm_prompt_studio_output);
+                notifyMutation(studioStatusHost);
+                notifyMutation(this);
             }, options.llmDelay || 10);
         },
     };
@@ -108,23 +148,49 @@ function createRuntime(initialQueue = [], options = {}) {
         matches: () => true,
         click() {
             generateClicks += 1;
+            const generationNumber = generateClicks;
+            events.push(`forge-click-${generationNumber}`);
             promptHistory.push(inputs.txt2img_prompt.value);
-            this.disabled = true;
+            localStorage.setItem("txt2img_task_id", `task-${generationNumber}`);
+            const markBusy = () => {
+                forgeBusy = true;
+                if (!options.forgeNoDisable) this.disabled = true;
+                notifyMutation(interrupt);
+                notifyMutation(this);
+            };
+            if (options.forgeBusyStartDelay) setTimeout(markBusy, options.forgeBusyStartDelay);
+            else markBusy();
+            if (options.replaceTaskIdAfter) {
+                setTimeout(() => localStorage.setItem("txt2img_task_id", "foreign-task"), options.replaceTaskIdAfter);
+            }
+            if (options.forgeNeverCompletes) return;
             setTimeout(() => {
                 const transientFailure = forgeFailures.shift();
                 const failure = transientFailure || (options.forgeFailure ? "Error: generation failed" : "");
                 forgeStatusHost.textContent = failure || "completed";
                 if (!failure && !options.keepGalleryUnchanged) gallery.innerHTML = `image-${generateClicks}`;
+                forgeBusy = false;
                 this.disabled = false;
-            }, options.forgeDelay || 10);
+                const removeTaskId = () => localStorage.removeItem("txt2img_task_id");
+                if (options.taskIdRemovalDelay) setTimeout(removeTaskId, options.taskIdRemovalDelay);
+                else removeTaskId();
+                events.push(`forge-complete-${generationNumber}`);
+                notifyMutation(forgeStatusHost);
+                notifyMutation(interrupt);
+                notifyMutation(this);
+            }, (options.forgeBusyStartDelay || 0) + (options.forgeDelay || 10));
         },
     };
     const interrupt = {
-        offsetParent: {},
+        offsetParent: options.panelsHidden ? null : {},
         matches: () => true,
         click() {
             interruptClicks += 1;
+            forgeBusy = false;
             forgeGenerate.disabled = false;
+            localStorage.removeItem("txt2img_task_id");
+            notifyMutation(this);
+            notifyMutation(forgeGenerate);
         },
     };
     const hosts = {
@@ -145,6 +211,8 @@ function createRuntime(initialQueue = [], options = {}) {
         hosts[id] = { querySelector: () => field };
     }
     const document = {
+        hidden: Boolean(options.documentHidden),
+        visibilityState: options.documentHidden ? "hidden" : "visible",
         querySelector(selector) {
             const prompt = selector.match(/^#(txt2img|img2img)_prompt textarea/);
             if (prompt) return inputs[`${prompt[1]}_prompt`];
@@ -158,10 +226,22 @@ function createRuntime(initialQueue = [], options = {}) {
         Event: class Event {},
         HTMLInputElement: FakeInput,
         HTMLTextAreaElement: FakeInput,
-        setTimeout,
+        setTimeout: options.pollDelayFloor
+            ? (callback, ms) => setTimeout(callback, Math.max(ms, options.pollDelayFloor))
+            : setTimeout,
         clearTimeout,
         Date,
     };
+    if (options.withMutationObserver) context.MutationObserver = FakeMutationObserver;
+    if (options.withBackgroundWorker) {
+        context.Worker = FakeWorker;
+        context.Blob = FakeBlob;
+        context.URL = { createObjectURL: () => "blob:test", revokeObjectURL() {} };
+    }
+    if (options.performanceStep) {
+        let performanceNow = 0;
+        context.performance = { now: () => { performanceNow += options.performanceStep; return performanceNow; } };
+    }
     context.navigator = options.noWebLocks ? {} : {
         locks: {
             request(_name, _settings, callback) {
@@ -172,7 +252,7 @@ function createRuntime(initialQueue = [], options = {}) {
     context.window = context;
     context.localStorage = localStorage;
     context.getComputedStyle = (element) => ({
-        display: element === interrupt && !forgeGenerate.disabled ? "none" : "block",
+        display: element === interrupt ? (forgeBusy ? "block" : "none") : "block",
         visibility: "visible",
     });
     vm.runInNewContext(SCRIPT, context, { filename: "llm_prompt_studio_auto_loop.js" });
@@ -185,6 +265,7 @@ function createRuntime(initialQueue = [], options = {}) {
         get dispatchClicks() { return dispatchClicks; },
         get generateClicks() { return generateClicks; },
         get interruptClicks() { return interruptClicks; },
+        events() { return [...events]; },
         promptValue(target = "txt2img") { return inputs[`${target}_prompt`].value; },
         promptHistory() { return [...promptHistory]; },
         queue() {
@@ -193,6 +274,22 @@ function createRuntime(initialQueue = [], options = {}) {
             return Array.isArray(stored) ? stored : stored.rows;
         },
     };
+}
+
+async function settleWithin(run, cancel, timeoutMs = 3000) {
+    const timedOut = Symbol("timed-out");
+    let timer;
+    const result = await Promise.race([
+        run,
+        new Promise((resolve) => { timer = setTimeout(() => resolve(timedOut), timeoutMs); }),
+    ]);
+    if (result === timedOut) {
+        cancel();
+        await run;
+        assert.fail(`runtime did not settle within ${timeoutMs}ms`);
+    }
+    clearTimeout(timer);
+    return result;
 }
 
 async function main() {
@@ -331,6 +428,116 @@ async function main() {
     assert.deepEqual(continuousRun.queue().map((row) => row.status), ["completed", "completed"]);
     assert.match(continuousResult, /2/);
 
+    const hiddenBackgroundRun = createRuntime([], {
+        documentHidden: true,
+        panelsHidden: true,
+        withBackgroundWorker: true,
+        withMutationObserver: true,
+        dispatchNoDisable: true,
+        forgeNoDisable: true,
+        pollDelayFloor: 75,
+        forgeBusyStartDelay: 10,
+        forgeDelay: 20,
+        taskIdRemovalDelay: 100,
+        generated: ["background one", "background two"],
+    });
+    const hiddenBackgroundPending = hiddenBackgroundRun.api.generateAndRun({
+        request: "background request",
+        target: "txt2img",
+        writeMode: "replace",
+        continuous: true,
+        cycles: 2,
+    });
+    const hiddenBackgroundResult = await settleWithin(
+        hiddenBackgroundPending,
+        () => hiddenBackgroundRun.api.cancel(),
+    );
+    assert.match(hiddenBackgroundResult, /2/);
+    assert.equal(hiddenBackgroundRun.dispatchClicks, 2);
+    assert.equal(hiddenBackgroundRun.generateClicks, 2);
+    assert.deepEqual(hiddenBackgroundRun.promptHistory(), ["background one", "background two"]);
+    assert.deepEqual(hiddenBackgroundRun.queue().map((row) => row.status), ["completed", "completed"]);
+    assert.deepEqual(hiddenBackgroundRun.events(), [
+        "llm-click-1", "llm-complete-1", "forge-click-1", "forge-complete-1",
+        "llm-click-2", "llm-complete-2", "forge-click-2", "forge-complete-2",
+    ]);
+
+    const hiddenBackgroundFailure = createRuntime([], {
+        documentHidden: true,
+        panelsHidden: true,
+        withBackgroundWorker: true,
+        withMutationObserver: true,
+        dispatchNoDisable: true,
+        forgeNoDisable: true,
+        pollDelayFloor: 75,
+        forgeBusyStartDelay: 10,
+        forgeDelay: 20,
+        forgeFailures: ["Error: generation failed"],
+        generated: ["background failure", "must not run"],
+    });
+    const hiddenFailurePending = hiddenBackgroundFailure.api.generateAndRun({
+        request: "background failure request",
+        target: "txt2img",
+        writeMode: "replace",
+        continuous: true,
+        cycles: 2,
+    });
+    const hiddenFailureResult = await settleWithin(
+        hiddenFailurePending,
+        () => hiddenBackgroundFailure.api.cancel(),
+    );
+    assert.match(hiddenFailureResult, /fail|error/i);
+    assert.equal(hiddenBackgroundFailure.dispatchClicks, 1);
+    assert.equal(hiddenBackgroundFailure.generateClicks, 1);
+    assert.equal(hiddenBackgroundFailure.queue()[0].status, "pending");
+
+    const hiddenTimeout = createRuntime([
+        { index: 1, id: "hidden-timeout", prompt: "timeout prompt", status: "pending", requestId: "timeout", batchId: "timeout-batch" },
+    ], {
+        documentHidden: true,
+        withBackgroundWorker: true,
+        forgeNeverCompletes: true,
+        performanceStep: 1800001,
+    });
+    const hiddenTimeoutResult = await settleWithin(
+        hiddenTimeout.api.runStored({ target: "txt2img", writeMode: "replace" }),
+        () => hiddenTimeout.api.cancel(),
+    );
+    assert.match(hiddenTimeoutResult, /timeout/i);
+    assert.equal(hiddenTimeout.queue()[0].status, "pending");
+
+    const ownershipLoss = createRuntime([
+        { index: 1, id: "ownership-loss", prompt: "ownership prompt", status: "pending", requestId: "ownership", batchId: "ownership-batch" },
+    ], {
+        documentHidden: true,
+        withBackgroundWorker: true,
+        forgeNeverCompletes: true,
+        replaceTaskIdAfter: 10,
+    });
+    const ownershipLossResult = await settleWithin(
+        ownershipLoss.api.runStored({ target: "txt2img", writeMode: "replace" }),
+        () => ownershipLoss.api.cancel(),
+    );
+    assert.match(ownershipLossResult, /ownership changed/i);
+    assert.equal(ownershipLoss.queue()[0].status, "pending");
+
+    const replacedTask = createRuntime([
+        { index: 1, id: "replaced", prompt: "owned task", status: "pending", requestId: "owned", batchId: "owned-batch" },
+    ], {
+        documentHidden: true,
+        panelsHidden: true,
+        withBackgroundWorker: true,
+        forgeNoDisable: true,
+        forgeNeverCompletes: true,
+        replaceTaskIdAfter: 10,
+    });
+    const replacedPending = replacedTask.api.runStored({ target: "txt2img", writeMode: "replace" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    replacedTask.api.cancel();
+    await settleWithin(replacedPending, () => replacedTask.api.cancel());
+    assert.equal(replacedTask.interruptClicks, 0);
+    assert.equal(replacedTask.queue()[0].status, "pending");
+
     const inlineAppendRun = createRuntime([], {
         inlineGenerated: ["inline details one", "inline details two"],
     });
@@ -402,7 +609,7 @@ async function main() {
 
     const cancelledForge = createRuntime([
         { index: 1, id: "cancel", prompt: "cancel forge", status: "pending", requestId: "cancel request", batchId: "cancel-batch" },
-    ], { forgeDelay: 80 });
+    ], { forgeDelay: 80, forgeNoDisable: true, panelsHidden: true });
     const pendingForge = cancelledForge.api.runStored({ target: "txt2img", writeMode: "replace" });
     await new Promise((resolve) => setTimeout(resolve, 20));
     cancelledForge.api.cancel();
