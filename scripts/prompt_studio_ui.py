@@ -8,6 +8,8 @@ import json
 import logging
 import re
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -208,6 +210,198 @@ def _independent_batch_directive(sequence: int = 0) -> str:
         f"独立请求标识: {nonce}."
     )
 _PNG_BATCH_CANCEL = threading.Event()
+_SERVER_QUEUE_WAKE = threading.Event()
+_SERVER_QUEUE_CANCEL = threading.Event()
+_SERVER_QUEUE_CANCEL_BATCHES: set[str] = set()
+_SERVER_QUEUE_CANCEL_LOCK = threading.Lock()
+_SERVER_QUEUE_THREAD: threading.Thread | None = None
+_SERVER_QUEUE_START_LOCK = threading.Lock()
+
+
+def _server_queue_snapshot(batch_id: str, limit: int = 500) -> dict[str, Any]:
+    records = DB.list_server_queue(str(batch_id or ""), limit)
+    counts: dict[str, int] = {}
+    for record in records:
+        counts[record["status"]] = counts.get(record["status"], 0) + 1
+    total = len(records)
+    done = counts.get("completed", 0)
+    failed = counts.get("error", 0)
+    cancelled = counts.get("cancelled", 0)
+    active = counts.get("running", 0)
+    if not total:
+        status = "未找到服务端队列任务"
+    elif active:
+        status = f"服务端队列运行中：完成 {done}/{total}，失败 {failed}，取消 {cancelled}"
+    elif done + failed + cancelled >= total:
+        status = f"服务端队列已结束：完成 {done}，失败 {failed}，取消 {cancelled}"
+    else:
+        status = f"服务端队列等待中：{done}/{total}"
+    return {"batch_id": str(batch_id or ""), "status": status, "counts": counts, "jobs": records}
+
+
+def _server_render_prompt(prompt: str, target: str, job_id: str) -> None:
+    """Submit txt2img through Forge's own API from the server worker."""
+    target = str(target or "none")
+    if target == "none":
+        return
+    if target != "txt2img":
+        raise RuntimeError("服务端队列目前只支持 txt2img；img2img 需要由队列任务提供 init image")
+    try:
+        from modules import shared
+        port = int(getattr(shared.cmd_opts, "port", 7860) or 7860)
+        auth = str(getattr(shared.cmd_opts, "api_auth", "") or "").split(",", 1)[0]
+    except Exception:
+        port, auth = 7860, ""
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/sdapi/v1/txt2img",
+        data=json.dumps({
+            "prompt": str(prompt), "negative_prompt": "", "steps": 20,
+            "send_images": False, "save_images": True,
+            "force_task_id": f"server-queue-{job_id}",
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    if auth and ":" in auth:
+        request.add_header("Authorization", "Basic " + base64.b64encode(auth.encode("utf-8")).decode("ascii"))
+    try:
+        with urllib.request.urlopen(request, timeout=3600) as response:
+            response.read(1024)
+    except urllib.error.HTTPError as error:
+        body = error.read(2048).decode("utf-8", "replace")
+        raise RuntimeError(f"Forge API HTTP {error.code}: {body[:500]}") from error
+
+
+def _server_queue_worker() -> None:
+    while True:
+        job = DB.claim_server_queue_job()
+        if not job:
+            _SERVER_QUEUE_WAKE.wait(1.0)
+            _SERVER_QUEUE_WAKE.clear()
+            continue
+        with _SERVER_QUEUE_CANCEL_LOCK:
+            batch_cancelled = job["batch_id"] in _SERVER_QUEUE_CANCEL_BATCHES
+        if _SERVER_QUEUE_CANCEL.is_set() or batch_cancelled:
+            DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消")
+            _SERVER_QUEUE_CANCEL.clear()
+            continue
+        config = dict(job.get("config") or {})
+        cancel_event = _SERVER_QUEUE_CANCEL
+        try:
+            generated, _system, status = _generate(
+                job["request"], "", config.get("preset", "Danbooru Tags"), config.get("system_override", ""),
+                config.get("base_model", "Auto / checkpoint default"), config.get("safety", "SFW"),
+                config.get("nsfw_injection", ""), config.get("user_instruction", ""),
+                config.get("provider", "OpenAI Compatible"), config.get("endpoint", ""), config.get("model", ""), "",
+                float(config.get("temperature", 0.9) or 0.9), int(config.get("timeout", 90) or 90), int(config.get("max_tokens", 1024) or 1024),
+                bool(config.get("send_temperature", True)), 0, 0,
+                bool(config.get("remove_bad", True)), config.get("remove_terms", ""), bool(config.get("shuffle", False)),
+                bool(config.get("spaces", False)), int(config.get("max_tags", 0) or 0), config.get("structured_mode", "Plain Prompt"),
+                int(config.get("region_count", 1) or 1), float(config.get("save_score", 0) or 0), bool(config.get("cache_result", True)),
+                "server_queue", f"server_queue:{job['batch_id']}:{job['position']}", True, cancel_event,
+                _independent_batch_directive(job["position"]),
+            )
+            if cancel_event.is_set():
+                DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消")
+                cancel_event.clear()
+                continue
+            if not generated:
+                raise RuntimeError(status or "LLM 未返回 Prompt")
+            if bool(config.get("cache_result", True)):
+                DB.save_prompt(generated, "", config.get("preset", "Danbooru Tags"), config.get("base_model", ""), 0, job["request"], score_source="unrated", source_kind="server_queue", source_ref=f"server_queue:{job['id']}", dedupe=True)
+            _server_render_prompt(generated, job.get("target", "none"), job["id"])
+            DB.update_server_queue_job(job["id"], "completed", prompt=generated)
+        except Exception as error:
+            LOGGER.exception("server queue job failed: %s", job["id"])
+            with _SERVER_QUEUE_CANCEL_LOCK:
+                batch_cancelled = job["batch_id"] in _SERVER_QUEUE_CANCEL_BATCHES
+            DB.update_server_queue_job(job["id"], "cancelled" if cancel_event.is_set() or batch_cancelled else "error", error=str(error))
+            if cancel_event.is_set():
+                cancel_event.clear()
+
+
+def _ensure_server_queue_worker() -> None:
+    global _SERVER_QUEUE_THREAD
+    with _SERVER_QUEUE_START_LOCK:
+        if _SERVER_QUEUE_THREAD and _SERVER_QUEUE_THREAD.is_alive():
+            return
+        DB.recover_server_queue()
+        _SERVER_QUEUE_CANCEL.clear()
+        _SERVER_QUEUE_THREAD = threading.Thread(target=_server_queue_worker, name="llm-prompt-studio-server-queue", daemon=True)
+        _SERVER_QUEUE_THREAD.start()
+
+
+def _enqueue_server_queue(payload: dict[str, Any]) -> dict[str, Any]:
+    requests = payload.get("requests") if isinstance(payload, dict) else None
+    if not isinstance(requests, list):
+        requests = str(payload.get("source_text") or "").splitlines() if isinstance(payload, dict) else []
+    requests = [str(item).strip() for item in requests if str(item).strip() and not str(item).strip().startswith("#")]
+    if not requests:
+        raise ValueError("服务端队列至少需要一条请求")
+    if len(requests) > 1000:
+        raise ValueError("单次服务端队列最多 1000 条请求")
+    if any(len(request) > 12000 for request in requests):
+        raise ValueError("单条服务端队列请求最多 12000 个字符")
+    target = str(payload.get("target") or "none")
+    if target not in {"none", "txt2img"}:
+        raise ValueError("服务端队列目标只支持 none 或 txt2img")
+    config = dict(payload.get("config") or {}) if isinstance(payload, dict) else {}
+    workflow = _workflow_settings()
+    connection = _connection_settings()
+    merged = {
+        "preset": workflow["preset"], "base_model": workflow["base_model"], "safety": workflow["safety"],
+        "temperature": max(float(connection["temperature"] or 0.9), _MIN_INDEPENDENT_BATCH_TEMPERATURE),
+        "timeout": connection["timeout"], "max_tokens": connection["max_tokens"], "send_temperature": connection["send_temperature"],
+        "provider": connection["provider"], "endpoint": connection["endpoint"], "model": connection["model"],
+        "system_override": workflow["system_override"], "nsfw_injection": workflow["nsfw_injection"], "user_instruction": workflow["user_instruction"],
+        "cache_result": True, "target": target,
+    }
+    merged.update({key: value for key, value in config.items() if key in merged and key not in {"provider", "endpoint", "model"}})
+    batch_id = uuid.uuid4().hex
+    with _SERVER_QUEUE_CANCEL_LOCK:
+        _SERVER_QUEUE_CANCEL_BATCHES.discard(batch_id)
+    count = DB.enqueue_server_queue(batch_id, [
+        {"request": request, "position": index, "target": merged["target"], "config": merged}
+        for index, request in enumerate(requests, start=1)
+    ])
+    _ensure_server_queue_worker()
+    _SERVER_QUEUE_WAKE.set()
+    return _server_queue_snapshot(batch_id) | {"queued": count}
+
+
+def _server_queue_html(snapshot: dict[str, Any]) -> str:
+    rows = []
+    for item in snapshot.get("jobs", []):
+        rows.append(
+            "<div class='lps-server-queue-row'>"
+            f"<span>{int(item.get('position', 0))}</span>"
+            f"<b>{html.escape(str(item.get('status', '')))}</b>"
+            f"<code>{html.escape(str(item.get('prompt') or item.get('request') or ''))}</code>"
+            f"<small>{html.escape(str(item.get('error') or ''))}</small>"
+            "</div>"
+        )
+    return "".join(rows) or "<div class='lps-auto-loop-empty'>暂无服务端队列记录。</div>"
+
+
+def _server_queue_start_ui(source_text: str, target: str):
+    try:
+        snapshot = _enqueue_server_queue({"source_text": source_text, "target": target})
+        return snapshot["batch_id"], snapshot["status"], _server_queue_html(snapshot)
+    except Exception as error:
+        return "", f"服务端队列提交失败：{_safe_error(error)}", ""
+
+
+def _server_queue_refresh_ui(batch_id: str):
+    snapshot = _server_queue_snapshot(batch_id)
+    return snapshot["status"], _server_queue_html(snapshot)
+
+
+def _server_queue_cancel_ui(batch_id: str):
+    with _SERVER_QUEUE_CANCEL_LOCK:
+        _SERVER_QUEUE_CANCEL_BATCHES.add(str(batch_id or ""))
+    _SERVER_QUEUE_CANCEL.set()
+    DB.cancel_server_queue(batch_id)
+    snapshot = _server_queue_snapshot(batch_id)
+    return snapshot["status"] + "；已请求取消", _server_queue_html(snapshot)
 
 
 def _as_rows(records: list[dict[str, Any]]) -> list[list[Any]]:
@@ -2072,6 +2266,7 @@ def _clear_finished_handoffs():
 
 
 def on_app_started(_, app):
+    _ensure_server_queue_worker()
     recovered_handoffs = DB.recover_stale_handoffs()
     if recovered_handoffs:
         LOGGER.warning("recovered %s stale Ranbooru handoff claims", recovered_handoffs)
@@ -2120,6 +2315,26 @@ def on_app_started(_, app):
         @app.get("/llm-prompt-studio/v1/cache", dependencies=api_dependencies)
         def prompt_studio_cache(query: str = "", limit: int = 100):
             return {"records": DB.list_prompts(query, limit)}
+
+        @app.post("/llm-prompt-studio/v1/queue", dependencies=api_dependencies)
+        def prompt_studio_queue(payload: dict[str, Any]):
+            try:
+                return _enqueue_server_queue(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.get("/llm-prompt-studio/v1/queue/{batch_id}", dependencies=api_dependencies)
+        def prompt_studio_queue_status(batch_id: str):
+            return _server_queue_snapshot(batch_id)
+
+        @app.post("/llm-prompt-studio/v1/queue/{batch_id}/cancel", dependencies=api_dependencies)
+        def prompt_studio_queue_cancel(batch_id: str):
+            with _SERVER_QUEUE_CANCEL_LOCK:
+                _SERVER_QUEUE_CANCEL_BATCHES.add(str(batch_id))
+            _SERVER_QUEUE_CANCEL.set()
+            cancelled = DB.cancel_server_queue(batch_id)
+            _SERVER_QUEUE_WAKE.set()
+            return _server_queue_snapshot(batch_id) | {"cancelled_now": cancelled}
 
         @app.post("/llm-prompt-studio/v1/handoff", dependencies=api_dependencies)
         def prompt_studio_handoff(payload: dict[str, Any]):
@@ -2291,6 +2506,19 @@ def on_ui_tabs():
                                 elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
                             )
                             gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
+                            gr.Markdown("### 服务端队列（页面关闭后仍继续）")
+                            gr.Markdown("服务端线程负责逐条调用 LLM，并可通过 Forge API 生成 txt2img。此处日志和已生成 Prompt 来自 SQLite，不依赖浏览器保持连接。")
+                            server_queue_target = gr.Radio(
+                                label="服务端生图目标", choices=[("只生成 Prompt", "none"), ("txt2img", "txt2img")],
+                                value="none", elem_id="llm_prompt_studio_server_queue_target",
+                            )
+                            with gr.Row():
+                                server_queue_start = gr.Button("加入服务端队列", variant="primary", elem_id="llm_prompt_studio_server_queue_start")
+                                server_queue_refresh = gr.Button("刷新日志", elem_id="llm_prompt_studio_server_queue_refresh")
+                                server_queue_cancel = gr.Button("取消服务端队列", variant="stop", elem_id="llm_prompt_studio_server_queue_cancel")
+                            server_queue_id = gr.Textbox(label="服务端任务 ID", interactive=False, elem_id="llm_prompt_studio_server_queue_id")
+                            server_queue_status = gr.HTML("尚未提交服务端任务。", elem_id="llm_prompt_studio_server_queue_status", elem_classes=["lps-status"])
+                            server_queue_log = gr.HTML("", elem_id="llm_prompt_studio_server_queue_log", elem_classes=["lps-auto-loop-log"])
                     with gr.Tab("PNG 润色 / 扩写", elem_id="llm_prompt_studio_png_batch_tab"):
                         png_batch_file = gr.File(label="导入 prompt_batch.v1 JSON", file_types=[".json"], type="filepath", elem_id="llm_prompt_studio_png_batch_file")
                         with gr.Accordion("批次 JSON", open=False):
@@ -2670,6 +2898,31 @@ def on_ui_tabs():
             outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state, batch_queue],
         )
         batch_cancel.click(_cancel_batch_generation, inputs=batch_task_id, outputs=batch_status)
+        server_queue_start_event = server_queue_start.click(
+            _server_queue_start_ui,
+            inputs=[batch_sources, server_queue_target],
+            outputs=[server_queue_id, server_queue_status, server_queue_log],
+            queue=False,
+        )
+        server_queue_start_event.then(
+            fn=None,
+            inputs=server_queue_id,
+            outputs=server_queue_status,
+            js="(batchId) => window.llmPromptStudioAutoLoop.watchServerQueue(batchId)",
+            queue=False,
+        )
+        server_queue_refresh.click(
+            _server_queue_refresh_ui,
+            inputs=server_queue_id,
+            outputs=[server_queue_status, server_queue_log],
+            queue=False,
+        )
+        server_queue_cancel.click(
+            _server_queue_cancel_ui,
+            inputs=server_queue_id,
+            outputs=[server_queue_status, server_queue_log],
+            queue=False,
+        )
         batch_select_all_issues.click(_select_all_batch_issues, inputs=batch_issue_state, outputs=batch_issue_selection)
         batch_clear_issue_selection.click(_clear_batch_issue_selection, outputs=batch_issue_selection)
         batch_retry_selected.click(

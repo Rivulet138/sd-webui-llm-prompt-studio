@@ -17,6 +17,7 @@
         lastBatchRowIds: [],
     };
     const inlineRuns = { txt2img: null, img2img: null };
+    const serverQueueWatchers = new Map();
     let backgroundTimer = undefined;
 
     function root() {
@@ -715,6 +716,44 @@
         return message;
     }
 
+    function renderServerQueue(snapshot) {
+        const statusHost = find("llm_prompt_studio_server_queue_status");
+        const logHost = find("llm_prompt_studio_server_queue_log");
+        if (statusHost) statusHost.innerHTML = escapeHtml(snapshot?.status || "服务端队列状态未知");
+        if (!logHost) return;
+        const rows = Array.isArray(snapshot?.jobs) ? snapshot.jobs : [];
+        logHost.innerHTML = rows.length
+            ? rows.map((row) => `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><code>${escapeHtml(row.prompt || row.request || "")}</code><small>${escapeHtml(row.error || "")}</small></div>`).join("")
+            : '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
+    }
+
+    async function watchServerQueue(batchId) {
+        const id = String(batchId || "").trim();
+        if (!id) return "尚未提交服务端任务";
+        const prior = serverQueueWatchers.get(id);
+        if (prior) prior.cancelled = true;
+        const watcher = { cancelled: false };
+        serverQueueWatchers.set(id, watcher);
+        while (!watcher.cancelled) {
+            try {
+                const response = await fetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(id)}`, { cache: "no-store" });
+                if (!response.ok) throw new Error(`服务端队列 HTTP ${response.status}`);
+                const snapshot = await response.json();
+                renderServerQueue(snapshot);
+                const counts = snapshot.counts || {};
+                const total = Number(snapshot.jobs?.length || 0);
+                const finished = Number(counts.completed || 0) + Number(counts.error || 0) + Number(counts.cancelled || 0);
+                if (total && finished >= total) break;
+            } catch (error) {
+                const statusHost = find("llm_prompt_studio_server_queue_status");
+                if (statusHost) statusHost.innerHTML = escapeHtml(`服务端队列轮询失败：${error?.message || error}`);
+            }
+            await wait(1000);
+        }
+        if (serverQueueWatchers.get(id) === watcher) serverQueueWatchers.delete(id);
+        return String(find("llm_prompt_studio_server_queue_status")?.textContent || "服务端队列已结束");
+    }
+
     function cancel() {
         const run = state.active;
         if (!run) return "当前没有运行中的任务";
@@ -750,6 +789,7 @@
         inlineOnce,
         inlineLoop,
         cancelInline,
+        watchServerQueue,
         clearQueue,
         cancel,
         start: generateBatch,

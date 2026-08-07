@@ -73,6 +73,14 @@ git pull
 
 Forge 生图失败或观察超时不会自动再次点击生图按钮，因为生图操作可能已经在 Forge 内部完成，自动重放会造成重复图片。对应队列记录会恢复为 `pending`，确认 Forge 已空闲后可用 `投入已有队列生图` 显式重试。
 
+#### 服务端队列（推荐）
+
+批处理页的“服务端队列（页面关闭后仍继续）”会把每一条请求和配置先写入 `user/prompt_studio.db`，再由 Forge 进程内的后台 worker 逐条执行。浏览器只提交任务并轮询状态，因此隐藏、刷新或关闭 Gradio 页面不会停止任务。日志中的每行包含请求、生成的 Prompt、状态、错误和尝试次数；重新打开页面后输入任务 ID 并点击“刷新日志”即可恢复查看。
+
+- “只生成 Prompt”只调用 LLM 并写入本地 Prompt 缓存。
+- “txt2img”在 Prompt 成功后调用 Forge `/sdapi/v1/txt2img`，使用 Forge 自身队列和保存设置；需要以 `--api` 启动 Forge。
+- 取消只会取消待处理项，并向当前运行项发送取消信号；失败记录会保留在日志中，不会悄悄丢失。
+
 #### PNG 润色 / 扩写
 
 接收 PNG Prompt Collector 发送的 `prompt_batch.v1` JSON：
@@ -174,6 +182,9 @@ assets/wildcards/
 | --- | --- | --- |
 | POST | `/llm-prompt-studio/v1/generate` | 使用已保存连接生成 Prompt |
 | GET | `/llm-prompt-studio/v1/cache` | 查询本地缓存 |
+| POST | `/llm-prompt-studio/v1/queue` | 创建持久化服务端队列 |
+| GET | `/llm-prompt-studio/v1/queue/{batch_id}` | 查询队列状态、日志和 Prompt |
+| POST | `/llm-prompt-studio/v1/queue/{batch_id}/cancel` | 取消待处理队列项 |
 | POST | `/llm-prompt-studio/v1/handoff` | 接收 Ranbooru 交接 |
 | POST | `/llm-prompt-studio/v1/handoff/process` | 处理并缓存交接记录 |
 | GET | `/llm-prompt-studio/v1/handoffs` | 查询交接箱 |

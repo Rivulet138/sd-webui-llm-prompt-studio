@@ -6,6 +6,9 @@
 .lps-table { overflow-x: auto; }
 #llm_prompt_studio_auto_loop_log { display: grid !important; grid-auto-rows: max-content; gap: .4rem; margin-top: .75rem; min-height: 0 !important; max-height: min(32rem, 55vh) !important; overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; scrollbar-gutter: stable; contain: layout paint; }
 #llm_prompt_studio_auto_loop_log > .prose { display: grid; gap: .4rem; min-width: 0; margin: 0; padding: 0; }
+.lps-server-queue-row { display: grid; grid-template-columns: 3rem 6rem minmax(0, 1fr); gap: .5rem; align-items: start; padding: .45rem .55rem; border-bottom: 1px solid var(--border-color-primary, #555); }
+.lps-server-queue-row code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.lps-server-queue-row small { grid-column: 3; color: var(--body-text-color-subdued, #aaa); overflow-wrap: anywhere; }
 .lps-auto-loop-row { display: grid; grid-template-columns: 3rem 7rem minmax(0, 1fr); gap: .5rem; align-items: start; width: 100%; min-width: 0; padding: .45rem .6rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; box-sizing: border-box; }
 .lps-auto-loop-row code { display: block; min-width: 0; max-height: 7rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
 .lps-auto-loop-empty { padding: .6rem; color: var(--body-text-color-subdued, #999); }

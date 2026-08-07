@@ -386,6 +386,20 @@ class StudioDB:
                     updated_at INTEGER NOT NULL,
                     UNIQUE(source_kind, source_ref)
                 );
+                CREATE TABLE IF NOT EXISTS server_queue_jobs (
+                    id TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    request TEXT NOT NULL,
+                    prompt TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT 'none',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    config_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
             """)
             handoff_columns = {row["name"] for row in conn.execute("PRAGMA table_info(handoffs)").fetchall()}
             if "revision" not in handoff_columns:
@@ -416,12 +430,102 @@ class StudioDB:
                 "ON prompts(source_kind, source_ref) WHERE source_kind != '' AND source_ref != ''"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_handoffs_status_updated ON handoffs(status, updated_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_server_queue_batch_position ON server_queue_jobs(batch_id, position)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_server_queue_status_updated ON server_queue_jobs(status, updated_at)")
 
     @staticmethod
     def _record_hash(record: dict[str, Any]) -> str:
         fields = ["prompt", "negative_prompt", "output_mode", "base_model", "tags"]
         normalized = "\x1f".join(str(record.get(field) or "").strip() for field in fields)
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def enqueue_server_queue(self, batch_id: str, jobs: Iterable[dict[str, Any]]) -> int:
+        """Persist a server-owned queue before returning control to the browser."""
+        now = int(time.time())
+        prepared = []
+        for index, item in enumerate(jobs, start=1):
+            request = str(item.get("request") or "").strip()
+            if not request:
+                continue
+            prepared.append((
+                str(item.get("id") or secrets.token_hex(12)), str(batch_id), int(item.get("position") or index),
+                request, str(item.get("target") or "none"), json.dumps(dict(item.get("config") or {}), ensure_ascii=False), now, now,
+            ))
+        if not prepared:
+            return 0
+        with self.lock, self._connection() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO server_queue_jobs(id,batch_id,position,request,target,config_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                prepared,
+            )
+        return len(prepared)
+
+    def claim_server_queue_job(self) -> dict[str, Any] | None:
+        """Atomically claim the next pending job; stale running jobs are recoverable."""
+        now = int(time.time())
+        with self.lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM server_queue_jobs WHERE status='pending' ORDER BY created_at, position LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = conn.execute(
+                "UPDATE server_queue_jobs SET status='running', attempts=attempts+1, error='', updated_at=? WHERE id=? AND status='pending'",
+                (now, str(row[0])),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = conn.execute("SELECT * FROM server_queue_jobs WHERE id=?", (str(row[0]),)).fetchone()
+        record = dict(claimed) if claimed else None
+        if record:
+            try:
+                record["config"] = json.loads(record.pop("config_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                record["config"] = {}
+        return record
+
+    def update_server_queue_job(self, job_id: str, status: str, prompt: str = "", error: str = "") -> bool:
+        if status not in {"pending", "running", "completed", "error", "cancelled"}:
+            raise ValueError(f"Unsupported server queue status: {status}")
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE server_queue_jobs SET status=?, prompt=?, error=?, updated_at=? WHERE id=?",
+                (status, str(prompt or ""), str(error or "")[:4000], int(time.time()), str(job_id)),
+            )
+        return cursor.rowcount > 0
+
+    def list_server_queue(self, batch_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        with self.lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM server_queue_jobs WHERE batch_id=? ORDER BY position LIMIT ?",
+                (str(batch_id), max(1, min(int(limit or 500), 2000))),
+            ).fetchall()
+        records = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["config"] = json.loads(item.pop("config_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["config"] = {}
+            records.append(item)
+        return records
+
+    def cancel_server_queue(self, batch_id: str) -> int:
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE server_queue_jobs SET status='cancelled', error='用户请求取消', updated_at=? WHERE batch_id=? AND status='pending'",
+                (int(time.time()), str(batch_id)),
+            )
+        return cursor.rowcount
+
+    def recover_server_queue(self, max_age_seconds: int = 1800) -> int:
+        cutoff = int(time.time()) - max(0, int(max_age_seconds))
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE server_queue_jobs SET status='pending', error='服务重启后自动恢复', updated_at=? WHERE status='running' AND updated_at<=?",
+                (int(time.time()), cutoff),
+            )
+        return cursor.rowcount
 
     def save_prompt(
         self, prompt: str, negative: str = "", output_mode: str = "", base_model: str = "", score: float = 0,

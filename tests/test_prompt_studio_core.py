@@ -19,6 +19,21 @@ from prompt_studio_core import (
 
 
 class PromptStudioCoreTests(unittest.TestCase):
+    def test_server_queue_persists_claim_status_and_prompt_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = StudioDB(Path(directory) / "studio.db")
+            self.assertEqual(db.enqueue_server_queue("batch-1", [{
+                "id": "job-1", "position": 1, "request": "a distinct scene", "target": "none",
+                "config": {"preset": "Danbooru Tags"},
+            }]), 1)
+            claimed = db.claim_server_queue_job()
+            self.assertEqual(claimed["status"], "running")
+            self.assertEqual(claimed["config"]["preset"], "Danbooru Tags")
+            db.update_server_queue_job("job-1", "completed", prompt="1girl, library")
+            record = db.list_server_queue("batch-1")[0]
+            self.assertEqual(record["prompt"], "1girl, library")
+            self.assertEqual(record["status"], "completed")
+
     def test_call_llm_retries_transient_failures_then_returns_once(self):
         response = {"choices": [{"message": {"content": "recovered prompt"}}]}
         with patch(
