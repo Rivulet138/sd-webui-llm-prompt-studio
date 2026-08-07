@@ -71,7 +71,7 @@ function createRuntime(initialQueue = [], options = {}) {
         matches: () => true,
         click() {
             dispatchClicks += 1;
-            this.disabled = true;
+            if (!options.dispatchNoDisable) this.disabled = true;
             const output = generated.shift() || "new prompt";
             setTimeout(() => {
                 if (typeof output === "object" && output.error) {
@@ -89,7 +89,7 @@ function createRuntime(initialQueue = [], options = {}) {
         disabled: false,
         matches: () => true,
         click() {
-            this.disabled = true;
+            if (!options.inlineNoDisable) this.disabled = true;
             const output = inlineGenerated.shift() || "inline prompt";
             setTimeout(() => {
                 if (typeof output === "object" && output.error) {
@@ -260,6 +260,13 @@ async function main() {
     assert.equal(repeatedLines.dispatchClicks, 2);
     assert.deepEqual(repeatedLines.queue().map((row) => row.prompt), ["variation one", "variation two"]);
 
+    const batchWithoutBusySignal = createRuntime([], {
+        generated: ["no disabled batch"], dispatchNoDisable: true,
+    });
+    await batchWithoutBusySignal.api.generateBatch({ request: "start batch" });
+    assert.equal(batchWithoutBusySignal.dispatchClicks, 1);
+    assert.equal(batchWithoutBusySignal.queue()[0].prompt, "no disabled batch");
+
     const exhaustedLlm = createRuntime([], {
         generated: [{ error: "LLM HTTP 503: retries exhausted" }, "must not be requested"],
     });
@@ -344,6 +351,15 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.match(inlineProgress.inlineLoopStatusHost.innerHTML, /正在生成 Prompt/);
     await inlineProgressRun;
+
+    const inlineWithoutBusySignal = createRuntime([], {
+        inlineGenerated: ["no disabled state"], inlineNoDisable: true,
+    });
+    const inlineWithoutBusyResult = await inlineWithoutBusySignal.api.inlineLoop({
+        slot: "txt2img", request: "start explicitly", source: "llm", cycles: 1,
+    });
+    assert.match(inlineWithoutBusyResult, /1/);
+    assert.equal(inlineWithoutBusySignal.generateClicks, 1);
 
     const inlineCancelRun = createRuntime([], { forgeDelay: 80, inlineGenerated: ["cancel details"] });
     const pendingInline = inlineCancelRun.api.inlineLoop({

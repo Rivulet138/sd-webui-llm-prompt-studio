@@ -227,16 +227,18 @@
             const busy = Boolean(button?.disabled);
             sawBusy ||= busy;
             const currentStatus = String(statusHost?.textContent || "");
-            if (currentStatus !== beforeStatus && FAILURE_PATTERN.test(currentStatus)) {
-                throw new Error(currentStatus || "LLM Prompt 生成失败");
-            }
-            if (sawBusy && !busy) {
+            const result = String(output?.value || "").trim();
+            const changed = currentStatus !== beforeStatus || result !== beforeOutput;
+            if (!busy && changed) {
                 await wait(50);
                 assertActive(run);
-                const result = String(output?.value || "").trim();
-                if (result && (result !== beforeOutput || currentStatus !== beforeStatus)
-                    && !FAILURE_PATTERN.test(String(statusHost?.textContent || ""))) return result;
-                throw new Error(currentStatus || "LLM Prompt 生成失败：未返回结果");
+                const finalStatus = String(statusHost?.textContent || "");
+                const finalResult = String(output?.value || "").trim();
+                if (FAILURE_PATTERN.test(finalStatus)) throw new Error(finalStatus || "LLM Prompt 生成失败");
+                if (finalResult) return finalResult;
+                if (sawBusy || finalStatus !== beforeStatus) {
+                    throw new Error(finalStatus || "LLM Prompt 生成失败：未返回结果");
+                }
             }
             await wait(25);
         }

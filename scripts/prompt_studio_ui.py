@@ -1593,10 +1593,10 @@ def _create_inline_panel(slot, prompt_target):
                 elem_id=f"llm_prompt_studio_{slot}_inline_cycles",
             )
         with gr.Row():
-            inline_once = gr.Button("取一条并写入", elem_id=f"llm_prompt_studio_{slot}_inline_once")
-            inline_start = gr.Button("开始连续生成", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
+            inline_once = gr.Button("只生成并写入 Prompt", elem_id=f"llm_prompt_studio_{slot}_inline_once")
+            inline_start = gr.Button("启动 Prompt + Forge 流程", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
             inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
-        inline_loop_status = gr.HTML("尚未启动：选择 Prompt 来源后点击开始连续生成。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+        inline_loop_status = gr.HTML("尚未启动：选择 Prompt 来源后点击“启动 Prompt + Forge 流程”。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
         inline_generate = gr.Button("内嵌 LLM 生成", visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_generate")
         inline_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_output")
         inline_system_preview = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_system_preview")
