@@ -635,6 +635,29 @@ class PromptStudioCoreTests(unittest.TestCase):
         self.assertIn("score_*", system)
         self.assertIn("1.05 to 1.20", system)
 
+    def test_presets_remove_style_generation_without_dropping_model_rules(self):
+        positive_style_instructions = (
+            "quality/style",
+            "style anchor",
+            "style details",
+            "one style",
+            "rendering descriptors",
+            "Anima-style",
+        )
+        for name, profile in PRESETS.items():
+            with self.subTest(profile=name):
+                self.assertFalse(any(term in profile for term in positive_style_instructions))
+
+        self.assertIn("canonical lowercase Danbooru tags", PRESETS["Danbooru Tags"])
+        self.assertIn("medium, subject and appearance", PRESETS["Natural Language"])
+        self.assertIn("best_quality", PRESETS["NoobAI Tags"])
+        self.assertIn("medium/rendering", PRESETS["Krea 2 Natural"])
+
+        self.assertIn("1.05-1.20", BASE_MODEL_GUIDANCE["Pony / Illustrious"])
+        self.assertIn("best_quality", BASE_MODEL_GUIDANCE["NoobAI"])
+        self.assertIn("medium/rendering", BASE_MODEL_GUIDANCE["Krea 2"])
+        self.assertIn("very_aesthetic", BASE_MODEL_GUIDANCE["NoobAI"])
+
     def test_settings_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
