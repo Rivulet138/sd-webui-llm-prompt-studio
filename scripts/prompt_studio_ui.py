@@ -39,6 +39,17 @@ DEFAULT_LLM_SETTINGS = {
     "max_tokens": 1024,
     "send_temperature": True,
 }
+GENERAL_CREATIVE_REQUEST_TEMPLATE = """请围绕原始 Prompt 的主体，生成一条独立、完整、可直接用于扩散模型的 SFW 内容 Prompt。
+
+目标主体是可爱、萌系的年幼外观角色或兽耳少女，必须完整着装、自然姿态、非性化，不描写裸体、性行为、性暗示或 fetish 内容；二次元表现由原始 Prompt 的 LoRA/tag 决定，不要在本轮输出中描述画风。
+
+Forge 写回时会自动保留原始 Prompt 中的主体身份、LoRA、权重、标签和内容限制。你不需要看见、复述或重写这些基底内容，也不要新增画师名、工作室名、作品名、艺术风格词、画风描述、渲染媒介词、美学标签或质量宣传词；画风由原始 Prompt 中的 LoRA/tag 决定。
+
+本次只补充内容维度：角色外观细节、服装和配饰、动作、表情、人与物体的关系、环境、道具、空间层次、构图、景别、视角、时间、天气和光照。
+
+每次请求都是无上下文的一次性请求，不得参考上一轮输出。重复生成时保留核心主体，但至少改变三项内容维度，例如动作、服装、道具、环境、构图、时间天气或叙事事件。
+
+只返回一条完整 Prompt，不要解释，不要标题，不要负面 Prompt，不要风格词。"""
 PRESET_UI_CHOICES = [
     ("Danbooru 标签", "Danbooru Tags"),
     ("Danbooru 标签 + 自然语言", "Danbooru + Natural"),
@@ -178,6 +189,22 @@ _INDEPENDENT_BATCH_CONDITIONS = (
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
 _MIN_INDEPENDENT_BATCH_TEMPERATURE = 0.9
+_INDEPENDENT_CREATIVE_LOCK = threading.Lock()
+_independent_creative_sequence = 0
+_INDEPENDENT_CREATIVE_FOCI = (
+    "change the character's action and expression while keeping the same core subject",
+    "change the clothing details, accessories, and interaction with one meaningful prop",
+    "change the setting and spatial depth with distinct foreground, middle ground, and background objects",
+    "change the camera distance, viewing angle, and subject placement in the frame",
+    "change the time, weather, and practical lighting so they affect the scene",
+    "change the relationship between the character and nearby objects or companions",
+    "change the small narrative event that is happening around the character",
+    "change the environment from interior to exterior or vice versa without changing the core subject",
+    "change the pose and movement direction while keeping the outfit fully described",
+    "change the location layout and readable environmental landmarks",
+    "change the foreground framing and depth cues while keeping the subject clearly visible",
+    "combine a different action, prop, and environmental condition into one coherent moment",
+)
 
 
 def _independent_batch_directive(sequence: int = 0) -> str:
@@ -209,6 +236,35 @@ def _independent_batch_directive(sequence: int = 0) -> str:
         "by changing only art style, quality words, synonyms, or tag order. Return exactly one complete Prompt. "
         f"独立请求标识: {nonce}."
     )
+
+
+def _independent_creative_directive(sequence: int = 0) -> str:
+    """Create a stateless content-variation hint for auto/inline generation."""
+    global _independent_creative_sequence
+    requested_sequence = int(sequence or 0)
+    if requested_sequence > 0:
+        focus_index = requested_sequence - 1
+    else:
+        with _INDEPENDENT_CREATIVE_LOCK:
+            focus_index = _independent_creative_sequence
+            _independent_creative_sequence += 1
+    focus = _INDEPENDENT_CREATIVE_FOCI[focus_index % len(_INDEPENDENT_CREATIVE_FOCI)]
+    nonce = uuid.uuid4().hex[:12]
+    return (
+        "This is one independent one-shot creative request. Do not use conversation history, "
+        "previous outputs, cached examples, or any assumed continuation. Preserve the user's "
+        "explicit subject and content restrictions. Treat LoRA tokens, weights, and user-owned base tags "
+        "as immutable Forge base-prompt data: do not repeat, rewrite, or invent them. Generate only content "
+        "descriptions: character appearance, "
+        "clothing, action, expression, environment, props, composition, camera, time, weather, "
+        "and lighting. For repeated requests, keep the core subject but make the content arrangement "
+        "clearly different by changing at least three content dimensions. This request's content focus is: "
+        f"{focus}. Do not add artist, studio, work-title, style, aesthetic, medium, or rendering "
+        "descriptions. Return exactly one complete Prompt. "
+        f"Independent request id: {nonce}."
+    )
+
+
 _PNG_BATCH_CANCEL = threading.Event()
 _SERVER_QUEUE_WAKE = threading.Event()
 _SERVER_QUEUE_CANCEL = threading.Event()
@@ -1437,14 +1493,14 @@ def _generate_auto_loop(
             provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, True, "auto_loop", source_ref, True, _AUTO_LOOP_CANCEL,
-            _independent_batch_directive(),
+            _independent_creative_directive(),
         )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, False, "", "", False, _AUTO_LOOP_CANCEL,
-            _independent_batch_directive(),
+            _independent_creative_directive(),
     )
 
 
@@ -1794,7 +1850,7 @@ def _inline_generate(
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
         structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
-        _independent_batch_directive(),
+        _independent_creative_directive(),
     )
     return generated, system, status, generated if generated else gr.update()
 
@@ -1854,6 +1910,10 @@ def _create_inline_panel(slot, prompt_target):
             label="本轮创作要求", lines=2, placeholder="例如：复杂二次元场景，不要只生成风格词",
             elem_id=f"llm_prompt_studio_{slot}_inline_request",
         )
+        inline_creative_template_button = gr.Button(
+            "填入通用创作需求",
+            elem_id=f"llm_prompt_studio_{slot}_creative_template",
+        )
         with gr.Row(elem_classes=["lps-form-row"]):
             inline_preset = gr.Dropdown(
                 label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"],
@@ -1890,6 +1950,10 @@ def _create_inline_panel(slot, prompt_target):
         inline_cache_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_output")
         inline_cache_status = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_status")
         inline_cache_cursor = gr.State(0)
+        inline_creative_template_button.click(
+            lambda: GENERAL_CREATIVE_REQUEST_TEMPLATE,
+            outputs=request,
+        )
         inline_generate.click(
             _inline_generate,
             inputs=[
@@ -2381,6 +2445,10 @@ def on_ui_tabs():
                             lines=3,
                             elem_id="llm_prompt_studio_source_tags",
                         )
+                        creative_template_button = gr.Button(
+                            "填入通用创作需求",
+                            elem_id="llm_prompt_studio_creative_template",
+                        )
                         preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
                         base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
@@ -2741,6 +2809,7 @@ def on_ui_tabs():
             batch_skip_existing, batch_skip_failed,
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
+        creative_template_button.click(lambda: GENERAL_CREATIVE_REQUEST_TEMPLATE, outputs=request)
         generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
         auto_loop_dispatch.click(
             _generate_auto_loop,

@@ -1,5 +1,16 @@
 # LLM Prompt Studio for Stable Diffusion WebUI Forge Neo
 
+## 内容生成边界
+
+- Forge 原始 Prompt 负责画风 LoRA、画师/工作室标签、权重、质量词和用户自己的固定标签；插件不会替用户创造、改写或复制这些内容。
+- LLM 只补充主体外观、完整服装、动作、表情、道具、环境、空间层次、构图、镜头、时间、天气和光照。
+- 自动循环与 txt2img/img2img 内嵌生成是无上下文的一次一请求：每轮从同一份冻结原始 Prompt 出发，不读取上一轮结果，也不使用批处理的固定场景蓝图。
+- 真正的批处理仍按一行一请求工作，并使用强差异规则改变动作、场景、构图、时间天气、道具和叙事事件。
+- Natural Language 与 Krea 2 Natural 不再要求输出 `medium/rendering`；System Prompt 明确禁止新增画师名、工作室名、作品名、风格、美学、媒介或渲染描述。
+- 生成结果不会在进入缓存前进行画师、工作室或风格词清洗；约束发生在 LLM System Prompt 中，原始结果按现有 SFW 校验和标签后处理流程保存。
+
+完整页和 txt2img/img2img 内嵌面板都提供“填入通用创作需求”按钮。模板面向可爱、萌系、完整着装、非性化的年幼外观角色或兽耳少女，并把二次元表现明确交给原始 Prompt 中的 LoRA/tag。Forge 在写回时保留这份基底，LLM 只返回本轮可追加的内容描述。
+
 面向 Forge Neo 的提示词生成、批处理、缓存和自动生图扩展。插件以实际工作流为中心：连接一次 LLM，批量生成不同 Prompt，按队列写入 txt2img / img2img，并与 Ranbooru、PNG Prompt Collector 联动。
 
 ## 核心功能

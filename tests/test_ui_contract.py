@@ -49,6 +49,7 @@ class PromptStudioUiContractTests(unittest.TestCase):
             "llm_prompt_studio_batch_preset",
             "llm_prompt_studio_batch_base_model",
             "llm_prompt_studio_batch_safety",
+            "llm_prompt_studio_request",
         ):
             self.assertIn(f'elem_id="{elem_id}"', source)
 
@@ -65,6 +66,10 @@ class PromptStudioUiContractTests(unittest.TestCase):
         self.assertIn('label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"]', source)
         self.assertIn('elem_id=f"llm_prompt_studio_{slot}_inline_generate"', source)
         self.assertIn("inline_generate.click(", source)
+        self.assertIn("GENERAL_CREATIVE_REQUEST_TEMPLATE", source)
+        self.assertIn("填入通用创作需求", source)
+        self.assertIn("不得参考上一轮输出", source)
+        self.assertIn("画风由原始 Prompt 中的 LoRA/tag 决定", source)
         self.assertIn("outputs=[inline_output, inline_system_preview, inline_status, inline_prompt_update]", source)
         self.assertIn('_INLINE_WORKFLOW_COMPONENTS[slot] = {', source)
         self.assertIn('_bind_workflow_sync(generate_component, [batch_component, *inline_components], event="change")', source)

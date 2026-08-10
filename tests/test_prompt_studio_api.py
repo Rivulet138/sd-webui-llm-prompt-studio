@@ -31,6 +31,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "call_llm": ui.call_llm,
             "generate": ui._generate,
             "independent_sequence": ui._independent_batch_sequence,
+            "creative_sequence": ui._independent_creative_sequence,
             "modules": sys.modules.get("modules"),
             "modules.shared": sys.modules.get("modules.shared"),
         }
@@ -61,6 +62,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         ui._generate = self.originals["generate"]
         with ui._INDEPENDENT_BATCH_LOCK:
             ui._independent_batch_sequence = self.originals["independent_sequence"]
+        with ui._INDEPENDENT_CREATIVE_LOCK:
+            ui._independent_creative_sequence = self.originals["creative_sequence"]
         with ui._BATCH_CONTROL_LOCK:
             ui._BATCH_ACTIVE_TASK_ID = ""
             ui._BATCH_CANCEL.clear()
@@ -812,8 +815,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             return f"1girl, inline_scene_{len(calls)}"
 
         ui.call_llm = capture_call
-        with ui._INDEPENDENT_BATCH_LOCK:
-            ui._independent_batch_sequence = 0
+        with ui._INDEPENDENT_CREATIVE_LOCK:
+            ui._independent_creative_sequence = 0
         inline_args = (
             "same request", "", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
             0, 0, True, "", False, False, 0, "Plain Prompt", 1, 0, False, "txt2img",
@@ -827,9 +830,42 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call[0][6] for call in calls], [0.9, 0.9])
         self.assertEqual(calls[0][0][5], calls[1][0][5])
         self.assertNotEqual(calls[0][0][4], calls[1][0][4])
-        self.assertIn(ui._INDEPENDENT_BATCH_BLUEPRINTS[0], calls[0][0][4])
-        self.assertIn(ui._INDEPENDENT_BATCH_BLUEPRINTS[1], calls[1][0][4])
+        self.assertIn("independent one-shot creative request", calls[0][0][4])
+        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
+        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
+        self.assertFalse(any(blueprint in calls[0][0][4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
+        self.assertFalse(any(blueprint in calls[1][0][4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
         self.assertNotIn("inline_scene_1", calls[1][0][4])
+
+    async def test_auto_loop_uses_content_variation_without_batch_blueprint(self):
+        calls = []
+
+        def capture_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "1girl, different_action, different_room"
+
+        ui.call_llm = capture_call
+        with ui._INDEPENDENT_CREATIVE_LOCK:
+            ui._independent_creative_sequence = 0
+        args = (
+            "same request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
+            "OpenAI Compatible", "http://127.0.0.1:1234/v1", "test-model", "",
+            0.35, 90, 1024, True, 0, 0, True, "", False, False, 0,
+            "Plain Prompt", 1, False,
+        )
+
+        first = ui._generate_auto_loop(*args)
+        second = ui._generate_auto_loop(*args)
+
+        self.assertEqual(first[0], "1girl, different_action, different_room")
+        self.assertEqual(second[0], "1girl, different_action, different_room")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call[0][6] for call in calls], [0.9, 0.9])
+        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
+        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
+        for call, _kwargs in calls:
+            self.assertFalse(any(blueprint in call[4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
+            self.assertNotIn("previous outputs", call[5])
 
     async def test_batch_cache_skip_only_considers_records_existing_at_batch_start(self):
         attempt = 0
@@ -872,7 +908,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["args"][-8:-5], (1, 0, False))
         self.assertEqual(captured["args"][-5:-2], ("", "", False))
         self.assertIs(captured["args"][-2], ui._AUTO_LOOP_CANCEL)
-        self.assertIn("independent one-shot batch request", captured["args"][-1])
+        self.assertIn("independent one-shot creative request", captured["args"][-1])
 
         result = ui._generate_auto_loop(
             "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
@@ -886,7 +922,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(captured["args"][-4].startswith("auto_loop:"))
         self.assertTrue(captured["args"][-3])
         self.assertIs(captured["args"][-2], ui._AUTO_LOOP_CANCEL)
-        self.assertIn("independent one-shot batch request", captured["args"][-1])
+        self.assertIn("independent one-shot creative request", captured["args"][-1])
 
     async def test_auto_loop_cache_is_unrated_and_model_configuration_is_part_of_identity(self):
         common = (

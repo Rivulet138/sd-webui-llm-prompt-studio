@@ -576,6 +576,7 @@ class PromptStudioCoreTests(unittest.TestCase):
         self.assertIn("SFW", prompt)
         self.assertIn("Return 30 tags", prompt)
         self.assertIn("red_hair", prompt)
+        self.assertIn("Never output artist names, studio names, or work titles", prompt)
 
     def test_system_prompt_can_require_independent_batch_variation(self):
         prompt = build_system_prompt(
@@ -631,7 +632,7 @@ class PromptStudioCoreTests(unittest.TestCase):
         self.assertNotIn("SDXL", BASE_MODEL_GUIDANCE)
         self.assertNotIn("SD 1.5 / anime checkpoint", BASE_MODEL_GUIDANCE)
         system = build_system_prompt("NoobAI Tags", "NoobAI", "SFW", "", "", [])
-        self.assertIn("best_quality", system)
+        self.assertNotIn("best_quality", system)
         self.assertIn("score_*", system)
         self.assertIn("1.05 to 1.20", system)
 
@@ -649,14 +650,17 @@ class PromptStudioCoreTests(unittest.TestCase):
                 self.assertFalse(any(term in profile for term in positive_style_instructions))
 
         self.assertIn("canonical lowercase Danbooru tags", PRESETS["Danbooru Tags"])
-        self.assertIn("medium, subject and appearance", PRESETS["Natural Language"])
-        self.assertIn("best_quality", PRESETS["NoobAI Tags"])
-        self.assertIn("medium/rendering", PRESETS["Krea 2 Natural"])
+        self.assertIn("subject count and identity", PRESETS["Natural Language"])
+        self.assertNotIn("best_quality", PRESETS["NoobAI Tags"])
+        self.assertNotIn("medium/rendering", PRESETS["Krea 2 Natural"])
 
         self.assertIn("1.05-1.20", BASE_MODEL_GUIDANCE["Pony / Illustrious"])
-        self.assertIn("best_quality", BASE_MODEL_GUIDANCE["NoobAI"])
-        self.assertIn("medium/rendering", BASE_MODEL_GUIDANCE["Krea 2"])
-        self.assertIn("very_aesthetic", BASE_MODEL_GUIDANCE["NoobAI"])
+        self.assertNotIn("best_quality", BASE_MODEL_GUIDANCE["NoobAI"])
+        self.assertNotIn("medium/rendering", BASE_MODEL_GUIDANCE["Krea 2"])
+        self.assertNotIn("very_aesthetic", BASE_MODEL_GUIDANCE["NoobAI"])
+        for profile in (*PRESETS.values(), *BASE_MODEL_GUIDANCE.values()):
+            self.assertNotIn("Digital anime illustration", profile)
+            self.assertNotIn("Digital painting", profile)
 
     def test_settings_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
