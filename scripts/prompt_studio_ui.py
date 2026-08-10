@@ -39,7 +39,7 @@ DEFAULT_LLM_SETTINGS = {
     "max_tokens": 1024,
     "send_temperature": True,
 }
-GENERAL_CREATIVE_REQUEST_TEMPLATE = """请围绕原始 Prompt 的主体，生成一条独立、完整、可直接用于扩散模型的 SFW 内容 Prompt。
+GENERAL_CREATIVE_REQUEST_TEMPLATE = """请围绕原始 Prompt 的主体，生成一条独立、完整、可直接用于扩散模型的内容 Prompt。
 
 目标主体是可爱、萌系的年幼外观角色或兽耳少女，必须完整着装、自然姿态、非性化，不描写裸体、性行为、性暗示或 fetish 内容；二次元表现由原始 Prompt 的 LoRA/tag 决定，不要在本轮输出中描述画风。
 

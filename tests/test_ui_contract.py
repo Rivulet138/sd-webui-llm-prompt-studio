@@ -70,6 +70,12 @@ class PromptStudioUiContractTests(unittest.TestCase):
         self.assertIn("填入通用创作需求", source)
         self.assertIn("不得参考上一轮输出", source)
         self.assertIn("画风由原始 Prompt 中的 LoRA/tag 决定", source)
+        template_source = source[
+            source.index("GENERAL_CREATIVE_REQUEST_TEMPLATE"):
+            source.index("PRESET_UI_CHOICES")
+        ]
+        self.assertNotIn("SFW 内容 Prompt", template_source)
+        self.assertIn("用于扩散模型的内容 Prompt", template_source)
         self.assertIn("outputs=[inline_output, inline_system_preview, inline_status, inline_prompt_update]", source)
         self.assertIn('_INLINE_WORKFLOW_COMPONENTS[slot] = {', source)
         self.assertIn('_bind_workflow_sync(generate_component, [batch_component, *inline_components], event="change")', source)
