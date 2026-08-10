@@ -276,6 +276,7 @@
         if (state.active) return null;
         const run = {
             id: createId("run"), phase, target, cancelled: false, forgeStarted: false, forgeTaskId: "",
+            basePrompts: Object.create(null),
         };
         state.active = run;
         saveQueue();
@@ -308,6 +309,13 @@
 
     function finishInlineRun(run) {
         if (inlineRuns[run.slot] === run) inlineRuns[run.slot] = null;
+    }
+
+    function freezeBasePrompt(run, target, targetInput) {
+        if (!Object.prototype.hasOwnProperty.call(run.basePrompts, target)) {
+            run.basePrompts[target] = String(targetInput?.value || "");
+        }
+        return run.basePrompts[target];
     }
 
     async function waitForStudioGeneration(run, beforeStatus, timeoutMs = 300000, controls = null) {
@@ -628,11 +636,11 @@
         const mode = config.writeMode === "append" ? "append" : "replace";
         const targetInput = root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`);
         if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
-        const basePrompt = String(targetInput.value || "");
         const run = parentRun || await beginRun("forge", target);
         if (!run) return "已有队列任务正在运行";
         run.phase = "forge";
         run.target = target;
+        const basePrompt = freezeBasePrompt(run, target, targetInput);
         let currentRow = null;
         let completed = 0;
         try {
@@ -681,6 +689,10 @@
             : 1;
         let completedCycles = 0;
         try {
+            const target = config.target === "img2img" ? "img2img" : "txt2img";
+            const targetInput = root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`);
+            if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
+            freezeBasePrompt(run, target, targetInput);
             while (cycleLimit === 0 || completedCycles < cycleLimit) {
                 assertActive(run);
                 const generated = await generateBatch({

@@ -267,6 +267,7 @@ function createRuntime(initialQueue = [], options = {}) {
         get interruptClicks() { return interruptClicks; },
         events() { return [...events]; },
         promptValue(target = "txt2img") { return inputs[`${target}_prompt`].value; },
+        setPromptValue(value, target = "txt2img") { inputs[`${target}_prompt`].value = value; },
         promptHistory() { return [...promptHistory]; },
         queue() {
             const raw = values.get(QUEUE_KEY);
@@ -427,6 +428,39 @@ async function main() {
     assert.equal(continuousRun.queue().length, 2);
     assert.deepEqual(continuousRun.queue().map((row) => row.status), ["completed", "completed"]);
     assert.match(continuousResult, /2/);
+
+    const continuousAppendRun = createRuntime([], {
+        generated: ["cycle A", "cycle B", "cycle C"],
+    });
+    const continuousAppendResult = await continuousAppendRun.api.generateAndRun({
+        request: "create independent variations",
+        target: "txt2img",
+        writeMode: "append",
+        continuous: true,
+        cycles: 3,
+    });
+    assert.deepEqual(continuousAppendRun.promptHistory(), [
+        "base, cycle A",
+        "base, cycle B",
+        "base, cycle C",
+    ]);
+    assert.equal(continuousAppendRun.promptValue(), "base, cycle C");
+    assert.match(continuousAppendResult, /3/);
+
+    const startFrozenRun = createRuntime([], {
+        generated: ["delayed cycle"],
+        llmDelay: 60,
+    });
+    const startFrozenPending = startFrozenRun.api.generateAndRun({
+        request: "freeze the starting prompt",
+        target: "txt2img",
+        writeMode: "append",
+        continuous: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    startFrozenRun.setPromptValue("edited while LLM was running");
+    await startFrozenPending;
+    assert.deepEqual(startFrozenRun.promptHistory(), ["base, delayed cycle"]);
 
     const hiddenBackgroundRun = createRuntime([], {
         documentHidden: true,
