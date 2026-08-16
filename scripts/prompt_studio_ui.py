@@ -40,14 +40,14 @@ DEFAULT_LLM_SETTINGS = {
     "max_tokens": 1024,
     "send_temperature": True,
 }
-GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，生成一条全新、独立成图的 Prompt。
+GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，生成一条全新、独立成图的日系插画 Prompt。
 
-保留主体身份、用户明确固定特征、LoRA/权重和内容限制；只补充本张图真正可见且有用的主体外观、服装、动作、关键道具、空间关系、镜头和光线。每次必须换地点、动作或事件、构图或视角，并额外改变至少两项服装、表情、道具、时间天气或空间布局。不要只换同义词、颜色、质量词或标签顺序。静态词库只作参考，不要堆砌无关元素。
+保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线允许由模型自由发挥。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序，但不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，不要堆砌无关元素。
 
 只返回一条完整的单图 Prompt，不要分镜、拼图、候选方案、解释或 Markdown。"""
-KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量生成彼此不同的二次元可爱兽耳小萝莉单图 Prompt。
+KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量生成彼此不同的二次元可爱兽耳小萝莉日系插画 Prompt。
 
-固定为可爱、完整得体着装、自然姿态；允许变化发色、瞳色、兽耳、服装和配饰。每条必须换地点、动作或事件、构图或视角，并额外改变至少两项服装、表情、道具、伙伴关系、时间天气或空间布局。只写对画面有用的可见细节，静态词库只作参考，不要堆词。
+保留主体核心身份和用户明确要求；允许模型自由发挥发色、瞳色、兽耳、服装、表情、动作、场景、道具、构图和光线。批量结果保持自然差异，避免重复或机械改词，但不要限制模型必须使用某种地点、动作、镜头或元素组合。静态词库只作参考，不要堆词。
 
 每条只返回一个完整瞬间，不要分镜、拼图、角色设定表、候选方案、解释或 Markdown。"""
 KREA_ANIMA_POLISH_ROLE = """Role: Krea2 & Anima extreme-detail expansion prompt engineer for Japanese light-novel illustrations.
@@ -282,7 +282,7 @@ _INDEPENDENT_CREATIVE_FOCI = (
 
 
 def _independent_batch_directive(sequence: int = 0) -> str:
-    """Create a fresh, stateless diversity constraint for one batch request."""
+    """Create a fresh, stateless diversity hint without fixing the scene shape."""
     global _independent_batch_sequence
     requested_sequence = int(sequence or 0)
     if requested_sequence > 0:
@@ -300,12 +300,13 @@ def _independent_batch_directive(sequence: int = 0) -> str:
     condition = _INDEPENDENT_BATCH_CONDITIONS[plan_index % len(_INDEPENDENT_BATCH_CONDITIONS)]
     nonce = uuid.uuid4().hex[:12]
     return (
-        "Independent single-image request; independent one-shot batch request. Preserve the core subject and explicit restrictions. Use this "
-        f"scene blueprint: {blueprint}; event: {dynamic}; composition: {composition}; condition: {condition}. "
-        "Change at least four content dimensions among action, setting, camera, time/weather, props, and event. "
-        "Do not vary only style, quality words, synonyms, or tag order. Return one complete Prompt, not a "
-        "storyboard, collage, montage, sequence, or alternatives. Consult the static_tag_lexicon for compatible "
-        "vocabulary and use only terms that support this scene. "
+        "Independent single-image request; independent one-shot batch request. Preserve the core subject and explicit restrictions. "
+        "Use the following only as optional variation inspiration, not as a mandatory template; reinterpret it, replace it, or ignore it "
+        f"when another idea better serves the source: setting idea: {blueprint}; event idea: {dynamic}; composition idea: {composition}; "
+        f"condition idea: {condition}. Prefer a meaningfully different result from nearby items, but choose any compatible combination "
+        "of changes and do not force a fixed number of changed dimensions. Do not vary only style, quality words, synonyms, or tag order. "
+        "Return one complete Prompt, not a storyboard, collage, montage, sequence, or alternatives. Consult the static_tag_lexicon for "
+        "compatible vocabulary and use only terms that support the chosen idea. "
         f"独立请求标识: {nonce}."
     )
 
@@ -324,9 +325,8 @@ def _independent_creative_directive(sequence: int = 0) -> str:
     nonce = uuid.uuid4().hex[:12]
     return (
         "Independent single-image request; independent one-shot creative request. Preserve the core subject, fixed user constraints, LoRA, "
-        "weights, and base tags; do not repeat or invent those tokens. Change the scene content, "
-        "especially this focus: "
-        f"{focus}. Add only useful visible details: action, expression, clothing, props, environment, "
+        "weights, and base tags; do not repeat or invent those tokens. Treat this as optional variation inspiration and reinterpret it freely: "
+        f"{focus}. Add only useful visible details that fit the chosen idea: action, expression, clothing, props, environment, "
         "composition, camera, time, weather, and lighting. Return one complete Prompt, not a storyboard, "
         "collage, alternatives, explanation, artist name, or style-name list. Consult the static_tag_lexicon "
         "for compatible vocabulary; use it as reference, never as a word dump. "
@@ -1289,9 +1289,9 @@ def _batch_generate(
                     0, False, "", "", False, _BATCH_CANCEL,
                     _independent_batch_directive(index) + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{len(sources)} 条。"
-                        f"本条必须围绕原要求生成一条新的完整 Prompt，重点改变{_BATCH_VARIATION_FOCI[(index - 1) % len(_BATCH_VARIATION_FOCI)]}；"
-                        "不得复用同批其他结果，不得只替换风格词或同义词来制造差异；"
-                        "至少改变三项非风格内容（动作、构图、环境、时间天气、道具或叙事细节），只返回一条 Prompt。"
+                        f"可以优先参考{_BATCH_VARIATION_FOCI[(index - 1) % len(_BATCH_VARIATION_FOCI)]}来形成自然差异，但不要把它当作硬性模板；"
+                        "避免复用同批其他结果，也不要只替换风格词或同义词来制造差异；"
+                        "请根据原要求自由选择合适的变化，只返回一条 Prompt。"
                     ),
                 )
             except Exception as error:
@@ -1560,7 +1560,7 @@ def _generate(
                 attempt_system = build_system_prompt(
                     preset, base_model, safety, nsfw_injection, user_instruction, examples,
                     static_tags, system_override,
-                    effective_batch_directive + "\nDIVERSITY RETRY: choose a different scene type, action, environment, camera arrangement, time/weather condition, and prop relationship; return one complete single-image prompt.",
+                    effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; keep the model free to choose and return one complete single-image prompt.",
                 )
             result = call_llm(
                 provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
@@ -1676,8 +1676,8 @@ def _expand_or_polish(
         )
     if directive:
         instruction += (
-            " Preserve the core subject identity and explicit user constraints, but independently redesign the "
-            "scene, action, props, spatial layout, camera, time, weather, and lighting for this item."
+            " Preserve the core subject identity and explicit user constraints. You may freely reinterpret the scene, action, props, "
+            "spatial layout, camera, time, weather, and lighting to create natural variation; do not force any particular combination."
         )
     def build_transform_system(active_directive: str) -> str:
         if action_name != "Polish":
@@ -1715,8 +1715,8 @@ def _expand_or_polish(
             if attempt and directive:
                 retry_directive = (
                     f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate was too similar to an existing item. "
-                    "Choose a different setting, action, prop relationship, spatial layout, camera angle, time/weather, "
-                    "and narrative event; return exactly one complete single-image prompt."
+                    "Favor a different compatible combination of setting, action, prop relationship, spatial layout, camera angle, "
+                    "time/weather, or narrative event, while leaving the model free to choose; return exactly one complete single-image prompt."
                 )
                 attempt_system = build_transform_system(retry_directive)
             result = call_llm(
