@@ -1,10 +1,13 @@
 import hashlib
 import json
 import sqlite3
+import ssl
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -95,6 +98,22 @@ class PromptStudioCoreTests(unittest.TestCase):
                 )
 
         self.assertEqual(request_json.call_count, 1)
+
+    def test_unexpected_tls_eof_is_retried(self):
+        error = ssl.SSLError(1, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1028)")
+        error.reason = "UNEXPECTED_EOF_WHILE_READING"
+        with patch("prompt_studio_core.urllib.request.urlopen", side_effect=urllib.error.URLError(error)) as request:
+            with self.assertRaisesRegex(LLMRequestError, "TLS 连接被远端提前关闭"):
+                call_llm("OpenAI Compatible", "https://127.0.0.1:1234/v1", "model", "", "system", "user", max_retries=1)
+        self.assertEqual(request.call_count, 3)
+
+    def test_certificate_tls_error_is_retried_in_unverified_mode(self):
+        error = ssl.SSLError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        error.reason = "CERTIFICATE_VERIFY_FAILED"
+        with patch("prompt_studio_core.urllib.request.urlopen", side_effect=urllib.error.URLError(error)) as request:
+            with self.assertRaisesRegex(LLMRequestError, "已启用不校验证书模式"):
+                call_llm("OpenAI Compatible", "https://127.0.0.1:1234/v1", "model", "", "system", "user", max_retries=2)
+        self.assertEqual(request.call_count, 4)
 
     def test_tag_processing_matches_expected_cleanup(self):
         result = process_tags("1girl, blue_eyes, watermark, blue_eyes, text", remove_bad=True, underscores_to_spaces=True)
@@ -576,6 +595,7 @@ class PromptStudioCoreTests(unittest.TestCase):
         self.assertIn("SFW", prompt)
         self.assertIn("Return 30 tags", prompt)
         self.assertIn("red_hair", prompt)
+        self.assertIn("exactly one complete, coherent single-image scene", prompt)
         self.assertIn("Never output artist names, studio names, or work titles", prompt)
 
     def test_system_prompt_can_require_independent_batch_variation(self):
@@ -739,6 +759,18 @@ class PromptStudioCoreTests(unittest.TestCase):
             self.assertEqual(db.wildcard_matches("obsolete"), [])
             self.assertEqual(db.wildcard_matches("active"), ["active_tag"])
 
+    def test_wildcard_samples_returns_random_reference_terms_and_honors_exclusions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "wildcards"
+            root.mkdir()
+            (root / "terms.txt").write_text("red hair\nblue eyes\nglass lantern\n", encoding="utf-8")
+            db = StudioDB(Path(directory) / "studio.db")
+            db.index_wildcards(root)
+            samples = db.wildcard_samples(2, exclude=["red hair"])
+            self.assertEqual(len(samples), 2)
+            self.assertNotIn("red hair", samples)
+            self.assertTrue(set(samples) <= {"blue eyes", "glass lantern"})
+
     def test_backup_names_are_unique_within_one_second(self):
         with tempfile.TemporaryDirectory() as directory:
             db = StudioDB(Path(directory) / "studio.db")
@@ -819,6 +851,59 @@ class PromptStudioCoreTests(unittest.TestCase):
         self.assertEqual(extract_provider_text("Ollama", {"message": {"content": "ollama"}}), "ollama")
         with self.assertRaisesRegex(RuntimeError, "SAFETY"):
             extract_provider_text("Google Gemini", {"promptFeedback": {"blockReason": "SAFETY"}})
+
+    def test_openai_compatible_response_variants_are_supported(self):
+        self.assertEqual(
+            extract_provider_text("OpenAI Compatible", {"choices": [{"text": "legacy completion"}]}),
+            "legacy completion",
+        )
+        self.assertEqual(
+            extract_provider_text(
+                "OpenAI Compatible",
+                {"choices": [{"message": {"content": [{"type": "text", "text": "part one"}, {"text": " part two"}]}}]},
+            ),
+            "part one part two",
+        )
+        self.assertEqual(
+            extract_provider_text("OpenAI Compatible", {"choices": [{"delta": {"content": "delta prompt"}}]}),
+            "delta prompt",
+        )
+
+    def test_empty_openai_compatible_response_exposes_shape(self):
+        with self.assertRaisesRegex(RuntimeError, "response keys: choices"):
+            extract_provider_text("OpenAI Compatible", {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+
+    def test_cancellable_http_wait_returns_before_transport_timeout(self):
+        cancelled = threading.Event()
+        started = threading.Event()
+        failure = []
+
+        def blocked(*_args, **_kwargs):
+            started.set()
+            time.sleep(5)
+            return {"choices": [{"message": {"content": "late"}}]}
+
+        def run_request():
+            try:
+                call_llm(
+                    "OpenAI Compatible", "http://127.0.0.1:1234/v1", "model", "", "system", "user",
+                    cancel_event=cancelled,
+                )
+            except LLMRequestError as error:
+                failure.append(error)
+
+        with patch("prompt_studio_core._request_json_once", side_effect=blocked):
+            worker = threading.Thread(
+                target=run_request,
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(started.wait(1))
+            cancelled.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(failure), 1)
+            self.assertIn("cancelled", str(failure[0]))
 
     def test_provider_http_round_trip_uses_wire_adapters(self):
         received = []

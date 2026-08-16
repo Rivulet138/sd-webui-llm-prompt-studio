@@ -20,8 +20,9 @@ from starlette.requests import Request
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_system_prompt, build_user_message, call_llm, get_provider_profile, is_sfw_output,
+    LLMRequestError,
     discover_ranbooru_cache, load_ranbooru_cache, process_tags,
-    regional_format, validate_endpoint,
+    regional_format, validate_endpoint, _cosine, _tokens,
 )
 
 
@@ -39,17 +40,77 @@ DEFAULT_LLM_SETTINGS = {
     "max_tokens": 1024,
     "send_temperature": True,
 }
-GENERAL_CREATIVE_REQUEST_TEMPLATE = """请围绕原始 Prompt 的主体，生成一条独立、完整、可直接用于扩散模型的内容 Prompt。
+GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，生成一条全新、独立成图的 Prompt。
 
-目标主体是可爱、萌系的年幼外观角色或兽耳少女，必须完整着装、自然姿态、非性化，不描写裸体、性行为、性暗示或 fetish 内容；二次元表现由原始 Prompt 的 LoRA/tag 决定，不要在本轮输出中描述画风。
+保留主体身份、用户明确固定特征、LoRA/权重和内容限制；只补充本张图真正可见且有用的主体外观、服装、动作、关键道具、空间关系、镜头和光线。每次必须换地点、动作或事件、构图或视角，并额外改变至少两项服装、表情、道具、时间天气或空间布局。不要只换同义词、颜色、质量词或标签顺序。静态词库只作参考，不要堆砌无关元素。
 
-Forge 写回时会自动保留原始 Prompt 中的主体身份、LoRA、权重、标签和内容限制。你不需要看见、复述或重写这些基底内容，也不要新增画师名、工作室名、作品名、艺术风格词、画风描述、渲染媒介词、美学标签或质量宣传词；画风由原始 Prompt 中的 LoRA/tag 决定。
+只返回一条完整的单图 Prompt，不要分镜、拼图、候选方案、解释或 Markdown。"""
+KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量生成彼此不同的二次元可爱兽耳小萝莉单图 Prompt。
 
-本次只补充内容维度：角色外观细节、服装和配饰、动作、表情、人与物体的关系、环境、道具、空间层次、构图、景别、视角、时间、天气和光照。
+固定为可爱、完整得体着装、自然姿态；允许变化发色、瞳色、兽耳、服装和配饰。每条必须换地点、动作或事件、构图或视角，并额外改变至少两项服装、表情、道具、伙伴关系、时间天气或空间布局。只写对画面有用的可见细节，静态词库只作参考，不要堆词。
 
-每次请求都是无上下文的一次性请求，不得参考上一轮输出。重复生成时保留核心主体，但至少改变三项内容维度，例如动作、服装、道具、环境、构图、时间天气或叙事事件。
+每条只返回一个完整瞬间，不要分镜、拼图、角色设定表、候选方案、解释或 Markdown。"""
+KREA_ANIMA_POLISH_ROLE = """Role: Krea2 & Anima extreme-detail expansion prompt engineer for Japanese light-novel illustrations.
 
-只返回一条完整 Prompt，不要解释，不要标题，不要负面 Prompt，不要风格词。"""
+Task: From the user's text, tags, or reference image description, produce one complete full-English image prompt. Detail is the highest priority. Actively decompose every useful visible element instead of giving a short summary.
+
+Core requirements:
+- Describe hair movement, hair strands, head accessories, facial details, clothing layers, ornaments, handheld objects, floating objects, material surfaces, highlights, shadows, and spatial relationships.
+- Distinguish tactile materials such as smooth satin, soft lace, plush fur, brushed fabric, polished metal, glass, paper, wood, leather, and translucent surfaces. State how light reacts to each material when it matters.
+- Strengthen motion and cinematic storytelling through body weight, balance, hand placement, gaze direction, wind-driven hair and fabric, object motion, depth, and the small event happening in this exact frame.
+- Allow rich detail density and tasteful decorative complexity, but omit unrelated clutter and contradictory elements.
+- When the source is sparse, add reasonable visible clothing, props, environment, lighting, and material detail that supports the subject and scene. Never invent a separate subject or unrelated setting.
+- Always consult the provided static vocabulary lexicon for compatible hair, clothing, prop, environment, camera, and material terms. Treat it as reference vocabulary: select and combine relevant entries, do not mechanically dump the list or copy unrelated entries.
+- Aim for a polished Japanese light-novel illustration: refined character design, vivid but coherent color, clear material response, commercial finish, camera awareness, and emotional tension.
+
+Anti-lazy rules:
+- Never return a short, generic, high-level, or evasive description.
+- Fully expand every section in the second part. Each section must contain concrete visible information plus relevant motion, texture, lighting, or position relationships.
+- If one section has little source information, infer useful detail from movement, material, light, depth, and object relationships rather than leaving it as one short sentence.
+- The Master Description must be a dense complete paragraph, not a short conclusion or a list of disconnected adjectives.
+
+Output rules:
+- Output English only. Output the result directly with no explanation and no Markdown code fence.
+- Do not use weight syntax such as (text:1.2) or any other weighting syntax.
+- Tags must be lowercase. Keep the requested anchor tags and separate tag items clearly.
+- Detail is preferred over vague quality words, but every added detail must serve the visible image.
+
+Output exactly this structure:
+
+PART ONE: TAG ANCHORS
+masterpiece, best quality, score_7, score_8_up, anime illustration, detailed, [subject count], [hair, hair color, head accessories], [face], [clothing and ornament details], [handheld and floating props], [pose and camera]
+
+BREAK
+One concise sentence stating the image density, dynamic direction, dominant color relationship, and emotional atmosphere.
+
+PART TWO: EXTREME LAYERED DETAIL
+Composition & Pose:
+Expand the camera distance, viewing angle, body tilt, hand positions, weight shift, movement direction, subject placement, foreground framing, depth layers, and cinematic lens impression. Explain how the pose reads as one moment in progress.
+
+Hair & Head Accessories:
+Expand color, length, haircut, strand grouping, flyaway strands, wind or motion, texture, gloss, translucency at the edges, and every head accessory's shape, material, location, attachment, and light response.
+
+Face & Expression:
+Expand iris color, pupil shape, eye highlights, eyelid angle, eyebrows, gaze direction, mouth and lips, skin texture, blush or reflected light, expression, and the emotional event implied by the face.
+
+Clothing & Details:
+Expand the main garment colors and construction, layered order, collars, sleeves, hems, fasteners, embroidery, ribbons, jewelry, armor or trim, fabric thickness, folds, tension points, satin sheen, lace softness, plushness, metal reflections, translucency, and how clothing reacts to the pose and air.
+
+Props & Floating Elements:
+Expand the exact shape, scale, material, wear, grip, orientation, and light response of handheld props. Describe nearby, suspended, falling, glowing, or wind-carried elements and their distribution, depth, motion, and relationship to the subject.
+
+Lighting & Color:
+Expand the key light direction and softness, fill light, rim light, cast shadows, reflected light, specular highlights, material-specific reactions, color contrast, palette hierarchy, atmosphere, and emotional effect.
+
+Background:
+Expand only useful location elements, architecture, terrain, furniture, distant objects, color masses, foreground obstruction, middle-ground relationship, background depth, atmospheric perspective, and controlled blur. The background must support the subject instead of becoming an unrelated catalog of objects.
+
+PART THREE: REFINED + MASTER
+SUBJECT
+Use long but clear English sentences to confirm the subject's appearance, clothing, key accessories, props, pose, and main material qualities.
+
+MASTER DESCRIPTION
+Write one high-density natural-language paragraph that recombines all important details. Emphasize layered decoration, movement, camera, light, material texture, color relationships, depth, and the small story implied by the frame. Do not make it a short summary."""
 PRESET_UI_CHOICES = [
     ("Danbooru 标签", "Danbooru Tags"),
     ("Danbooru 标签 + 自然语言", "Danbooru + Natural"),
@@ -72,7 +133,16 @@ OUTPUT_UI_CHOICES = [
     ("Regional Markdown", "Regional Markdown"),
 ]
 PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
-ACTION_UI_CHOICES = [("扩写", "Expand"), ("润色", "Polish")]
+ACTION_UI_CHOICES = [("格式转换", "Convert"), ("扩写", "Expand"), ("润色", "Polish")]
+JSON_VARIATION_MODE_CHOICES = [("独立构图转换", "independent"), ("忠实格式转换", "faithful")]
+PRESET_BASE_MODEL_DEFAULTS = {
+    "NoobAI Tags": "NoobAI",
+    "Anima Tags": "Anima",
+    "Krea 2 Natural": "Krea 2",
+    "Natural Language": "Auto / checkpoint default",
+    "Danbooru Tags": "Auto / checkpoint default",
+    "Danbooru + Natural": "Auto / checkpoint default",
+}
 RANBOORU_CONTENT_CHOICES = [
     ("Tag Prompt", "tags"),
     ("自然语言 Prompt", "natural"),
@@ -188,7 +258,11 @@ _INDEPENDENT_BATCH_CONDITIONS = (
 )
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
-_MIN_INDEPENDENT_BATCH_TEMPERATURE = 0.9
+_MIN_INDEPENDENT_BATCH_TEMPERATURE = 1.25
+_MAX_BATCH_SIMILARITY = 0.70
+_MAX_DIVERSITY_RETRIES = 2
+_RECENT_BATCH_OUTPUTS: dict[str, list[str]] = {}
+_RECENT_BATCH_OUTPUTS_LOCK = threading.Lock()
 _INDEPENDENT_CREATIVE_LOCK = threading.Lock()
 _independent_creative_sequence = 0
 _INDEPENDENT_CREATIVE_FOCI = (
@@ -226,14 +300,12 @@ def _independent_batch_directive(sequence: int = 0) -> str:
     condition = _INDEPENDENT_BATCH_CONDITIONS[plan_index % len(_INDEPENDENT_BATCH_CONDITIONS)]
     nonce = uuid.uuid4().hex[:12]
     return (
-        "This is one independent one-shot batch request. Do not use conversation history, previous outputs, "
-        "or any assumed continuation. Preserve the user's core subject and content restrictions, but create "
-        "a clearly different content type for this item using this required blueprint: "
-        f"{blueprint}. Required event dynamic: {dynamic}. Required composition: {composition}. "
-        f"Required time or weather condition: {condition}. Change at least four non-style dimensions: "
-        "subject action or interaction, setting, "
-        "composition or camera distance, time or weather, props, and narrative event. Do not obtain variety "
-        "by changing only art style, quality words, synonyms, or tag order. Return exactly one complete Prompt. "
+        "Independent single-image request; independent one-shot batch request. Preserve the core subject and explicit restrictions. Use this "
+        f"scene blueprint: {blueprint}; event: {dynamic}; composition: {composition}; condition: {condition}. "
+        "Change at least four content dimensions among action, setting, camera, time/weather, props, and event. "
+        "Do not vary only style, quality words, synonyms, or tag order. Return one complete Prompt, not a "
+        "storyboard, collage, montage, sequence, or alternatives. Consult the static_tag_lexicon for compatible "
+        "vocabulary and use only terms that support this scene. "
         f"独立请求标识: {nonce}."
     )
 
@@ -251,18 +323,39 @@ def _independent_creative_directive(sequence: int = 0) -> str:
     focus = _INDEPENDENT_CREATIVE_FOCI[focus_index % len(_INDEPENDENT_CREATIVE_FOCI)]
     nonce = uuid.uuid4().hex[:12]
     return (
-        "This is one independent one-shot creative request. Do not use conversation history, "
-        "previous outputs, cached examples, or any assumed continuation. Preserve the user's "
-        "explicit subject and content restrictions. Treat LoRA tokens, weights, and user-owned base tags "
-        "as immutable Forge base-prompt data: do not repeat, rewrite, or invent them. Generate only content "
-        "descriptions: character appearance, "
-        "clothing, action, expression, environment, props, composition, camera, time, weather, "
-        "and lighting. For repeated requests, keep the core subject but make the content arrangement "
-        "clearly different by changing at least three content dimensions. This request's content focus is: "
-        f"{focus}. Do not add artist, studio, work-title, style, aesthetic, medium, or rendering "
-        "descriptions. Return exactly one complete Prompt. "
+        "Independent single-image request; independent one-shot creative request. Preserve the core subject, fixed user constraints, LoRA, "
+        "weights, and base tags; do not repeat or invent those tokens. Change the scene content, "
+        "especially this focus: "
+        f"{focus}. Add only useful visible details: action, expression, clothing, props, environment, "
+        "composition, camera, time, weather, and lighting. Return one complete Prompt, not a storyboard, "
+        "collage, alternatives, explanation, artist name, or style-name list. Consult the static_tag_lexicon "
+        "for compatible vocabulary; use it as reference, never as a word dump. "
         f"Independent request id: {nonce}."
     )
+
+
+def _prompt_similarity(left: str, right: str, stable_source: str = "") -> float:
+    """Measure content overlap without requiring an embedding service."""
+    stable = _tokens(stable_source)
+    return _cosine(_tokens(left) - stable, _tokens(right) - stable)
+
+
+def _remember_diverse_output(source: str, prompt: str) -> bool:
+    """Reject near-identical outputs for the same repeated batch request."""
+    key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
+    with _RECENT_BATCH_OUTPUTS_LOCK:
+        previous = _RECENT_BATCH_OUTPUTS.setdefault(key, [])
+        duplicate = any(_prompt_similarity(prompt, item, source) >= _MAX_BATCH_SIMILARITY for item in previous)
+        if not duplicate:
+            previous.append(prompt)
+            del previous[:-16]
+        return not duplicate
+
+
+def _recent_diverse_outputs(source: str, limit: int = 4) -> list[str]:
+    key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
+    with _RECENT_BATCH_OUTPUTS_LOCK:
+        return list(_RECENT_BATCH_OUTPUTS.get(key, [])[-max(1, int(limit or 1)):])
 
 
 _PNG_BATCH_CANCEL = threading.Event()
@@ -348,7 +441,7 @@ def _server_queue_worker() -> None:
                 config.get("base_model", "Auto / checkpoint default"), config.get("safety", "SFW"),
                 config.get("nsfw_injection", ""), config.get("user_instruction", ""),
                 config.get("provider", "OpenAI Compatible"), config.get("endpoint", ""), config.get("model", ""), "",
-                float(config.get("temperature", 0.9) or 0.9), int(config.get("timeout", 90) or 90), int(config.get("max_tokens", 1024) or 1024),
+                float(config.get("temperature", 1.25) or 1.25), int(config.get("timeout", 90) or 90), int(config.get("max_tokens", 1024) or 1024),
                 bool(config.get("send_temperature", True)), 0, 0,
                 bool(config.get("remove_bad", True)), config.get("remove_terms", ""), bool(config.get("shuffle", False)),
                 bool(config.get("spaces", False)), int(config.get("max_tags", 0) or 0), config.get("structured_mode", "Plain Prompt"),
@@ -405,7 +498,7 @@ def _enqueue_server_queue(payload: dict[str, Any]) -> dict[str, Any]:
     connection = _connection_settings()
     merged = {
         "preset": workflow["preset"], "base_model": workflow["base_model"], "safety": workflow["safety"],
-        "temperature": max(float(connection["temperature"] or 0.9), _MIN_INDEPENDENT_BATCH_TEMPERATURE),
+        "temperature": max(float(connection["temperature"] or 1.25), _MIN_INDEPENDENT_BATCH_TEMPERATURE),
         "timeout": connection["timeout"], "max_tokens": connection["max_tokens"], "send_temperature": connection["send_temperature"],
         "provider": connection["provider"], "endpoint": connection["endpoint"], "model": connection["model"],
         "system_override": workflow["system_override"], "nsfw_injection": workflow["nsfw_injection"], "user_instruction": workflow["user_instruction"],
@@ -1410,6 +1503,24 @@ def _processed_kind_for_preset(preset: str) -> str:
     return "tags"
 
 
+def _recommended_base_model_for_preset(preset: str):
+    return PRESET_BASE_MODEL_DEFAULTS.get(str(preset), "Auto / checkpoint default")
+
+
+def _static_prompt_reference(source: str, related_limit: int = 20, sample_limit: int = 20) -> list[str]:
+    """Provide related plus fresh random lexicon terms for every creative request."""
+    related = DB.wildcard_matches(str(source or ""), related_limit)
+    samples = DB.wildcard_samples(sample_limit, exclude=related)
+    result = []
+    seen = set()
+    for term in [*related, *samples]:
+        normalized = str(term or "").strip()
+        if normalized and normalized.casefold() not in seen:
+            seen.add(normalized.casefold())
+            result.append(normalized)
+    return result
+
+
 def _generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
@@ -1422,28 +1533,56 @@ def _generate(
     if not source:
         return "", "", "请输入创作要求或源 Danbooru 标签。"
     examples = []
-    static_tags = DB.wildcard_matches(source, 40)
+    static_tags = _static_prompt_reference(source)
+    effective_batch_directive = str(batch_directive or "").strip()
+    if effective_batch_directive:
+        recent_outputs = _recent_diverse_outputs(source)
+        if recent_outputs:
+            exclusions = "\n".join(f"- {item[:360]}" for item in recent_outputs)
+            effective_batch_directive += (
+                "\nRecent outputs are exclusion references only. Do not reuse their scene structure, action, "
+                "camera arrangement, prop combination, or distinctive decorative elements:\n" + exclusions
+            )
     system = build_system_prompt(
         preset, base_model, safety, nsfw_injection, user_instruction, examples,
-        static_tags, system_override, batch_directive,
+        static_tags, system_override, effective_batch_directive,
     )
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
         request_temperature = float(temperature or 0.35)
-        if batch_directive:
+        if effective_batch_directive:
             request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
-        result = call_llm(
-            provider, endpoint, model, resolved_key, system, build_user_message(source),
-            request_temperature, int(timeout or 90), int(max_tokens or 0),
-            bool(send_temperature), cancel_event=cancel_event,
-        )
+        diversity_retry = False
+        for attempt in range(_MAX_DIVERSITY_RETRIES + 1):
+            attempt_system = system
+            if attempt:
+                diversity_retry = True
+                attempt_system = build_system_prompt(
+                    preset, base_model, safety, nsfw_injection, user_instruction, examples,
+                    static_tags, system_override,
+                    effective_batch_directive + "\nDIVERSITY RETRY: choose a different scene type, action, environment, camera arrangement, time/weather condition, and prop relationship; return one complete single-image prompt.",
+                )
+            result = call_llm(
+                provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
+                min(2.0, request_temperature + 0.15 * attempt), int(timeout or 90), int(max_tokens or 0),
+                bool(send_temperature), cancel_event=cancel_event,
+            )
+            candidate = _finalize_generated_prompt(
+                result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
+                max_tags, structured_mode, region_count,
+            )
+            if not effective_batch_directive or _remember_diverse_output(source, candidate) or attempt == _MAX_DIVERSITY_RETRIES:
+                result = candidate
+                system = attempt_system
+                break
+    except LLMRequestError as error:
+        if str(error) == "LLM request cancelled":
+            return "", system, "已取消"
+        return "", system, f"生成失败：{_safe_error(error)}"
     except Exception as error:
         return "", system, f"生成失败：{_safe_error(error)}"
     try:
-        result = _finalize_generated_prompt(
-            result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
-            max_tags, structured_mode, region_count,
-        )
+        result = str(result or "").strip()
     except ValueError as error:
         return "", system, f"生成失败：{error}"
     if cache_result:
@@ -1510,20 +1649,90 @@ def _expand_or_polish(
     remove_bad=True, remove_terms="", shuffle=False, spaces=False, max_tags=0,
     structured_mode="Plain Prompt", region_count=1,
     cancel_event=None,
+    batch_directive="", previous_outputs=None,
 ):
-    instruction = "Expand this while keeping all explicit facts and the requested output format." if action == "Expand" else "Polish this for clarity, visual specificity, and model compatibility without adding unsupported facts."
-    system = build_system_prompt(preset, base_model, safety, nsfw_injection, f"{user_instruction}\n{instruction}", [], system_override=system_override)
+    instructions = {
+        "Convert": (
+            "Convert the source prompt into exactly the selected output profile and target-model format. "
+            "Preserve every explicit visual fact that is compatible with the target format, translate Danbooru tags "
+            "into fluent prose when the selected profile is natural language, and never return the original tag dump "
+            "when the selected profile forbids tags."
+        ),
+        "Expand": "Expand this while keeping all explicit facts and the requested output format.",
+        "Polish": "Polish this for clarity, visual specificity, and model compatibility without adding unsupported facts.",
+    }
+    action_name = str(action)
+    instruction = instructions.get(action_name, instructions["Convert"])
+    static_tags = _static_prompt_reference(source)
+    if action_name == "Polish":
+        instruction = "Enhance the source prompt with concrete visible detail while preserving its subject and constraints."
+    directive = str(batch_directive or "").strip()
+    previous = [str(item).strip() for item in (previous_outputs or []) if str(item).strip()]
+    if directive and previous:
+        previous_summary = "\n".join(f"- {item[:480]}" for item in previous[-6:])
+        directive += (
+            "\nPrevious outputs are supplied only as exclusion constraints; do not copy their wording or scene structure:\n"
+            + previous_summary
+        )
+    if directive:
+        instruction += (
+            " Preserve the core subject identity and explicit user constraints, but independently redesign the "
+            "scene, action, props, spatial layout, camera, time, weather, and lighting for this item."
+        )
+    def build_transform_system(active_directive: str) -> str:
+        if action_name != "Polish":
+            return build_system_prompt(
+                preset, base_model, safety, nsfw_injection, f"{user_instruction}\n{instruction}", static_tags,
+                system_override=system_override, batch_directive=active_directive,
+            )
+        sections = [KREA_ANIMA_POLISH_ROLE]
+        if str(system_override or "").strip():
+            sections.append("Additional system requirements:\n" + str(system_override).strip())
+        if str(user_instruction or "").strip():
+            sections.append("Additional user requirements:\n" + str(user_instruction).strip())
+        sections.append(instruction)
+        if static_tags:
+            sections.append(
+                "STATIC VOCABULARY REFERENCE (use as vocabulary inspiration; select only compatible visible terms, "
+                "never dump the list):\n" + ", ".join(static_tags[:60])
+            )
+        if active_directive:
+            sections.append(active_directive)
+        return "\n\n".join(sections)
+
+    system = build_transform_system(directive)
+    try:
+        request_temperature = float(temperature or 0.35)
+    except (TypeError, ValueError):
+        request_temperature = 0.35
+    if directive:
+        request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
-        result = call_llm(
-            provider, endpoint, model, resolved_key, system, build_user_message(source),
-            float(temperature or 0.35), int(timeout or 90), int(max_tokens or 0),
-            bool(send_temperature), cancel_event=cancel_event,
-        )
-        result = _finalize_generated_prompt(
-            result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
-            max_tags, structured_mode, region_count,
-        )
+        result = ""
+        for attempt in range(_MAX_DIVERSITY_RETRIES + 1):
+            attempt_system = system
+            if attempt and directive:
+                retry_directive = (
+                    f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate was too similar to an existing item. "
+                    "Choose a different setting, action, prop relationship, spatial layout, camera angle, time/weather, "
+                    "and narrative event; return exactly one complete single-image prompt."
+                )
+                attempt_system = build_transform_system(retry_directive)
+            result = call_llm(
+                provider, endpoint, model, resolved_key, attempt_system,
+                build_user_message(source), min(2.0, request_temperature + 0.15 * attempt),
+                int(timeout or 90), int(max_tokens or 0), bool(send_temperature), cancel_event=cancel_event,
+            )
+            finalize_preset = "Krea 2 Natural" if action_name == "Polish" else preset
+            result = _finalize_generated_prompt(
+                result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
+                max_tags, structured_mode, region_count,
+            )
+            if not directive or not any(_prompt_similarity(result, item, source) >= _MAX_BATCH_SIMILARITY for item in previous):
+                break
+        if directive and result:
+            previous.append(result)
         return result, "LLM 提示词处理完成"
     except Exception as error:
         return "", f"处理失败：{_safe_error(error)}"
@@ -1537,11 +1746,77 @@ def _png_batch_json(payload):
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def _generic_prompt_records(payload):
+    """Convert common prompt-export JSON shapes into the internal batch schema."""
+    if isinstance(payload, list):
+        source_records = payload
+    elif isinstance(payload, dict):
+        source_records = None
+        for key in ("prompts", "items", "records", "results", "data"):
+            candidate = payload.get(key)
+            if isinstance(candidate, list):
+                source_records = candidate
+                break
+        if source_records is None:
+            string_values = [(key, value) for key, value in payload.items() if isinstance(value, str) and value.strip()]
+            object_values = [(key, value) for key, value in payload.items() if isinstance(value, dict)]
+            if object_values:
+                source_records = [
+                    {**value, "record_id": str(value.get("record_id") or value.get("id") or key)}
+                    for key, value in object_values
+                ]
+            else:
+                source_records = [{"record_id": str(key), "prompt": value} for key, value in string_values]
+            if not source_records:
+                source_records = [payload]
+    else:
+        raise ValueError("JSON 顶层必须是数组或对象")
+
+    records = []
+    for position, source in enumerate(source_records, 1):
+        if isinstance(source, str):
+            records.append({"record_id": str(position), "prompt": {"positive": source}})
+            continue
+        if not isinstance(source, dict):
+            raise ValueError(f"第 {position} 条 Prompt 必须是字符串或对象")
+        nested = source.get("prompt")
+        prompt = nested if isinstance(nested, dict) else {}
+        positive = ""
+        for key in ("positive", "text", "content", "prompt", "input", "description"):
+            value = prompt.get(key) if key in prompt else source.get(key)
+            if isinstance(value, str) and value.strip():
+                positive = value.strip()
+                break
+        if not positive:
+            raise ValueError(f"第 {position} 条记录没有可用的 Prompt 字段")
+        image = source.get("image") if isinstance(source.get("image"), dict) else {}
+        record = {
+            "record_id": str(source.get("record_id") or source.get("id") or position),
+            "image": {
+                "filename": str(image.get("filename") or source.get("filename") or f"prompt-{position}.png"),
+            },
+            "prompt": {"positive": positive},
+        }
+        processed = source.get("processed")
+        if processed is None and isinstance(nested, dict):
+            processed = nested.get("processed")
+        if isinstance(processed, str) and processed.strip():
+            record["prompt"]["processed"] = processed.strip()
+        records.append(record)
+    return {
+        "schema_version": PNG_BATCH_SCHEMA,
+        "producer": {"name": "Generic JSON import"},
+        "records": records,
+    }
+
+
 def _normalize_png_batch_payload(payload):
     if isinstance(payload, str):
         payload = json.loads(payload or "{}")
+    if not (isinstance(payload, dict) and payload.get("schema_version") == PNG_BATCH_SCHEMA):
+        payload = _generic_prompt_records(payload)
     if not isinstance(payload, dict) or payload.get("schema_version") != PNG_BATCH_SCHEMA:
-        raise ValueError("仅支持 prompt_batch.v1 JSON")
+        raise ValueError("不支持的 Prompt JSON：需要数组、Prompt 对象或 prompt_batch.v1 records")
     records = payload.get("records")
     if not isinstance(records, list):
         raise ValueError("PNG batch records must be a list")
@@ -1598,7 +1873,7 @@ def _normalize_png_batch_payload(payload):
             if len(processed) > PNG_BATCH_MAX_PROMPT_LENGTH:
                 raise ValueError(f"第 {position} 条处理结果过长")
             item["prompt"]["processed"] = processed
-        for field in ("processed_kind", "output_kind"):
+        for field in ("processed_kind", "output_kind", "processed_preset", "processed_base_model"):
             if field in prompt:
                 kind = str(prompt[field] or "").strip()
                 if len(kind) > 64:
@@ -1613,6 +1888,14 @@ def _normalize_png_batch_payload(payload):
             item["appended"] = True
         if "booru" in record:
             item["booru"] = record["booru"]
+        for field in ("rating", "ranbooru_id", "database_key", "post_id"):
+            if record.get(field) is not None and str(record.get(field)).strip():
+                item[field] = str(record[field]).strip()[:256]
+        if record.get("source_score") is not None:
+            try:
+                item["source_score"] = int(float(record["source_score"]))
+            except (TypeError, ValueError, OverflowError):
+                item["source_score"] = 0
         normalized.append(item)
     return {"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": producer_name}, "records": normalized}
 
@@ -1704,6 +1987,24 @@ def _cancel_png_batch():
     return "已请求取消；当前 LLM 请求返回后停止，已完成结果会保留。"
 
 
+def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="independent"):
+    """Run JSON Prompt processing from the Forge txt2img inline panel."""
+    workflow = _workflow_settings()
+    connection = _connection_settings()
+    selected_preset = preset if preset in PRESETS else workflow["preset"]
+    selected_base_model = base_model if base_model in BASE_MODEL_GUIDANCE else workflow["base_model"]
+    yield from _png_batch_run(
+        payload, action,
+        selected_preset, workflow["system_override"], selected_base_model, workflow["safety"],
+        workflow["nsfw_injection"], workflow["user_instruction"],
+        connection["provider"], connection["endpoint"], connection["model"], "",
+        connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
+        workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
+        workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
+        variation_mode,
+    )
+
+
 def _cancel_auto_loop_generation():
     _AUTO_LOOP_CANCEL.set()
     return "已请求取消当前 LLM 请求；已返回的结果不会写入队列。"
@@ -1713,7 +2014,7 @@ def _cancel_inline_generation(slot):
     event = _INLINE_CANCEL_EVENTS.get(str(slot or ""))
     if event is not None:
         event.set()
-    return "已请求停止；当前 LLM 请求会在本次 HTTP 返回后取消。"
+    return "已请求停止；LLM 等待已中断，迟到响应不会写入 Prompt。"
 
 
 def _png_batch_run(
@@ -1721,6 +2022,7 @@ def _png_batch_run(
     user_instruction, provider, endpoint, model, api_key, temperature, timeout,
     max_tokens, send_temperature, remove_bad=True, remove_terms="", shuffle=False,
     spaces=False, max_tags=0, structured_mode="Plain Prompt", region_count=1,
+    variation_mode="faithful",
 ):
     try:
         data = _normalize_png_batch_payload(payload or {})
@@ -1732,9 +2034,11 @@ def _png_batch_run(
         return
     _PNG_BATCH_CANCEL.clear()
     records = [dict(record) for record in data["records"]]
+    independent = str(variation_mode or "faithful") == "independent"
     progress_interval = max(1, (len(records) + 99) // 100)
     skipped_existing = reused = 0
     outcomes = {}
+    previous_outputs = []
     try:
         for position, record in enumerate(records, 1):
             if _PNG_BATCH_CANCEL.is_set():
@@ -1743,7 +2047,13 @@ def _png_batch_run(
                         pending["status"] = "已取消"
                         pending["error"] = "尚未处理"
                 break
-            if str(record.get("prompt", {}).get("processed") or "").strip():
+            record_prompt = record.get("prompt", {})
+            has_processed = bool(str(record_prompt.get("processed") or "").strip())
+            same_conversion_target = (
+                record_prompt.get("processed_preset") == preset
+                and record_prompt.get("processed_base_model") == base_model
+            )
+            if not independent and has_processed and (action != "Convert" or same_conversion_target):
                 skipped_existing += 1
                 if not record.get("status"):
                     record["status"] = "已完成"
@@ -1752,18 +2062,19 @@ def _png_batch_run(
                 continue
             source = record["prompt"]["positive"]
             outcome_key = source.strip()
-            if outcome_key in outcomes:
+            if not independent and outcome_key in outcomes:
                 processed, llm_status = outcomes[outcome_key]
                 reused += 1
             else:
+                batch_directive = _independent_batch_directive(position) if independent else ""
                 processed, llm_status = _expand_or_polish(
                     source, action, preset, system_override, base_model, safety,
                     nsfw_injection, user_instruction, provider, endpoint, model,
                     api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-                    _PNG_BATCH_CANCEL,
+                    _PNG_BATCH_CANCEL, batch_directive, previous_outputs,
                 )
-                if not _PNG_BATCH_CANCEL.is_set():
+                if not independent and not _PNG_BATCH_CANCEL.is_set():
                     outcomes[outcome_key] = (processed, llm_status)
             if not processed and _PNG_BATCH_CANCEL.is_set() and "request cancelled" in str(llm_status or "").lower():
                 record["status"], record["error"] = "已取消", "当前 LLM 请求已取消"
@@ -1772,10 +2083,13 @@ def _png_batch_run(
                         pending["status"], pending["error"] = "已取消", "尚未处理"
                 break
             if processed:
-                processed_kind = _processed_kind_for_preset(preset)
+                if independent:
+                    previous_outputs.append(processed)
+                processed_kind = "mixed" if action == "Polish" else _processed_kind_for_preset(preset)
                 record["prompt"] = {
                     **record["prompt"], "processed": processed,
                     "processed_kind": processed_kind, "output_kind": processed_kind,
+                    "processed_preset": preset, "processed_base_model": base_model,
                 }
                 record["status"], record["error"] = "已完成", ""
             else:
@@ -1788,7 +2102,10 @@ def _png_batch_run(
         completed = sum(1 for record in records if record.get("status") == "已完成")
         failed = sum(1 for record in records if record.get("status") == "失败")
         cancelled = sum(1 for record in records if record.get("status") == "已取消")
-        yield _png_batch_json(result), _png_batch_table(result), selected, current, f"批处理结束：完成 {completed}，相同 Prompt 复用 {reused}，已有结果跳过 {skipped_existing}，失败 {failed}，取消 {cancelled}。"
+        yield _png_batch_json(result), _png_batch_table(result), selected, current, (
+            f"批处理结束：目标 {preset} / {base_model}；完成 {completed}，相同 Prompt 复用 {reused}，"
+            f"已有结果跳过 {skipped_existing}（同目标），失败 {failed}，取消 {cancelled}。"
+        )
     finally:
         _PNG_BATCH_CANCEL.clear()
 
@@ -1816,6 +2133,48 @@ def _png_batch_export_file(payload):
     content = _png_batch_json(data)
     path.write_text(content, encoding="utf-8")
     return str(path)
+
+
+def _ranbooru_handoff_to_png_batch(handoff_id):
+    """Convert one Ranbooru handoff into the shared prompt_batch.v1 shape."""
+    try:
+        handoff_key = int(str(handoff_id or "").strip())
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("请选择有效的 Ranbooru 交接记录") from error
+    record = DB.get_handoff(handoff_key)
+    if not record or record.get("source_kind") != "ranbooru":
+        raise ValueError("Ranbooru 交接记录不存在，或已被清理")
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("Ranbooru 交接记录的 JSON 已损坏")
+    normalized = _normalize_ranbooru_handoff(payload)
+    selected = str(normalized.get("selected_prompt") or "").strip()
+    if not selected:
+        selected = str(normalized.get("natural_prompt") or normalized.get("tags_prompt") or "").strip()
+    if not selected:
+        raise ValueError("Ranbooru 交接记录没有可用 Prompt")
+    source_identity = _handoff_source_ref(normalized)
+    record_id = f"ranbooru-{normalized['database_key']}-{normalized['ranbooru_id']}"
+    prompt = {"positive": selected}
+    natural = str(normalized.get("natural_prompt") or "").strip()
+    if natural:
+        prompt["natural"] = natural
+    return _normalize_png_batch_payload({
+        "schema_version": PNG_BATCH_SCHEMA,
+        "producer": {"name": "Ranbooru"},
+        "records": [{
+            "record_id": record_id,
+            "image": {"filename": f"{record_id}.png"},
+            "prompt": prompt,
+            "source_identity": source_identity,
+            "booru": normalized.get("booru", ""),
+            "rating": normalized.get("rating", ""),
+            "source_score": normalized.get("source_score", 0),
+            "ranbooru_id": normalized.get("ranbooru_id", ""),
+            "database_key": normalized.get("database_key", ""),
+            "post_id": normalized.get("post_id", ""),
+        }],
+    })
 
 
 def _test_connection(provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
@@ -1902,6 +2261,105 @@ def inject_inline_before_negative(component, **kwargs):
         LOGGER.exception("内嵌面板创建失败：%s", error)
 
 
+def _create_inline_json_batch_panel(slot):
+    """Render the JSON Prompt batch controls directly below Forge txt2img."""
+    prefix = f"llm_prompt_studio_{slot}_json_batch"
+    empty_payload = _png_batch_json({"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": []})
+    initial_handoff_choices, initial_handoff_status = _inline_ranbooru_handoff_views()
+    with gr.Accordion("JSON Prompt 批量润色 / 扩写", open=False, elem_id=prefix):
+        json_file = gr.File(label="导入 Prompt JSON", file_types=[".json"], type="filepath", elem_id=f"{prefix}_file")
+        with gr.Row(elem_classes=["lps-form-row"]):
+            json_ranbooru_handoff = gr.Dropdown(
+                label="Ranbooru 交接来源",
+                choices=initial_handoff_choices.get("choices", []),
+                value=initial_handoff_choices.get("value"),
+                elem_id=f"{prefix}_ranbooru_handoff",
+            )
+            json_ranbooru_refresh = gr.Button("刷新 Ranbooru", elem_id=f"{prefix}_ranbooru_refresh")
+            json_ranbooru_load = gr.Button("载入所选交接", elem_id=f"{prefix}_ranbooru_load")
+        json_ranbooru_status = gr.Markdown(initial_handoff_status, elem_id=f"{prefix}_ranbooru_status")
+        json_png_receive = gr.Button("接收 PNG Prompt Collector 当前批次", elem_id=f"{prefix}_png_receive")
+        json_payload = gr.Textbox(label="批量输入 / 结果 JSON", value=empty_payload, lines=6, elem_id=f"{prefix}_payload")
+        with gr.Row(elem_classes=["lps-form-row"]):
+            json_preset = gr.Dropdown(
+                label="转换 System Prompt 预设",
+                choices=PRESET_UI_CHOICES,
+                value="Krea 2 Natural",
+                elem_id=f"{prefix}_preset",
+            )
+            json_base_model = gr.Dropdown(
+                label="转换目标底模",
+                choices=MODEL_UI_CHOICES,
+                value="Krea 2",
+                elem_id=f"{prefix}_base_model",
+            )
+        with gr.Row(elem_classes=["lps-form-row"]):
+            json_action = gr.Radio(label="操作", choices=ACTION_UI_CHOICES, value="Convert", elem_id=f"{prefix}_action")
+            json_variation_mode = gr.Radio(
+                label="批量多样性模式", choices=JSON_VARIATION_MODE_CHOICES, value="independent",
+                elem_id=f"{prefix}_variation_mode",
+            )
+            json_target = gr.Radio(label="目标 Prompt", choices=[("不写入", "none"), ("txt2img", "txt2img")], value="none", elem_id=f"{prefix}_target")
+            json_append = gr.Radio(label="写入方式", choices=[("追加", "append"), ("覆盖", "replace")], value="append", elem_id=f"{prefix}_append")
+        with gr.Row():
+            json_run = gr.Button("开始处理", variant="primary", elem_id=f"{prefix}_run")
+            json_cancel = gr.Button("取消", variant="stop", elem_id=f"{prefix}_cancel")
+            json_append_all = gr.Button("全部结果写入正面 Prompt", elem_id=f"{prefix}_append_all")
+            json_export = gr.DownloadButton("导出结果", elem_id=f"{prefix}_export")
+        json_table = gr.Dataframe(
+            headers=["序号", "文件", "原始正向 Prompt", "状态", "LLM 结果", "错误"],
+            datatype=["number", "str", "str", "str", "str", "str"], interactive=False, wrap=True,
+            elem_id=f"{prefix}_table", elem_classes=["lps-table"],
+        )
+        json_status = gr.HTML("等待导入 JSON。", elem_id=f"{prefix}_status", elem_classes=["lps-status"])
+        json_selection = gr.Number(value=1, precision=0, visible=False, elem_id=f"{prefix}_selection")
+        json_current = gr.Textbox(value="", visible=False, elem_id=f"{prefix}_current")
+        json_append_succeeded = gr.Checkbox(value=False, visible=False, elem_id=f"{prefix}_append_succeeded")
+        json_file.change(
+            _png_batch_load,
+            inputs=json_file,
+            outputs=[json_payload, json_table, json_selection, json_current, json_status],
+        )
+        json_ranbooru_refresh.click(
+            _inline_ranbooru_handoff_views,
+            inputs=json_ranbooru_handoff,
+            outputs=[json_ranbooru_handoff, json_ranbooru_status],
+        )
+        json_ranbooru_load.click(
+            _inline_ranbooru_handoff_load,
+            inputs=json_ranbooru_handoff,
+            outputs=[json_payload, json_table, json_selection, json_current, json_status],
+        )
+        json_png_receive.click(
+            fn=None,
+            outputs=json_status,
+            js=f"() => window.llmPromptStudioPngBatch.receiveCollectorBatch('{slot}')",
+        )
+        json_payload.input(
+            _png_batch_refresh,
+            inputs=[json_payload, json_selection],
+            outputs=[json_table, json_selection, json_current, json_status],
+        )
+        json_preset.change(
+            _recommended_base_model_for_preset,
+            inputs=json_preset,
+            outputs=json_base_model,
+        )
+        json_run.click(
+            _inline_json_batch_run,
+            inputs=[json_payload, json_action, json_preset, json_base_model, json_variation_mode],
+            outputs=[json_payload, json_table, json_selection, json_current, json_status],
+        )
+        json_cancel.click(_cancel_png_batch, outputs=json_status, queue=False)
+        json_export.click(_png_batch_export_file, inputs=json_payload, outputs=json_export)
+        json_append_all.click(
+            fn=None,
+            inputs=[json_payload, json_target, json_append],
+            outputs=[json_status, json_append_succeeded],
+            js="(payload, target, mode) => window.llmPromptStudioPngBatch.appendAllToPrompt(payload, target, mode)",
+        )
+
+
 def _create_inline_panel(slot, prompt_target):
     workflow = _workflow_settings()
     with gr.Accordion("Prompt 批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
@@ -1913,6 +2371,10 @@ def _create_inline_panel(slot, prompt_target):
         inline_creative_template_button = gr.Button(
             "填入通用创作需求",
             elem_id=f"llm_prompt_studio_{slot}_creative_template",
+        )
+        inline_kemonimimi_template_button = gr.Button(
+            "填入萌系兽耳批量模板",
+            elem_id=f"llm_prompt_studio_{slot}_kemonimimi_template",
         )
         with gr.Row(elem_classes=["lps-form-row"]):
             inline_preset = gr.Dropdown(
@@ -1950,8 +2412,14 @@ def _create_inline_panel(slot, prompt_target):
         inline_cache_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_output")
         inline_cache_status = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_status")
         inline_cache_cursor = gr.State(0)
+        if slot == "txt2img":
+            _create_inline_json_batch_panel(slot)
         inline_creative_template_button.click(
             lambda: GENERAL_CREATIVE_REQUEST_TEMPLATE,
+            outputs=request,
+        )
+        inline_kemonimimi_template_button.click(
+            lambda: KEMONOMIMI_LOLI_BATCH_TEMPLATE,
             outputs=request,
         )
         inline_generate.click(
@@ -2280,6 +2748,36 @@ def _handoff_views(selected=None):
     return gr.update(value=rows), gr.update(choices=choices, value=retained), status
 
 
+def _inline_ranbooru_handoff_views(selected=None):
+    records = [record for record in DB.list_handoffs() if record.get("source_kind") == "ranbooru"]
+    choices = []
+    for record in records:
+        payload = record.get("payload") or {}
+        preview = " ".join(str(
+            payload.get("selected_prompt") or payload.get("natural_prompt") or payload.get("tags_prompt") or ""
+        ).split())
+        if len(preview) > 72:
+            preview = preview[:69] + "..."
+        label = HANDOFF_STATUS_LABELS.get(record.get("status"), record.get("status", ""))
+        choices.append((f"#{record['id']} | {label} | {preview}", str(record["id"])))
+    available = {value for _, value in choices}
+    selected_value = str(selected or "")
+    retained = selected_value if selected_value in available else (choices[0][1] if choices else None)
+    status = f"Ranbooru 可用交接记录：{len(records)} 条。"
+    return gr.update(choices=choices, value=retained), status
+
+
+def _inline_ranbooru_handoff_load(handoff_id):
+    try:
+        data = _ranbooru_handoff_to_png_batch(handoff_id)
+        selected, current = _png_batch_current(data, 1)
+        return _png_batch_json(data), _png_batch_table(data), selected, current, (
+            f"已载入 Ranbooru 交接 #{handoff_id}；可直接点击批处理进行润色/扩写。"
+        )
+    except Exception as error:
+        return gr.update(), gr.update(), gr.update(), gr.update(), f"Ranbooru 载入失败：{_safe_error(error)}"
+
+
 def _load_handoff_into_generation(handoff_id):
     record = DB.get_handoff(int(handoff_id)) if str(handoff_id or "").isdigit() else None
     if not record:
@@ -2449,6 +2947,10 @@ def on_ui_tabs():
                             "填入通用创作需求",
                             elem_id="llm_prompt_studio_creative_template",
                         )
+                        kemonimimi_template_button = gr.Button(
+                            "填入萌系兽耳批量模板",
+                            elem_id="llm_prompt_studio_kemonimimi_template",
+                        )
                         preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
                         base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
@@ -2587,8 +3089,8 @@ def on_ui_tabs():
                             server_queue_id = gr.Textbox(label="服务端任务 ID", interactive=False, elem_id="llm_prompt_studio_server_queue_id")
                             server_queue_status = gr.HTML("尚未提交服务端任务。", elem_id="llm_prompt_studio_server_queue_status", elem_classes=["lps-status"])
                             server_queue_log = gr.HTML("", elem_id="llm_prompt_studio_server_queue_log", elem_classes=["lps-auto-loop-log"])
-                    with gr.Tab("PNG 润色 / 扩写", elem_id="llm_prompt_studio_png_batch_tab"):
-                        png_batch_file = gr.File(label="导入 prompt_batch.v1 JSON", file_types=[".json"], type="filepath", elem_id="llm_prompt_studio_png_batch_file")
+                    with gr.Tab("JSON Prompt 批量处理", visible=False, elem_id="llm_prompt_studio_png_batch_tab"):
+                        png_batch_file = gr.File(label="导入 Prompt JSON", file_types=[".json"], type="filepath", elem_id="llm_prompt_studio_png_batch_file")
                         with gr.Accordion("批次 JSON", open=False):
                             png_batch_payload = gr.Textbox(
                                 label="批量输入 / 结果 JSON",
@@ -2608,6 +3110,7 @@ def on_ui_tabs():
                             png_batch_run = gr.Button("开始处理", variant="primary", elem_id="llm_prompt_studio_png_batch_run")
                             png_batch_cancel = gr.Button("取消", variant="stop", elem_id="llm_prompt_studio_png_batch_cancel")
                             png_batch_append_button = gr.Button("追加并下一条", variant="primary", elem_id="llm_prompt_studio_png_batch_append_button")
+                            png_batch_append_all = gr.Button("全部结果写入正面 Prompt", elem_id="llm_prompt_studio_png_batch_append_all")
                             png_batch_export = gr.DownloadButton("导出结果", elem_id="llm_prompt_studio_png_batch_export")
                         png_batch_table = gr.Dataframe(headers=["序号", "文件", "原始正向 Prompt", "状态", "LLM 结果", "错误"], datatype=["number", "str", "str", "str", "str", "str"], interactive=False, wrap=True, elem_id="llm_prompt_studio_png_batch_table", elem_classes=["lps-table"])
                         gr.Markdown("", elem_id="llm_prompt_studio_png_batch_results")
@@ -2810,6 +3313,7 @@ def on_ui_tabs():
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
         creative_template_button.click(lambda: GENERAL_CREATIVE_REQUEST_TEMPLATE, outputs=request)
+        kemonimimi_template_button.click(lambda: KEMONOMIMI_LOLI_BATCH_TEMPLATE, outputs=request)
         generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
         auto_loop_dispatch.click(
             _generate_auto_loop,
@@ -2857,6 +3361,12 @@ def on_ui_tabs():
         )
         png_batch_cancel.click(_cancel_png_batch, outputs=png_batch_status, queue=False)
         png_batch_export.click(_png_batch_export_file, inputs=png_batch_payload, outputs=png_batch_export)
+        png_batch_append_all.click(
+            fn=None,
+            inputs=[png_batch_payload, png_batch_target, png_batch_append],
+            outputs=[png_batch_status, png_batch_append_succeeded],
+            js="(payload, target, mode) => window.llmPromptStudioPngBatch.appendAllToPrompt(payload, target, mode)",
+        )
         png_append_event = png_batch_append_button.click(
             fn=None,
             inputs=[png_batch_current, png_batch_target, png_batch_append],

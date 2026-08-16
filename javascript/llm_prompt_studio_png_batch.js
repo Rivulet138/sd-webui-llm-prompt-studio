@@ -50,5 +50,35 @@
         return [status("success", mode === "replace" ? "已覆盖 Prompt" : "已追加 Prompt", `${target} · ${incoming.length} 字符`), true];
     }
 
-    window.llmPromptStudioPngBatch = { appendToPrompt };
+    function appendAllToPrompt(payload, target, mode) {
+        let data;
+        try {
+            data = typeof payload === "string" ? JSON.parse(payload || "{}") : payload;
+        } catch (error) {
+            return [status("error", "JSON invalid", error?.message || error), false];
+        }
+        const records = Array.isArray(data?.records) ? data.records : [];
+        const prompts = records
+            .map((record) => String(record?.prompt?.processed || "").trim())
+            .filter(Boolean);
+        if (!prompts.length) {
+            return [status("warning", "No processed prompts", "Run batch processing first."), false];
+        }
+        return appendToPrompt(prompts.join(", "), target, mode);
+    }
+
+    function receiveCollectorBatch(slot) {
+        const targetId = `#llm_prompt_studio_${slot || "txt2img"}_json_batch_payload`;
+        const target = root().querySelector(targetId);
+        const legacy = root().querySelector("#llm_prompt_studio_png_batch_payload");
+        if (!target) return status("error", "未找到内嵌 JSON 面板", `目标：${targetId}`);
+        if (!legacy || !String(legacy.value || "").trim()) {
+            return status("warning", "PNG Collector 尚无批次", "请先在 PNG Prompt Collector 读取 PNG 或导入 JSON。");
+        }
+        setValue(target, legacy.value);
+        target.focus({ preventScroll: true });
+        return status("success", "已接收 PNG Collector 批次", "批次已写入当前 txt2img JSON 面板。");
+    }
+
+    window.llmPromptStudioPngBatch = { appendToPrompt, appendAllToPrompt, receiveCollectorBatch };
 })();

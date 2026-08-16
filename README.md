@@ -1,260 +1,159 @@
-# LLM Prompt Studio for Stable Diffusion WebUI Forge Neo
+# LLM Prompt Studio
 
-## 内容生成边界
+LLM Prompt Studio 是面向 Forge Neo 的 Prompt 生成、转换、批处理、缓存和联动扩展。它支持单条生成、服务端队列、txt2img/img2img 内嵌生成，以及 JSON/PNG Prompt 批量转换。
 
-- Forge 原始 Prompt 负责画风 LoRA、画师/工作室标签、权重、质量词和用户自己的固定标签；插件不会替用户创造、改写或复制这些内容。
-- LLM 只补充主体外观、完整服装、动作、表情、道具、环境、空间层次、构图、镜头、时间、天气和光照。
-- 自动循环与 txt2img/img2img 内嵌生成是无上下文的一次一请求：每轮从同一份冻结原始 Prompt 出发，不读取上一轮结果，也不使用批处理的固定场景蓝图。
-- 真正的批处理仍按一行一请求工作，并使用强差异规则改变动作、场景、构图、时间天气、道具和叙事事件。
-- Natural Language 与 Krea 2 Natural 不再要求输出 `medium/rendering`；System Prompt 明确禁止新增画师名、工作室名、作品名、风格、美学、媒介或渲染描述。
-- 生成结果不会在进入缓存前进行画师、工作室或风格词清洗；约束发生在 LLM System Prompt 中，原始结果按现有 SFW 校验和标签后处理流程保存。
-
-完整页和 txt2img/img2img 内嵌面板都提供“填入通用创作需求”按钮。模板面向可爱、萌系、完整着装、非性化的年幼外观角色或兽耳少女，并把二次元表现明确交给原始 Prompt 中的 LoRA/tag。Forge 在写回时保留这份基底，LLM 只返回本轮可追加的内容描述。
-
-“填入通用创作需求”只会把模板文字写入创作需求输入框，不会修改、绑定或代替独立的 `SFW / NSFW` 内容模式设置。
-
-面向 Forge Neo 的提示词生成、批处理、缓存和自动生图扩展。插件以实际工作流为中心：连接一次 LLM，批量生成不同 Prompt，按队列写入 txt2img / img2img，并与 Ranbooru、PNG Prompt Collector 联动。
-
-## 核心功能
+## 功能概览
 
 - 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic、Gemini、OpenRouter、DeepSeek、Ollama、LM Studio 和自定义 OpenAI 兼容接口。
-- 单条生成 Danbooru Tag、自然语言、混合 Prompt 和 Regional Prompt 结构。
-- 批处理坚持“一行一次请求”：重复要求也会作为独立任务发送，不因缓存或相同输入自动跳过。
-- 批次请求会要求模型改变动作、构图、环境、时间天气、道具和叙事内容，禁止只替换风格词制造差异。
-- txt2img / img2img 内嵌 `Prompt 批量生成` 面板，可从 LLM 或缓存取词并连续生图。
-- 本地 SQLite Prompt 缓存，支持筛选、手动评分、编辑、撤销删除和 JSON / CSV 导入导出。
-- 自动发现并同步 Ranbooru Tag / 自然语言缓存，支持实时交接。
-- 接收 PNG Prompt Collector 的 `prompt_batch.v1` 批次，逐条润色或扩写。
-- 静态词库自动建立和增量刷新索引，无需手动重建。
+- 输出预设覆盖 Danbooru Tags、Danbooru + Natural、Natural Language、NoobAI Tags、Anima Tags 和 Krea 2 Natural。
+- 支持 `Plain Prompt`、`Regional JSON` 和 `Regional Markdown` 结构化输出。
+- txt2img/img2img 下方提供内嵌 Prompt 生成与 JSON 批量转换面板。
+- 通过独立的构图指令、静态词库参考和最近结果排除项，降低批量结果的构图、动作、道具和装饰重复。
+- 保留兽耳萝莉批量模板；模板只规定主体方向和差异规则，SFW/NSFW 由内容模式及现有安全注入负责。
+- 支持本地 SQLite 缓存、服务端队列、取消、导入导出、Ranbooru 交接和 PNG Prompt Collector 批次。
 
+## 安装与更新
 
-## 安装
-
-在 Forge Neo 的扩展目录执行：
+在 Forge Neo 扩展目录执行：
 
 ```powershell
 cd E:\sd-webui-forge-neo\extensions
 git clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio.git
 ```
 
-重新启动 Forge Neo，然后执行一次浏览器强制刷新（`Ctrl + F5`）。
-
-更新：
+重启 Forge Neo 后，在浏览器执行 `Ctrl + F5`。更新已有安装：
 
 ```powershell
 cd E:\sd-webui-forge-neo\extensions\sd-webui-llm-prompt-studio
 git pull
 ```
 
-## 界面说明
+## 首次配置
 
-### 生成
+在 `LLM Prompt Studio` 页面填写 Provider、Endpoint、模型 ID、API Key、温度、超时和最大输出 Token，然后使用“测试 API”验证连接。API Key 保存在 `user/credentials/llm_credentials.json`，界面不会回填明文。
 
-用于验证单条生成链路和保存通用工作参数。
+“创作要求”描述本次画面；“源 Danbooru 标签”可选。System Prompt 预设决定输出格式，目标底模会追加对应模型的内容约束。SFW/NSFW 是独立的内容模式；自定义 System Prompt、额外 NSFW 注入和输出后处理参数也在工作参数中统一保存。
 
-| 控件 | 作用 |
-| --- | --- |
-| 创作要求 | 描述需要生成的画面 |
-| 源 Danbooru 标签 | 可选；填写后优先作为本次输入 |
-| System Prompt 预设 | 选择 Tag、自然语言或混合输出规则 |
-| 目标底模 | 追加对应模型的 Prompt 约束 |
-| 内容模式 | 选择 SFW / NSFW |
-| 高级 Prompt 约束 | 自定义 System Prompt、NSFW 注入和输出要求 |
-| 标签后处理 | 去除不良词、通配排除、打乱、下划线转换和数量限制 |
-| 缓存 | 决定是否保存结果及本地手动评分 |
+连接失败时，插件对临时网络错误、408/409/425/429 和部分 5xx 状态最多重试两次并退避等待。OpenAI 兼容服务应确认 Endpoint 包含正确的 `/v1` 路径、模型 ID 可用，并检查本地代理或服务端 TLS 配置。
 
-`生成提示词` 是一次逻辑生成请求。遇到连接超时、连接重置、HTTP 408/409/425/429 或 5xx 时，服务端最多再重试 2 次，并使用退避等待；结果成功后只写入一次缓存，不会追加评分请求。
+## 单条生成
 
-### 批处理
+“生成提示词”执行一次完整链路：读取已保存连接和工作参数，构建 System Prompt 与用户消息，调用 Provider，解析 assistant 文本，执行安全校验和标签后处理，按设置写入缓存。
 
-#### 服务端批量生成
+结果只应是一条完整的单图 Prompt。插件会拒绝空响应、解释性文本、负面 Prompt、分镜/拼图/候选方案和与所选输出预设不符的格式。
 
-输入框每行是一条独立创作要求。点击 `预览生成队列` 可检查任务，点击 `开始生成并缓存` 后逐行调用 LLM。
+## 批处理
 
-- 一行对应一个独立逻辑请求；临时网络错误最多进行 2 次服务端重试，永久错误不会重试。
-- 相同的两行仍会分别调用两次。
-- `跳过批次开始前已有缓存` 默认关闭；仅在用户主动勾选时生效。
-- 生成结果直接显示在批量结果表格，并按 `0 / unrated` 缓存。
-- 单条失败可继续处理；错误和跳过记录支持选择后重新提交。
-- 批量取消会阻止下一次重试或下一行请求；当前底层 HTTP 返回或超时后停止，已经完成的结果保留。
+### 服务端批量生成
 
-#### 浏览器生图队列
+批处理页每行对应一个独立请求。预览队列后可选择“只生成 Prompt”或“生成并写入 txt2img”。任务写入 `user/prompt_studio.db` 后由 Forge 进程内 worker 执行，页面关闭、刷新或隐藏不会停止队列。
 
-可先生成 Prompt 到浏览器队列，再投入 Forge 原生 txt2img / img2img；也可使用 `重新调用 LLM 并立即生图`。
+- 相同文本默认仍是两次独立请求。
+- 可主动开启“跳过批次开始前已有缓存”。
+- 单条失败会记录错误并继续后续任务。
+- 取消会阻止下一次重试和下一条请求；当前底层 HTTP 返回或超时后生效，已完成结果保留。
+- txt2img 队列需要 Forge 以 `--api` 启动，并使用 Forge 自身的保存设置。
 
-队列只维护当前页面任务状态和浏览器本地缓存，不使用跨标签页 Web Locks、租约或任务所有者判断。
+### txt2img/img2img 内嵌生成
 
-Forge 生图失败或观察超时不会自动再次点击生图按钮，因为生图操作可能已经在 Forge 内部完成，自动重放会造成重复图片。对应队列记录会恢复为 `pending`，确认 Forge 已空闲后可用 `投入已有队列生图` 显式重试。
+内嵌面板位于正向 Prompt 区域下方，包含：
 
-#### 服务端队列（推荐）
+- 本轮创作要求、System Prompt 预设、目标底模和内容模式。
+- `LLM 自动生成` 或 `缓存顺序读取` 两种来源。
+- `取一条并写入`、`开始连续生成` 和 `停止`。
+- JSON Prompt 批量润色/扩写及结果写回控件。
 
-批处理页的“服务端队列（页面关闭后仍继续）”会把每一条请求和配置先写入 `user/prompt_studio.db`，再由 Forge 进程内的后台 worker 逐条执行。浏览器只提交任务并轮询状态，因此隐藏、刷新或关闭 Gradio 页面不会停止任务。日志中的每行包含请求、生成的 Prompt、状态、错误和尝试次数；重新打开页面后输入任务 ID 并点击“刷新日志”即可恢复查看。
+连续生成会冻结启动时的原始 Prompt。每轮只写入“原始 Prompt + 当前轮结果”，不会把上轮完整 Prompt 再次累加。系统会记录最近结果的摘要作为排除参考，并要求改变场景结构、动作/事件、镜头、道具、装饰或时间天气；稳定的主体身份词不参与相似度判定。相似度超过阈值的结果会被拒绝或重试，从而避免只换颜色、同义词或标签顺序。
 
-- “只生成 Prompt”只调用 LLM 并写入本地 Prompt 缓存。
-- “txt2img”在 Prompt 成功后调用 Forge `/sdapi/v1/txt2img`，使用 Forge 自身队列和保存设置；需要以 `--api` 启动 Forge。
-- 取消只会取消待处理项，并向当前运行项发送取消信号；失败记录会保留在日志中，不会悄悄丢失。
+点击“停止”会设置当前面板的取消事件；当前 LLM 请求返回或超时后，迟到响应不会写入 Prompt，已写入的结果保持不变。
 
-#### PNG 润色 / 扩写
+## JSON Prompt 批量转换
 
-接收 PNG Prompt Collector 发送的 `prompt_batch.v1` JSON：
+面板支持导入 PNG Prompt Collector 的 `prompt_batch.v1`，也支持常见 JSON 形状：字符串数组、`prompts`/`items`/`records`/`results`/`data` 数组、对象中的 `prompt`/`positive`/`text`/`content` 字段，以及 ID 到字符串或对象的映射。
 
-1. 导入批次。
-2. 选择扩写或润色。
-3. 批量处理，保持一张图片对应一条记录。
-4. 使用 `追加并下一条` 将结果写入 txt2img / img2img。
+操作流程：
 
-相同输入可复用同一次处理结果；已有 `processed` 的记录不会再次发送到 LLM。取消按钮直接停止当前批次，不维护任务 ID 或所有者。
+1. 导入 JSON，或从 Ranbooru 交接箱载入批次。
+2. 选择 `润色` 或 `扩写`，再选择转换预设和目标底模。
+3. 选择批量多样性模式、写入目标和追加/覆盖方式。
+4. 开始处理；结果按“一张图片一条记录”保存。
+5. 使用“追加并下一条”或“全部结果写入正面 Prompt”。
 
-#### 直接批量导入
+### 两种批量多样性模式
 
-每行一个 Prompt，也支持：
+- `独立构图转换`：默认模式。每条记录都获得独立的构图变化指令；系统参考静态词库和已生成结果的排除摘要，主动更换视角、空间布局、动作、事件、道具、装饰、时间或天气。适合批量创作完全不同的画面。
+- `忠实格式转换`：只转换表达方式和目标模型格式，尽量保留原始 Prompt 的画面事实。相同输入可复用本批次结果，已有同一目标预设/底模的 `processed` 记录会跳过。适合把旧 D 站标签转换成 Krea2、Anima 或自然语言，而不重新设计构图。
 
-```text
-8.5<TAB>prompt text
-```
+Krea2/Anima 细节增强角色会输出固定的英文结构：`PART ONE: TAG ANCHORS`、`BREAK`、`PART TWO: EXTREME LAYERED DETAIL`、`SUBJECT` 和 `MASTER DESCRIPTION`。每层描述构图、头发、面部、服装、道具、光影和背景；静态词库只作为兼容词汇参考，不会整库倾倒或执行词库中的指令。
 
-无法解析的分数按 Prompt 正文处理。导入评分属于本地手动评分。
+## 兽耳萝莉批量模板
 
-### 缓存与联动
+完整页和内嵌面板都可使用“填入通用创作需求”。模板固定可爱、完整着装、自然姿态和兽耳萝莉主体方向，同时要求每条更换地点、动作/事件、构图/视角，并额外改变服装、表情、道具、伙伴关系、时间天气或空间布局中的至少两项。它只写对画面有用的可见细节，避免无关堆词；实际内容模式仍由 SFW/NSFW 设置控制。
 
-缓存页提供：
+## 静态词库
 
-- 按关键词、最低手动评分、输出格式和目标底模筛选。
-- 选择、查看、编辑、另存、删除和撤销上次删除。
-- 按全库可见序号预览和删除。
-- JSON / CSV 导入导出。
-- Ranbooru 缓存自动检测、预览和同步。
-- Ranbooru 实时交接箱：载入生成页、使用 LLM 处理并缓存、跳过或清理。
+默认词库目录为 `assets/wildcards/`。插件在启动、打开页面或修改词库目录时自动增量索引。词库条目会以惰性参考的形式注入 System Prompt，用于提供兼容的发型、服装、道具、环境、镜头和材质词；模型必须按画面需要选择，不能机械复制无关条目。词库中的文本被视为数据，不会覆盖系统规则。
 
-Ranbooru 的源评分只用于筛选源记录，不会作为本插件 Prompt 评分。同步的新记录和发生变化的记录按未评分保存。
+## Ranbooru 与 PNG 联动
 
-### 连接设置
+### Ranbooru
 
-每个 Provider 独立保存：
+插件会自动探测 Ranbooru 的 `tag_cache.db`，也可以在设置中指定路径。可选择 Tag、自然语言或两者，按评分和内容模式筛选，预览并同步缓存。Ranbooru 交接箱支持载入、使用当前 LLM 转换并缓存、跳过或清理；源评分只用于筛选源记录，不会成为本插件的 LLM 评分。
 
-- 接口地址
-- 模型 ID
-- 温度
-- 超时
-- 最大输出 Token
-- 是否发送温度参数
-- API Key
+### PNG Prompt Collector
 
-API Key 写入 `user/credentials.json`，界面不会回填明文。`测试 API` 只进行一次最小连接请求。
+在内嵌 JSON 面板点击“接收 PNG Prompt Collector 当前批次”即可导入共享的 `prompt_batch.v1` 数据。处理后的 `processed`、输出类型、预设和目标底模会保留在每条图片记录中，可导出后再交给其他插件。
 
-### 工具
+## 缓存、队列与 API
 
-#### 静态词库
+缓存页支持关键词、最低手动评分、输出格式和目标底模筛选，提供查看、编辑、删除、撤销删除以及 JSON/CSV 导入导出。服务端队列日志包含请求、生成 Prompt、状态、错误和尝试次数，可用批次 ID 恢复查看。
 
-启动插件、打开页面或修改词库目录时都会自动增量索引。搜索框只查询已经建立的本地索引。
-
-默认词库位于：
-
-```text
-assets/wildcards/
-```
-
-#### WD14 + LLM
-
-调用已安装的 Forge WD14 Tagger 获取标签，再使用当前 LLM 设置扩写或润色。WD14 和 LLM 是两个连续步骤，任一步不可用都会返回明确状态。
-
-## txt2img / img2img 内嵌面板
-
-内嵌面板只保留无限生成联动需要的控件：
-
-- 本轮创作要求
-- System Prompt 预设
-- 目标底模
-- 内容模式：`SFW` / `NSFW`
-- Prompt 来源：`LLM 自动生成` / `缓存顺序读取`
-- Ranbooru 固定基底追加：启动时冻结原始 Prompt；每轮只写入“原始 Prompt + 当前轮结果”，不会累计上一轮结果
-- 轮数（`0` 表示持续）
-- `取一条并写入`、`开始连续生成`、`停止`
-
-三个生成选项与独立 `LLM Prompt Studio` 页使用同一组选项，并自动载入已保存的工作参数；在生成页、批处理页或任一内嵌面板修改时，其他面板会同步更新。详细 Provider、自定义 System Prompt 和后处理参数仍统一在独立页面保存。
-
-
-## 输出预设
-
-| 预设 | 输出 |
-| --- | --- |
-| Danbooru Tags | 逗号分隔 Tag Prompt |
-| Danbooru + Natural | Tag 与自然语言组合 |
-| Natural Language | 普通自然语言描述 |
-| NoobAI Tags | 面向 NoobAI 的 Tag 规则 |
-| Anima Tags | 面向 Anima 的 Tag 规则 |
-| Krea 2 Natural | 面向 Krea 2 的自然语言描述 |
-
-结构化输出可选 `Plain Prompt`、`Regional JSON` 或 `Regional Markdown`。
-
-## 本地 API
-
-插件注册以下接口：
+主要本地 API：
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | POST | `/llm-prompt-studio/v1/generate` | 使用已保存连接生成 Prompt |
 | GET | `/llm-prompt-studio/v1/cache` | 查询本地缓存 |
 | POST | `/llm-prompt-studio/v1/queue` | 创建持久化服务端队列 |
-| GET | `/llm-prompt-studio/v1/queue/{batch_id}` | 查询队列状态、日志和 Prompt |
+| GET | `/llm-prompt-studio/v1/queue/{batch_id}` | 查询队列状态和日志 |
 | POST | `/llm-prompt-studio/v1/queue/{batch_id}/cancel` | 取消待处理队列项 |
 | POST | `/llm-prompt-studio/v1/handoff` | 接收 Ranbooru 交接 |
 | POST | `/llm-prompt-studio/v1/handoff/process` | 处理并缓存交接记录 |
 | GET | `/llm-prompt-studio/v1/handoffs` | 查询交接箱 |
 
-默认只允许本机访问。Forge 配置 `--api-auth` 后，远程调用必须通过对应 Basic Auth。API 不接受请求正文中的 API Key，也不能临时切换到未保存的 Provider 或地址。
-
-最小生成请求：
-
-```json
-{
-  "request": "one young girl in a complex railway station scene",
-  "preset": "NoobAI Tags",
-  "base_model": "NoobAI",
-  "cache_result": false
-}
-```
+默认 API 仅允许本机访问。请求正文不接受 API Key，也不能临时切换到未保存的 Provider 或 Endpoint。
 
 ## 数据目录
 
 ```text
 user/
 ├── prompt_studio.db
-├── credentials.json
+├── credentials/
+│   └── llm_credentials.json
 ├── exports/
 └── backups/
 ```
 
-- `prompt_studio.db`：Prompt、工作设置、静态词库索引和交接记录。
-- `credentials.json`：按 Provider 与 URL 保存的凭据。
-- `exports/`：JSON / CSV 导出。
+- `prompt_studio.db`：Prompt、设置、静态词库索引、队列和交接记录。
+- `credentials/llm_credentials.json`：按 Provider 和 Endpoint 保存的凭据。
+- `exports/`：JSON/CSV 导出。
 - `backups/`：删除操作创建的可恢复备份。
 
-旧数据库中的 `score_source=llm`、评分模型和评分理由字段仅用于历史兼容；当前版本不会生成新的 LLM 评分。
+## 开发与验证
 
-## 联动插件
+在扩展目录执行：
+
+```powershell
+E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py'
+E:\sd-webui-forge-neo\venv\Scripts\python.exe -m py_compile scripts\prompt_studio_ui.py scripts\prompt_studio_core.py
+node --check javascript\llm_prompt_studio_png_batch.js
+git diff --check
+```
+
+修改 Python 或 JavaScript 后重启 Forge，并使用 `Ctrl + F5` 刷新页面。缺少 Ranbooru、PNG Prompt Collector 或 WD14 Tagger 时，本插件的基础生成和缓存仍可独立运行，相应联动按钮会显示不可用状态。
+
+## 相关扩展
 
 - [sd-webui-ranbooru-Forge-neo](https://github.com/Rivulet138/sd-webui-ranbooru-Forge-neo)
 - [sd-webui-png-prompt-collector](https://github.com/Rivulet138/sd-webui-png-prompt-collector)
 - [stable-diffusion-webui-wd14-tagger](https://github.com/toriato/stable-diffusion-webui-wd14-tagger)
-
-三个插件均可独立运行。缺少联动插件时，相应按钮会报告目标不可用，不影响本插件基础生成和缓存功能。
-
-## 开发与验证
-
-```powershell
-cd E:\sd-webui-forge-neo\extensions\sd-webui-llm-prompt-studio
-E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -v
-E:\sd-webui-forge-neo\venv\Scripts\python.exe -m ruff check scripts tests
-node --check javascript/llm_prompt_studio_auto_loop.js
-node tests/auto_loop_runtime_test.js
-```
-
-当前回归套件覆盖 Provider 请求与响应适配、API、缓存、批处理独立请求、Ranbooru 交接、PNG 批次、自动词库索引、Ranbooru 式追加、取消和浏览器队列。
-
-## 已知边界
-
-- 模型 ID 必须手动填写，插件不自动枚举 Provider 模型。
-- LLM 请求开始后无法中断底层 HTTP 连接；取消会在当前请求返回或超时后生效，并阻止后续退避重试。
-- 浏览器队列保存在当前浏览器的 `localStorage`；清理站点数据会移除队列。
-- 修改 Python 或 JavaScript 后需要重启 Forge，并使用 `Ctrl + F5` 强制刷新。

@@ -30,6 +30,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
             "wildcards": ui.DEFAULT_WILDCARDS,
             "call_llm": ui.call_llm,
             "generate": ui._generate,
+            "recent_outputs": {key: list(value) for key, value in ui._RECENT_BATCH_OUTPUTS.items()},
             "independent_sequence": ui._independent_batch_sequence,
             "creative_sequence": ui._independent_creative_sequence,
             "modules": sys.modules.get("modules"),
@@ -38,6 +39,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         ui.DB = StudioDB(root / "studio.db")
         ui.CREDENTIALS = CredentialStore(root / "credentials.json")
         ui.DEFAULT_WILDCARDS = self.lexicon
+        ui._RECENT_BATCH_OUTPUTS.clear()
         ui.call_llm = lambda *args, **kwargs: "1girl, red_hair"
         ui.DB.set_setting("llm_connections_v2", {
             "version": 2,
@@ -60,6 +62,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         ui.DEFAULT_WILDCARDS = self.originals["wildcards"]
         ui.call_llm = self.originals["call_llm"]
         ui._generate = self.originals["generate"]
+        ui._RECENT_BATCH_OUTPUTS.clear()
+        ui._RECENT_BATCH_OUTPUTS.update({key: list(value) for key, value in self.originals["recent_outputs"].items()})
         with ui._INDEPENDENT_BATCH_LOCK:
             ui._independent_batch_sequence = self.originals["independent_sequence"]
         with ui._INDEPENDENT_CREATIVE_LOCK:
@@ -283,6 +287,33 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["prompt"], "A polished natural prompt.")
         self.assertEqual(captured["request"], "A green-haired girl standing in a forest.")
         self.assertEqual(captured["source_tags"], "")
+
+    async def test_ranbooru_handoff_can_feed_inline_json_batch(self):
+        handoff_id = ui.receive_ranbooru_handoff({
+            "ranbooru_id": 201,
+            "database_key": "abcdef0123456789",
+            "tags_prompt": "1girl, silver_hair, tags version",
+            "natural_prompt": "A silver-haired girl arranging flowers in a greenhouse.",
+            "selected_prompt": "A silver-haired girl arranging flowers in a greenhouse.",
+            "selected_is_natural": True,
+            "booru": "danbooru",
+            "rating": "g",
+            "source_score": 8,
+        })["handoff_id"]
+
+        batch = ui._ranbooru_handoff_to_png_batch(handoff_id)
+
+        self.assertEqual(batch["producer"]["name"], "Ranbooru")
+        self.assertEqual(len(batch["records"]), 1)
+        record = batch["records"][0]
+        self.assertEqual(record["prompt"]["positive"], "A silver-haired girl arranging flowers in a greenhouse.")
+        self.assertEqual(record["prompt"]["natural"], record["prompt"]["positive"])
+        self.assertEqual(record["source_identity"], "ranbooru:abcdef0123456789:201")
+        self.assertEqual(record["booru"], "danbooru")
+        self.assertEqual(record["rating"], "g")
+        self.assertEqual(record["source_score"], 8)
+        self.assertEqual(record["ranbooru_id"], "201")
+        self.assertEqual(record["database_key"], "abcdef0123456789")
 
     async def test_ranbooru_handoff_rejects_non_boolean_variant_flag(self):
         with self.assertRaisesRegex(ValueError, "必须是布尔值"):
@@ -774,7 +805,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(calls), 3)
         self.assertIn("LLM 请求 3", results[-1][0])
-        self.assertEqual([call[0][6] for call in calls], [0.9, 0.9, 0.9])
+        self.assertEqual([call[0][6] for call in calls], [1.25, 1.25, 1.25])
         self.assertEqual(
             [call[0][5] for call in calls],
             [
@@ -797,7 +828,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         high_temperature_args = list(self._batch_args("delta", False, True))
         high_temperature_args[13] = 1.1
         list(ui._batch_generate(*high_temperature_args))
-        self.assertEqual(calls[-1][0][6], 1.1)
+        self.assertEqual(calls[-1][0][6], 1.25)
 
     async def test_batch_diversity_plan_does_not_repeat_across_supported_queue_size(self):
         semantic_directives = {
@@ -807,7 +838,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(semantic_directives), 10001)
 
-    async def test_inline_generation_uses_fresh_stateless_request_each_time(self):
+    async def test_inline_generation_uses_fresh_request_with_prior_exclusions(self):
         calls = []
 
         def capture_call(*args, **kwargs):
@@ -827,7 +858,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([first[0], second[0]], ["1girl, inline_scene_1", "1girl, inline_scene_2"])
         self.assertEqual(len(calls), 2)
-        self.assertEqual([call[0][6] for call in calls], [0.9, 0.9])
+        self.assertEqual([call[0][6] for call in calls], [1.25, 1.25])
         self.assertEqual(calls[0][0][5], calls[1][0][5])
         self.assertNotEqual(calls[0][0][4], calls[1][0][4])
         self.assertIn("independent one-shot creative request", calls[0][0][4])
@@ -835,7 +866,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
         self.assertFalse(any(blueprint in calls[0][0][4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
         self.assertFalse(any(blueprint in calls[1][0][4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
-        self.assertNotIn("inline_scene_1", calls[1][0][4])
+        self.assertIn("Recent outputs are exclusion references only", calls[1][0][4])
+        self.assertIn("inline_scene_1", calls[1][0][4])
 
     async def test_auto_loop_uses_content_variation_without_batch_blueprint(self):
         calls = []
@@ -859,8 +891,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first[0], "1girl, different_action, different_room")
         self.assertEqual(second[0], "1girl, different_action, different_room")
-        self.assertEqual(len(calls), 2)
-        self.assertEqual([call[0][6] for call in calls], [0.9, 0.9])
+        self.assertEqual(len(calls), 4)
+        self.assertEqual([call[0][6] for call in calls], [1.25, 1.25, 1.4, 1.55])
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
         for call, _kwargs in calls:
