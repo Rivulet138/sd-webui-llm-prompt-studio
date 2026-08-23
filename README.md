@@ -139,17 +139,6 @@ user/
 - `exports/`：JSON/CSV 导出。
 - `backups/`：删除操作创建的可恢复备份。
 
-## 开发与验证
-
-在扩展目录执行：
-
-```powershell
-E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py'
-E:\sd-webui-forge-neo\venv\Scripts\python.exe -m py_compile scripts\prompt_studio_ui.py scripts\prompt_studio_core.py
-node --check javascript\llm_prompt_studio_png_batch.js
-git diff --check
-```
-
 修改 Python 或 JavaScript 后重启 Forge，并使用 `Ctrl + F5` 刷新页面。缺少 Ranbooru、PNG Prompt Collector 或 WD14 Tagger 时，本插件的基础生成和缓存仍可独立运行，相应联动按钮会显示不可用状态。
 
 ## 相关扩展

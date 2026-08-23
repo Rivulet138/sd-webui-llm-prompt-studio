@@ -189,9 +189,6 @@ WORKFLOW_DEFAULTS = {
     "shuffle": False,
     "spaces": False,
     "max_tags": 0,
-    # Retained for settings-file compatibility; generation now uses batch memory instead.
-    "few_shot_count": 0,
-    "rag_min_score": 0,
     "save_score": 0,
     "cache_result": True,
     "batch_skip_existing": False,
@@ -495,7 +492,7 @@ def _server_queue_worker() -> None:
                 config.get("nsfw_injection", ""), config.get("user_instruction", ""),
                 config.get("provider", "OpenAI Compatible"), config.get("endpoint", ""), config.get("model", ""), "",
                 float(config.get("temperature", 1.25) or 1.25), int(config.get("timeout", 90) or 90), int(config.get("max_tokens", 1024) or 1024),
-                bool(config.get("send_temperature", True)), 0, 0,
+                bool(config.get("send_temperature", True)),
                 bool(config.get("remove_bad", True)), config.get("remove_terms", ""), bool(config.get("shuffle", False)),
                 bool(config.get("spaces", False)), int(config.get("max_tags", 0) or 0), config.get("structured_mode", "Plain Prompt"),
                 int(config.get("region_count", 1) or 1), float(config.get("save_score", 0) or 0), bool(config.get("cache_result", True)),
@@ -742,10 +739,10 @@ def _workflow_settings() -> dict[str, Any]:
     if values["safety"] not in {"SFW", "NSFW"}:
         values["safety"] = WORKFLOW_DEFAULTS["safety"]
     integer_limits = {
-        "region_count": (1, 8), "max_tags": (0, 200), "few_shot_count": (0, 8),
+        "region_count": (1, 8), "max_tags": (0, 200),
     }
     float_limits = {
-        "rag_min_score": (0, 10), "save_score": (0, 10),
+        "save_score": (0, 10),
         "wd_threshold": (0, 1),
     }
     for key, (minimum, maximum) in integer_limits.items():
@@ -765,10 +762,6 @@ def _workflow_settings() -> dict[str, Any]:
         "wd_endpoint", "wd_model", "wildcard_path",
     ]:
         values[key] = str(values.get(key) or "")
-    # The former retrieval controls were never part of the active request path.
-    # Keep their keys readable for old settings, but do not pretend they affect output.
-    values["few_shot_count"] = 0
-    values["rag_min_score"] = 0.0
     return values
 
 
@@ -804,7 +797,7 @@ def _bind_workflow_sync(source, outputs, event="input"):
 def _save_workflow_settings(
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
-    few_shot_count, rag_min_score, save_score, cache_result,
+    save_score, cache_result,
     batch_skip_existing, batch_skip_failed,
     wd_endpoint, wd_model, wd_threshold, wildcard_path,
 ):
@@ -814,7 +807,6 @@ def _save_workflow_settings(
         "structured_mode": structured_mode, "region_count": int(region_count or 1),
         "remove_bad": bool(remove_bad), "remove_terms": remove_terms, "shuffle": bool(shuffle),
         "spaces": bool(spaces), "max_tags": int(max_tags or 0),
-        "few_shot_count": int(few_shot_count or 0), "rag_min_score": float(rag_min_score or 0),
         "save_score": float(save_score or 0), "cache_result": bool(cache_result),
         "batch_skip_existing": bool(batch_skip_existing), "batch_skip_failed": bool(batch_skip_failed),
         "wd_endpoint": wd_endpoint, "wd_model": wd_model,
@@ -826,7 +818,7 @@ def _workflow_component_values(values: dict[str, Any]) -> list[Any]:
     return [values[key] for key in [
         "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction",
         "structured_mode", "region_count", "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags",
-        "few_shot_count", "rag_min_score", "save_score", "cache_result",
+        "save_score", "cache_result",
         "batch_skip_existing", "batch_skip_failed",
         "wd_endpoint", "wd_model", "wd_threshold", "wildcard_path",
     ]]
@@ -1278,7 +1270,7 @@ def _batch_output(status, table, cache_choices, issues, selected=None, result_ro
 def _batch_generate(
     source_text, skip_existing, skip_failed,
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     query="", min_score=0, filter_output_mode="全部", filter_base_model="全部", existing_issues=None, task_id="",
 ):
@@ -1349,7 +1341,7 @@ def _batch_generate(
             try:
                 generated, _system, last_status = _generate(
                     source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-                    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+                    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     0, False, "", "", False, _BATCH_CANCEL,
                     _independent_batch_directive(index, used_lenses) + "\n" + (
@@ -1435,7 +1427,7 @@ def _batch_generate(
 def _retry_batch_issues(
     selected_sources, issue_records, skip_failed,
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     query="", min_score=0, filter_output_mode="全部", filter_base_model="全部", task_id="",
 ):
@@ -1456,7 +1448,7 @@ def _retry_batch_issues(
     generator = _batch_generate(
         source_text, False, skip_failed,
         preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-        provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+        provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
         remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
         query, min_score, filter_output_mode, filter_base_model, selected, task_id,
     )
@@ -1618,7 +1610,7 @@ def _static_prompt_reference(
 
 def _generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     save_score, cache_result, source_kind="", source_ref="", cache_unrated=False,
     cancel_event=None,
@@ -1727,7 +1719,7 @@ def _generate(
 def _generate_auto_loop(
     request, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
-    few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
+    remove_bad, remove_terms, shuffle, spaces, max_tags,
     structured_mode, region_count, cache_result=False,
 ):
     _AUTO_LOOP_CANCEL.clear()
@@ -1738,7 +1730,7 @@ def _generate_auto_loop(
             "base_model": base_model, "safety": safety, "nsfw_injection": nsfw_injection,
             "user_instruction": user_instruction, "provider": provider, "endpoint": endpoint, "model": model,
             "temperature": temperature, "max_tokens": max_tokens, "send_temperature": bool(send_temperature),
-            "few_shot_count": few_shot_count, "rag_min_score": rag_min_score, "remove_bad": bool(remove_bad),
+            "remove_bad": bool(remove_bad),
             "remove_terms": remove_terms, "shuffle": bool(shuffle), "spaces": bool(spaces),
             "max_tags": max_tags, "structured_mode": structured_mode, "region_count": region_count,
         }
@@ -1749,14 +1741,14 @@ def _generate_auto_loop(
         return _generate(
             request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
             provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
-            few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
+            remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, True, "auto_loop", source_ref, True, _AUTO_LOOP_CANCEL,
             _independent_creative_directive(),
         )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
-            few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
+            remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, False, "", "", False, _AUTO_LOOP_CANCEL,
             _independent_creative_directive(),
     )
@@ -2320,7 +2312,7 @@ def _test_connection(provider, endpoint, model, api_key, temperature, timeout, m
 
 def _inline_generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-    few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
+    remove_bad, remove_terms, shuffle, spaces, max_tags,
     structured_mode, region_count, save_score, cache_result,
     slot="",
 ):
@@ -2337,7 +2329,7 @@ def _inline_generate(
         request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         connection["provider"], connection["endpoint"], connection["model"], "",
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
-        few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags,
+        remove_bad, remove_terms, shuffle, spaces, max_tags,
         structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
         _independent_creative_directive(),
     )
@@ -2557,8 +2549,7 @@ def _create_inline_panel(slot, prompt_target):
             inputs=[
                 request, gr.State(""), inline_preset, gr.State(workflow["system_override"]),
                 inline_base_model, inline_safety, gr.State(workflow["nsfw_injection"]),
-                gr.State(workflow["user_instruction"]), gr.State(workflow["few_shot_count"]),
-                gr.State(workflow["rag_min_score"]), gr.State(workflow["remove_bad"]),
+                gr.State(workflow["user_instruction"]), gr.State(workflow["remove_bad"]),
                 gr.State(workflow["remove_terms"]), gr.State(workflow["shuffle"]),
                 gr.State(workflow["spaces"]), gr.State(workflow["max_tags"]),
                 gr.State(workflow["structured_mode"]), gr.State(workflow["region_count"]),
@@ -2789,7 +2780,7 @@ def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
             workflow["nsfw_injection"], workflow["user_instruction"],
             connection["provider"], connection["endpoint"], connection["model"], "",
             connection["temperature"], connection["timeout"], connection["max_tokens"],
-            connection["send_temperature"], workflow["few_shot_count"], workflow["rag_min_score"],
+            connection["send_temperature"],
             workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
             workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
             0, False, "ranbooru", prompt_source_ref, True,
@@ -3097,8 +3088,6 @@ def on_ui_tabs():
                             shuffle = gr.Checkbox(label="随机打乱标签", value=workflow["shuffle"])
                             spaces = gr.Checkbox(label='将“_”转换为空格', value=workflow["spaces"])
                             max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=workflow["max_tags"], step=1)
-                        few_shot_count = gr.State(0)
-                        rag_min_score = gr.State(0)
                         with gr.Accordion("缓存", open=False):
                             save_score = gr.Slider(label="缓存评分", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
                             cache_result = gr.Checkbox(label="在本地缓存本次结果", value=workflow["cache_result"], elem_id="llm_prompt_studio_cache_result")
@@ -3431,23 +3420,23 @@ def on_ui_tabs():
         workflow_inputs = [
             preset, system_override, base_model, safety, nsfw_injection, user_instruction,
             structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
-            few_shot_count, rag_min_score, save_score, cache_result,
+            save_score, cache_result,
             batch_skip_existing, batch_skip_failed,
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
         batch_workflow_inputs = [
             batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction,
             structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
-            few_shot_count, rag_min_score, save_score, cache_result,
+            save_score, cache_result,
             batch_skip_existing, batch_skip_failed,
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
         creative_template_button.click(lambda: GENERAL_CREATIVE_REQUEST_TEMPLATE, outputs=request)
         kemonimimi_template_button.click(lambda: KEMONOMIMI_LOLI_BATCH_TEMPLATE, outputs=request)
-        generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
+        generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
         auto_loop_dispatch.click(
             _generate_auto_loop,
-            inputs=[request, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, auto_loop_cache_result],
+            inputs=[request, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, auto_loop_cache_result],
             outputs=[output, system_preview, status],
         )
         save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
@@ -3615,7 +3604,7 @@ def on_ui_tabs():
         batch_preview_button.click(_preview_batch_sources, inputs=[batch_sources, batch_skip_existing, batch_preset, batch_base_model], outputs=[batch_queue, batch_preview_status])
         batch_generate.click(
             _batch_generate,
-            inputs=[batch_sources, batch_skip_existing, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_issue_state, batch_task_id],
+            inputs=[batch_sources, batch_skip_existing, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_issue_state, batch_task_id],
             outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state, batch_queue],
         )
         batch_cancel.click(_cancel_batch_generation, inputs=batch_task_id, outputs=batch_status)
@@ -3648,7 +3637,7 @@ def on_ui_tabs():
         batch_clear_issue_selection.click(_clear_batch_issue_selection, outputs=batch_issue_selection)
         batch_retry_selected.click(
             _retry_batch_issues,
-            inputs=[batch_issue_selection, batch_issue_state, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_task_id],
+            inputs=[batch_issue_selection, batch_issue_state, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_task_id],
             outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state, batch_queue],
         )
         preview_positions.click(_preview_positions, inputs=position_spec, outputs=[cache_status, table, selected_records])
