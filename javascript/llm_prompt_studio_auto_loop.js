@@ -462,10 +462,42 @@
         });
     }
 
+    function isRecoverablePromptFailure(error) {
+        return /assistant text|finish_reason\s*[=:]\s*length/i.test(String(error?.message || error));
+    }
+
+    async function runStudioGenerationWithRetry(run, request, button) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                return await runStudioGeneration(run, request, button);
+            } catch (error) {
+                if (!isRecoverablePromptFailure(error) || attempt === 1) throw error;
+                assertActive(run);
+                render("warning", "Prompt 响应为空，自动重试", "不会结束当前连续流程");
+                await wait(500);
+            }
+        }
+        throw new Error("Prompt 生成重试失败");
+    }
+
     async function getInlinePrompt(config, run) {
         return config.source === "cache"
             ? readInlineCache(config.slot, run)
             : generateInlinePrompt(config.slot, config.request, run);
+    }
+
+    async function getInlinePromptWithRetry(config, run) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                return await getInlinePrompt(config, run);
+            } catch (error) {
+                if (!isRecoverablePromptFailure(error) || attempt === 1) throw error;
+                assertActive(run);
+                renderInline(config.slot, "warning", "Prompt 响应为空，自动重试", "不会结束当前连续流程");
+                await wait(500);
+            }
+        }
+        throw new Error("Prompt 生成重试失败");
     }
 
     async function inlineOnce(config) {
@@ -476,7 +508,7 @@
         const basePrompt = String(root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`)?.value || "");
         try {
             renderInline(slot, "warning", config.source === "cache" ? "正在读取缓存 Prompt" : "正在生成 Prompt", "当前请求处理中");
-            const prompt = await getInlinePrompt(config, run);
+            const prompt = await getInlinePromptWithRetry(config, run);
             assertActive(run);
             writePrompt(prompt, target, "append", basePrompt);
             const message = config.source === "cache" ? "已取缓存 Prompt 并写入" : "已生成 Prompt 并写入";
@@ -506,7 +538,7 @@
                 assertActive(run);
                 ensureForgeIdle(target);
                 renderInline(slot, "warning", `第 ${completed + 1} 轮：正在生成 Prompt`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
-                const prompt = await getInlinePrompt(config, run);
+                const prompt = await getInlinePromptWithRetry(config, run);
                 assertActive(run);
                 writePrompt(prompt, target, "append", basePrompt);
                 const generate = findButton(`${target}_generate`);
@@ -590,7 +622,7 @@
                     continue;
                 }
                 const button = ensureLlmIdle();
-                const prompt = await runStudioGeneration(run, request, button);
+                const prompt = await runStudioGenerationWithRetry(run, request, button);
                 assertActive(run);
                 state.requestIds.add(requestId);
                 const promptKey = canonicalPrompt(prompt);
