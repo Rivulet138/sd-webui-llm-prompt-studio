@@ -41,16 +41,16 @@ DEFAULT_LLM_SETTINGS = {
     "max_tokens": 1024,
     "send_temperature": True,
 }
-GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，生成一条全新、独立成图的日系插画 Prompt。
+GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创作一条全新、独立成图的日系插画方向。
 
-保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线允许由模型自由发挥。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序，但不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，不要堆砌无关元素。
+保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
 
-只返回一条完整的单图 Prompt，不要分镜、拼图、候选方案、解释或 Markdown。"""
-KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量生成彼此不同的二次元可爱兽耳小萝莉日系插画 Prompt。
+本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
+KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量创作彼此不同的二次元可爱兽耳小萝莉日系插画方向。
 
-保留主体核心身份和用户明确要求；允许模型自由发挥发色、瞳色、兽耳、服装、表情、动作、场景、道具、构图和光线。批量结果保持自然差异，避免重复或机械改词，但不要限制模型必须使用某种地点、动作、镜头或元素组合。静态词库只作参考，不要堆词。
+保留原始 Prompt 中明确指定的主体身份、外观特征、LoRA/权重和内容限制；突出角色作为画面主体的可爱、萌感、兽耳特征、表情与自然姿态。发色、瞳色、服装、动作、场景、道具、构图、时间、天气和光线都交由模型结合当前预设自由选择，不固定清单，不套用模板，不用重复元素凑差异。批量结果应自然地彼此不同，优先改变有视觉意义的动作、空间关系、物品关系、构图或光线，而不是只改同义词、颜色、质量词或标签顺序。静态词库只作参考，选择兼容且有用的词汇，不要堆词。
 
-每条只返回一个完整瞬间，不要分镜、拼图、角色设定表、候选方案、解释或 Markdown。"""
+本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
 KREA_ANIMA_POLISH_ROLE = """Role: Krea2 & Anima extreme-detail expansion prompt engineer for Japanese light-novel illustrations.
 
 Task: From the user's text, tags, or reference image description, produce one complete full-English image prompt. Detail is the highest priority. Actively decompose every useful visible element instead of giving a short summary.
