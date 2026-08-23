@@ -536,6 +536,11 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ui.DB.wildcard_matches("custom_saved"), ["custom_saved_tag"])
 
+    async def test_preset_alignment_follows_selected_base_model(self):
+        self.assertEqual(ui._aligned_preset("Krea 2 Natural", "NoobAI"), ("NoobAI Tags", True))
+        self.assertEqual(ui._aligned_preset("NoobAI Tags", "NoobAI"), ("NoobAI Tags", False))
+        self.assertEqual(ui._aligned_preset("Natural Language", "Auto / checkpoint default"), ("Natural Language", False))
+
     async def test_connection_probe_uses_current_temperature_settings(self):
         captured = []
         ui.call_llm = lambda *args, **kwargs: captured.append((args, kwargs)) or "READY"
@@ -818,8 +823,11 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(systems)), 3)
         for index, system in enumerate(systems, start=1):
             self.assertIn("Independent single-image batch item", system)
-            self.assertIn(ui._BATCH_VARIATION_FOCI[index - 1], system)
-            self.assertNotIn("independent_scene_", system)
+            self.assertIn("Optional underused variation lenses", system)
+            if index == 1:
+                self.assertNotIn("independent_scene_", system)
+            else:
+                self.assertIn(f"independent_scene_{index - 1}", system)
         for args, kwargs in calls:
             self.assertEqual(len(args), 10)
             self.assertNotIn("history", kwargs)
@@ -830,13 +838,14 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         list(ui._batch_generate(*high_temperature_args))
         self.assertEqual(calls[-1][0][6], 1.25)
 
-    async def test_batch_diversity_plan_cycles_compact_variation_axes(self):
+    async def test_batch_diversity_plan_avoids_a_deterministic_variation_cycle(self):
         semantic_directives = {
             ui._independent_batch_directive(index).split("独立请求标识:", 1)[0]
-            for index in range(1, 10002)
+            for index in range(1, 80)
         }
 
-        self.assertEqual(len(semantic_directives), len(ui._BATCH_VARIATION_FOCI))
+        self.assertGreater(len(semantic_directives), 20)
+        self.assertTrue(all("Optional underused variation lenses" in item for item in semantic_directives))
 
     async def test_inline_generation_uses_fresh_request_with_prior_exclusions(self):
         calls = []
@@ -862,8 +871,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][0][5], calls[1][0][5])
         self.assertNotEqual(calls[0][0][4], calls[1][0][4])
         self.assertIn("Independent single-image inline request", calls[0][0][4])
-        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
-        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
+        self.assertIn("Optional underused variation lenses", calls[0][0][4])
+        self.assertIn("Optional underused variation lenses", calls[1][0][4])
         self.assertIn("Complete prompt contract", calls[0][0][4])
         self.assertIn("Complete prompt contract", calls[1][0][4])
         self.assertIn("Recent outputs are exclusion references only", calls[1][0][4])
@@ -894,8 +903,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(calls), 4)
         self.assertEqual([call[0][6] for call in calls[:4]], [1.25, 1.25, 1.4, 1.55])
         self.assertGreaterEqual(calls[-1][0][6], 1.55)
-        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
-        self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
+        self.assertIn("Optional underused variation lenses", calls[0][0][4])
+        self.assertIn("Optional underused variation lenses", calls[1][0][4])
         for call, _kwargs in calls:
             self.assertIn("Complete prompt contract", call[4])
             self.assertNotIn("previous outputs", call[5])

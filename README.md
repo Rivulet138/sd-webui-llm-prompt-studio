@@ -30,11 +30,11 @@ git pull
 
 ## 首次配置
 
-在 `LLM Prompt Studio` 页面填写 Provider、Endpoint、模型 ID、API Key、温度、超时和最大输出 Token，然后使用“测试 API”验证连接。API Key 保存在 `user/credentials/llm_credentials.json`，界面不会回填明文。
+在 `LLM Prompt Studio` 页面填写 Provider、Endpoint、模型 ID、API Key、温度、超时和最大输出 Token，然后使用“测试 API”验证连接。温度默认值为 `1.0`；独立批量、内嵌多样性和 PNG 批量会将请求温度提升到至少 `1.25`。API Key 保存在 `user/credentials/llm_credentials.json`，界面不会回填明文。
 
 “创作要求”描述本次画面；“源 Danbooru 标签”可选。System Prompt 预设决定输出格式，目标底模会追加对应模型的内容约束。SFW/NSFW 是独立的内容模式；自定义 System Prompt、额外 NSFW 注入和输出后处理参数也在工作参数中统一保存。
 
-连接失败时，插件对临时网络错误、408/409/425/429 和部分 5xx 状态最多重试两次并退避等待。OpenAI 兼容服务应确认 Endpoint 包含正确的 `/v1` 路径、模型 ID 可用，并检查本地代理或服务端 TLS 配置。
+连接失败时，插件对临时网络错误、408/409/425/429、部分 5xx 状态和常见 TLS 提前断开最多重试两次并退避等待；对 HTTPS 兼容端点还会尝试 HTTP 协议回退。OpenAI 兼容服务应确认 Endpoint 包含正确的 `/v1` 路径、模型 ID 可用，并检查本地代理或服务端 TLS 配置。若 HTTPS 握手在所有重试后仍返回 `UNEXPECTED_EOF_WHILE_READING`，这是远端端点或代理在握手阶段关闭连接，需更换可用端点或修复其 TLS 反向代理，客户端无法凭空生成 assistant 响应。
 
 ## 单条生成
 

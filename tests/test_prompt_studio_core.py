@@ -656,6 +656,33 @@ class PromptStudioCoreTests(unittest.TestCase):
         self.assertIn("score_*", system)
         self.assertIn("1.05 to 1.20", system)
 
+    def test_quality_policy_and_wildcard_categories_are_model_aware(self):
+        self.assertIn("<quality_anchor_policy>", build_system_prompt("Krea 2 Natural", "Krea 2", "SFW", "", "", []))
+        self.assertIn("no score tags", build_system_prompt("Krea 2 Natural", "Krea 2", "SFW", "", "", []))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "wildcards"
+            (root / "动作").mkdir(parents=True)
+            (root / "道具").mkdir()
+            (root / "动作" / "pose.txt").write_text("kneeling\n", encoding="utf-8")
+            (root / "道具" / "props.txt").write_text("glass lantern\nred umbrella\n", encoding="utf-8")
+            db = StudioDB(Path(directory) / "studio.db")
+            db.index_wildcards(root)
+            grouped = db.wildcard_samples_by_category(per_category=1, exclude=["red umbrella"])
+            self.assertIn("action", grouped)
+            self.assertIn("prop", grouped)
+            self.assertNotIn("red umbrella", grouped["prop"])
+
+    def test_wildcard_matching_uses_query_concepts_not_only_full_query(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "wildcards"
+            root.mkdir()
+            (root / "terms.txt").write_text("red hair\nmoonlit library\nblue eyes\n", encoding="utf-8")
+            db = StudioDB(Path(directory) / "studio.db")
+            db.index_wildcards(root)
+            matches = db.wildcard_matches("a red-haired mage in a moonlit library", limit=3)
+            self.assertIn("red hair", matches)
+            self.assertIn("moonlit library", matches)
+
     def test_presets_remove_style_generation_without_dropping_model_rules(self):
         positive_style_instructions = (
             "quality/style",

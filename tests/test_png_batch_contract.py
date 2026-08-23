@@ -321,6 +321,25 @@ class PngBatchContractTests(unittest.TestCase):
         self.assertEqual(result, "a distinct prompt")
         self.assertGreaterEqual(captured[0][6], 1.25)
 
+    def test_polish_zero_temperature_uses_one_as_default(self):
+        captured = []
+        original_call = ui.call_llm
+        original_finalize = ui._finalize_generated_prompt
+        original_resolve = ui.CREDENTIALS.resolve
+        ui.CREDENTIALS.resolve = lambda *_args: ""
+        ui.call_llm = lambda *args, **kwargs: captured.append(args) or "prompt"
+        ui._finalize_generated_prompt = lambda result, *_args: result
+        try:
+            ui._expand_or_polish(
+                "same", "Convert", "Natural Language", "", "Auto / checkpoint default", "SFW", "", "",
+                "OpenAI-compatible", "http://127.0.0.1:1234", "model", "", 0, 30, 1000, True,
+            )
+        finally:
+            ui.call_llm = original_call
+            ui._finalize_generated_prompt = original_finalize
+            ui.CREDENTIALS.resolve = original_resolve
+        self.assertEqual(captured[0][6], 1.0)
+
     def test_polish_injects_krea_anima_detail_role(self):
         captured_systems = []
         finalized_presets = []
@@ -341,7 +360,8 @@ class PngBatchContractTests(unittest.TestCase):
             ui.CREDENTIALS.resolve = original_resolve
         output_profile = str(captured_systems[0])
         self.assertIn("Krea2 & Anima extreme-detail expansion prompt engineer", output_profile)
-        self.assertIn("score_7, score_8_up", output_profile)
+        self.assertIn("MODEL-ALIGNED QUALITY POLICY", output_profile)
+        self.assertNotIn("score_7, score_8_up", output_profile)
         self.assertIn("STATIC VOCABULARY REFERENCE", output_profile)
         self.assertIn("Composition & Pose", output_profile)
         self.assertIn("MASTER DESCRIPTION", output_profile)
@@ -368,7 +388,7 @@ class PngBatchContractTests(unittest.TestCase):
             "one fox girl holding a red umbrella near a quiet canal",
         ]
         terms = ui._diversity_exclusion_terms_from_outputs(outputs, source)
-        self.assertIn("holding", terms)
+        self.assertIn("hold", terms)
         self.assertIn("umbrella", terms)
         self.assertNotIn("girl", terms)
 

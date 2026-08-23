@@ -6,6 +6,7 @@ import html
 import ipaddress
 import json
 import logging
+import random
 import re
 import threading
 import urllib.error
@@ -19,7 +20,7 @@ import gradio as gr
 from starlette.requests import Request
 
 from prompt_studio_core import (
-    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
+    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, MODEL_QUALITY_GUIDANCE, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_system_prompt, build_user_message, call_llm, get_provider_profile, is_sfw_output,
     LLMRequestError,
     discover_ranbooru_cache, load_ranbooru_cache, process_tags,
@@ -36,7 +37,7 @@ DEFAULT_LLM_SETTINGS = {
     "provider": "OpenAI Compatible",
     "endpoint": "http://127.0.0.1:1234/v1",
     "model": "",
-    "temperature": 0.35,
+    "temperature": 1.0,
     "timeout": 90,
     "max_tokens": 1024,
     "send_temperature": True,
@@ -76,10 +77,12 @@ Output rules:
 - Tags must be lowercase. Keep the requested anchor tags and separate tag items clearly.
 - Detail is preferred over vague quality words, but every added detail must serve the visible image.
 
+Each result must be one complete image, not a storyboard, collage, or list of alternatives.
+
 Output exactly this structure:
 
 PART ONE: TAG ANCHORS
-masterpiece, best quality, score_7, score_8_up, anime illustration, detailed, [subject count], [hair, hair color, head accessories], [face], [clothing and ornament details], [handheld and floating props], [pose and camera]
+[model-aligned quality/source anchors only when required by the selected base model], [subject count], [hair, hair color, head accessories], [face], [clothing and ornament details], [handheld and floating props], [pose and camera]
 
 BREAK
 One concise sentence stating the image density, dynamic direction, dominant color relationship, and emotional atmosphere.
@@ -144,6 +147,13 @@ PRESET_BASE_MODEL_DEFAULTS = {
     "Danbooru Tags": "Auto / checkpoint default",
     "Danbooru + Natural": "Auto / checkpoint default",
 }
+MODEL_PRESET_ALIGNMENT = {
+    "Pony / Illustrious": "Danbooru Tags",
+    "NoobAI": "NoobAI Tags",
+    "Flux": "Natural Language",
+    "Anima": "Anima Tags",
+    "Krea 2": "Krea 2 Natural",
+}
 RANBOORU_CONTENT_CHOICES = [
     ("Tag Prompt", "tags"),
     ("自然语言 Prompt", "natural"),
@@ -179,8 +189,9 @@ WORKFLOW_DEFAULTS = {
     "shuffle": False,
     "spaces": False,
     "max_tags": 0,
-    "few_shot_count": 3,
-    "rag_min_score": 7,
+    # Retained for settings-file compatibility; generation now uses batch memory instead.
+    "few_shot_count": 0,
+    "rag_min_score": 0,
     "save_score": 0,
     "cache_result": True,
     "batch_skip_existing": False,
@@ -200,25 +211,24 @@ _BATCH_CONTROL_LOCK = threading.Lock()
 _BATCH_ACTIVE_TASK_ID = ""
 _AUTO_LOOP_CANCEL = threading.Event()
 _INLINE_CANCEL_EVENTS = {"txt2img": threading.Event(), "img2img": threading.Event()}
-_BATCH_VARIATION_FOCI = (
-    "subject action or gesture",
-    "facial expression or emotional beat",
-    "clothing and accessory details",
-    "handheld object or nearby prop",
-    "setting and environmental identity",
+_VARIATION_DIMENSIONS = (
+    "action and expression",
+    "clothing and accessory identity",
+    "prop relationship",
+    "setting identity",
     "spatial layout and depth",
-    "camera distance and framing",
-    "time, weather, and light",
-    "color relationship and material contrast",
-    "interaction with a companion or object",
-    "small event happening in this frame",
-    "silhouette, balance, and movement direction",
+    "camera and subject placement",
+    "time, weather, and practical light",
+    "color and material contrast",
+    "interaction and narrative event",
+    "silhouette and movement direction",
 )
+_BATCH_VARIATION_FOCI = _VARIATION_DIMENSIONS  # Backward-compatible test/API name; selection is no longer cyclic.
 _COMPLETE_PROMPT_CONTRACT = (
-    "Complete prompt contract: preserve every source-fixed subject, identity, tag, and restriction; then cover the visible "
-    "subject/appearance, clothing, action/expression, environment/objects, composition/camera, and time/weather/lighting. "
-    "Use the selected output profile, keep one coherent single image, and return the complete prompt without headings, alternatives, or explanation; "
-    "not a storyboard or collage."
+    "Complete prompt contract: preserve every source-fixed subject, identity, tag, and restriction. "
+    "Use the selected output profile and let the model decide which visible dimensions need detail for this image; "
+    "add only compatible action, expression, clothing, environment, props, composition, camera, time, weather, or lighting when useful. "
+    "Keep one coherent single image and return the prompt without alternatives or explanation; do not force a checklist, storyboard, or collage."
 )
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
@@ -238,28 +248,41 @@ _DIVERSITY_STOP_TOKENS = frozenset({
     "anchors", "backgrounds", "break", "description", "detail", "details", "extreme", "layered",
     "master", "part", "paragraph", "props", "reference", "section", "tags", "three", "two", "use",
 })
+_DIVERSITY_CONCEPT_ALIASES = {
+    "stand": "stand", "standing": "stand", "wait": "stand", "waiting": "stand", "stroll": "walk",
+    "walk": "walk", "walking": "walk", "step": "walk", "stepping": "walk",
+    "run": "run", "running": "run", "sprint": "run", "sprinting": "run",
+    "sit": "sit", "sitting": "sit", "seated": "sit", "kneel": "kneel", "kneeling": "kneel",
+    "hold": "hold", "holding": "hold", "carry": "hold", "carrying": "hold", "grip": "hold", "gripping": "hold",
+    "look": "gaze", "looking": "gaze", "gaze": "gaze", "gazing": "gaze", "stare": "gaze", "staring": "gaze",
+    "smile": "smile", "smiling": "smile", "grin": "smile", "grinning": "smile",
+    "laugh": "laugh", "laughing": "laugh", "giggle": "laugh", "giggling": "laugh",
+    "portrait": "portrait", "closeup": "portrait", "close_up": "portrait", "headshot": "portrait",
+    "fullbody": "fullbody", "full_body": "fullbody", "wide_shot": "wide_shot", "long_shot": "wide_shot",
+    "front_facing": "front_facing", "three_quarter": "three_quarter", "low_angle": "low_angle", "high_angle": "high_angle",
+    "temple": "shrine", "shrine": "shrine", "sanctuary": "shrine", "shrine_gate": "shrine",
+    "umbrella": "umbrella", "parasol": "umbrella", "rain_umbrella": "umbrella",
+}
 _RECENT_BATCH_OUTPUTS: dict[str, list[str]] = {}
 _RECENT_BATCH_OUTPUTS_LOCK = threading.Lock()
+_BATCH_CONTEXT = threading.local()
 _INDEPENDENT_CREATIVE_LOCK = threading.Lock()
 _independent_creative_sequence = 0
-_INDEPENDENT_CREATIVE_FOCI = (
-    "change the character's action and expression while keeping the same core subject",
-    "change the clothing details, accessories, and interaction with one meaningful prop",
-    "change the setting and spatial depth with distinct foreground, middle ground, and background objects",
-    "change the camera distance, viewing angle, and subject placement in the frame",
-    "change the time, weather, and practical lighting so they affect the scene",
-    "change the relationship between the character and nearby objects or companions",
-    "change the small narrative event that is happening around the character",
-    "change the environment from interior to exterior or vice versa without changing the core subject",
-    "change the pose and movement direction while keeping the outfit fully described",
-    "change the location layout and readable environmental landmarks",
-    "change the foreground framing and depth cues while keeping the subject clearly visible",
-    "combine a different action, prop, and environmental condition into one coherent moment",
-)
+_INDEPENDENT_CREATIVE_FOCI = _VARIATION_DIMENSIONS
 
 
-def _independent_batch_directive(sequence: int = 0) -> str:
-    """Create a compact variation directive; the ledger, not a scene blueprint, drives diversity."""
+def _choose_variation_lenses(used: set[str] | None = None, count: int = 2) -> tuple[str, ...]:
+    """Choose underused creative dimensions without a deterministic scene cycle."""
+    pool = list(_VARIATION_DIMENSIONS)
+    used = used if used is not None else set()
+    available = [item for item in pool if item not in used] or pool
+    chosen = random.SystemRandom().sample(available, min(max(1, int(count or 1)), len(available)))
+    used.update(chosen)
+    return tuple(chosen)
+
+
+def _independent_batch_directive(sequence: int = 0, used_lenses: set[str] | None = None) -> str:
+    """Create a compact directive; batch memory and underused lenses drive diversity."""
     global _independent_batch_sequence
     requested_sequence = int(sequence or 0)
     if requested_sequence > 0:
@@ -268,19 +291,19 @@ def _independent_batch_directive(sequence: int = 0) -> str:
         with _INDEPENDENT_BATCH_LOCK:
             focus_index = _independent_batch_sequence
             _independent_batch_sequence += 1
-    focus = _BATCH_VARIATION_FOCI[focus_index % len(_BATCH_VARIATION_FOCI)]
+    lenses = _choose_variation_lenses(used_lenses, count=2)
     nonce = uuid.uuid4().hex[:12]
     return (
         "Independent single-image batch item. " + _COMPLETE_PROMPT_CONTRACT + " "
-        f"Optional variation axis for this item: {focus}. Use it as inspiration, not a fixed template; choose fresh compatible details "
-        "and avoid repeated concepts, actions, and props from the diversity ledger. Do not vary only style, quality words, synonyms, or tag order. "
+        f"Optional underused variation lenses for this item: {', '.join(lenses)}. Use them as loose inspiration, never as a fixed template; "
+        "choose fresh compatible details and avoid repeated concepts, actions, and props from the diversity ledger. Do not vary only style, quality words, synonyms, or tag order. "
         "Use static vocabulary only as a reference. "
         f"独立请求标识: {nonce}."
     )
 
 
-def _independent_creative_directive(sequence: int = 0) -> str:
-    """Create the compact inline variation and completeness contract."""
+def _independent_creative_directive(sequence: int = 0, used_lenses: set[str] | None = None) -> str:
+    """Create the compact inline variation and conditional-completeness contract."""
     global _independent_creative_sequence
     requested_sequence = int(sequence or 0)
     if requested_sequence > 0:
@@ -289,11 +312,11 @@ def _independent_creative_directive(sequence: int = 0) -> str:
         with _INDEPENDENT_CREATIVE_LOCK:
             focus_index = _independent_creative_sequence
             _independent_creative_sequence += 1
-    focus = _INDEPENDENT_CREATIVE_FOCI[focus_index % len(_INDEPENDENT_CREATIVE_FOCI)]
+    lenses = _choose_variation_lenses(used_lenses, count=2)
     nonce = uuid.uuid4().hex[:12]
     return (
         "Independent single-image inline request. " + _COMPLETE_PROMPT_CONTRACT + " "
-        f"Optional variation axis: {focus}. Reinterpret it freely and avoid repeated concepts from the diversity ledger. "
+        f"Optional underused variation lenses: {', '.join(lenses)}. Reinterpret them freely and avoid repeated concepts from the diversity ledger. "
         "Use static vocabulary only as a reference. "
         f"Independent request id: {nonce}."
     )
@@ -301,8 +324,8 @@ def _independent_creative_directive(sequence: int = 0) -> str:
 
 def _distinctive_tokens(text: str, stable_source: str = "") -> set[str]:
     """Return content-bearing tokens, excluding the fixed subject and boilerplate."""
-    stable = _tokens(stable_source)
-    tokens = _tokens(text) - stable
+    stable = _canonical_diversity_tokens(stable_source)
+    tokens = _canonical_diversity_tokens(text) - stable
     return {
         token for token in tokens
         if token not in _DIVERSITY_STOP_TOKENS and (len(token) >= 3 or "_" in token)
@@ -311,8 +334,16 @@ def _distinctive_tokens(text: str, stable_source: str = "") -> set[str]:
 
 def _prompt_similarity(left: str, right: str, stable_source: str = "") -> float:
     """Measure content overlap without requiring an embedding service."""
-    stable = _tokens(stable_source)
-    return _cosine(_tokens(left) - stable, _tokens(right) - stable)
+    stable = _canonical_diversity_tokens(stable_source)
+    return _cosine(_canonical_diversity_tokens(left) - stable, _canonical_diversity_tokens(right) - stable)
+
+
+def _canonical_diversity_tokens(text: str):
+    tokens = _tokens(text)
+    normalized = Counter()
+    for token, count in tokens.items():
+        normalized[_DIVERSITY_CONCEPT_ALIASES.get(token, token)] += count
+    return normalized
 
 
 def _distinctive_overlap(left: str, right: str, stable_source: str = "") -> float:
@@ -434,6 +465,8 @@ def _server_render_prompt(prompt: str, target: str, job_id: str) -> None:
 
 
 def _server_queue_worker() -> None:
+    batch_histories: dict[str, list[str]] = {}
+    batch_lenses: dict[str, set[str]] = {}
     while True:
         job = DB.claim_server_queue_job()
         if not job:
@@ -449,6 +482,13 @@ def _server_queue_worker() -> None:
         config = dict(job.get("config") or {})
         cancel_event = _SERVER_QUEUE_CANCEL
         try:
+            batch_id = str(job.get("batch_id") or "")
+            if batch_id not in batch_histories and len(batch_histories) >= 32:
+                stale_batch = next(iter(batch_histories))
+                batch_histories.pop(stale_batch, None)
+                batch_lenses.pop(stale_batch, None)
+            history = batch_histories.setdefault(batch_id, [])
+            lenses = batch_lenses.setdefault(batch_id, set())
             generated, _system, status = _generate(
                 job["request"], "", config.get("preset", "Danbooru Tags"), config.get("system_override", ""),
                 config.get("base_model", "Auto / checkpoint default"), config.get("safety", "SFW"),
@@ -460,7 +500,8 @@ def _server_queue_worker() -> None:
                 bool(config.get("spaces", False)), int(config.get("max_tags", 0) or 0), config.get("structured_mode", "Plain Prompt"),
                 int(config.get("region_count", 1) or 1), float(config.get("save_score", 0) or 0), bool(config.get("cache_result", True)),
                 "server_queue", f"server_queue:{job['batch_id']}:{job['position']}", True, cancel_event,
-                _independent_batch_directive(job["position"]),
+                _independent_batch_directive(job["position"], lenses),
+                batch_history=history,
             )
             if cancel_event.is_set():
                 DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消")
@@ -468,6 +509,8 @@ def _server_queue_worker() -> None:
                 continue
             if not generated:
                 raise RuntimeError(status or "LLM 未返回 Prompt")
+            history.append(generated)
+            del history[:-_DIVERSITY_MEMORY_SIZE]
             if bool(config.get("cache_result", True)):
                 DB.save_prompt(generated, "", config.get("preset", "Danbooru Tags"), config.get("base_model", ""), 0, job["request"], score_source="unrated", source_kind="server_queue", source_ref=f"server_queue:{job['id']}", dedupe=True)
             _server_render_prompt(generated, job.get("target", "none"), job["id"])
@@ -518,6 +561,7 @@ def _enqueue_server_queue(payload: dict[str, Any]) -> dict[str, Any]:
         "cache_result": True, "target": target,
     }
     merged.update({key: value for key, value in config.items() if key in merged and key not in {"provider", "endpoint", "model"}})
+    merged["preset"], _preset_aligned = _aligned_preset(merged["preset"], merged["base_model"])
     batch_id = uuid.uuid4().hex
     with _SERVER_QUEUE_CANCEL_LOCK:
         _SERVER_QUEUE_CANCEL_BATCHES.discard(batch_id)
@@ -721,6 +765,10 @@ def _workflow_settings() -> dict[str, Any]:
         "wd_endpoint", "wd_model", "wildcard_path",
     ]:
         values[key] = str(values.get(key) or "")
+    # The former retrieval controls were never part of the active request path.
+    # Keep their keys readable for old settings, but do not pretend they affect output.
+    values["few_shot_count"] = 0
+    values["rag_min_score"] = 0.0
     return values
 
 
@@ -1236,6 +1284,7 @@ def _batch_generate(
 ):
     global _BATCH_ACTIVE_TASK_ID
     sources, _parse_stats = _parse_batch_sources(source_text)
+    preset, _preset_aligned = _aligned_preset(preset, base_model)
     if not sources:
         yield _batch_output("请输入批量请求，每行一条。", gr.update(), gr.update(), existing_issues or [])
         return
@@ -1251,6 +1300,9 @@ def _batch_generate(
         if skip_existing and DB.has_source_prompt(source, preset, base_model)
     }
     pending, inserted, duplicates, score_updates, skipped, failed, request_count = [], 0, 0, 0, 0, 0, 0
+    batch_history = []
+    used_lenses: set[str] = set()
+    _BATCH_CONTEXT.history = batch_history
     issues = []
     result_rows = [[index, source, "", "等待处理"] for index, source in enumerate(sources[:200], start=1)]
 
@@ -1300,11 +1352,10 @@ def _batch_generate(
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, few_shot_count, rag_min_score,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     0, False, "", "", False, _BATCH_CANCEL,
-                    _independent_batch_directive(index) + "\n" + (
+                    _independent_batch_directive(index, used_lenses) + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{len(sources)} 条。"
-                        f"可以优先参考{_BATCH_VARIATION_FOCI[(index - 1) % len(_BATCH_VARIATION_FOCI)]}来形成自然差异，但不要把它当作硬性模板；"
-                        "避免复用同批其他结果，也不要只替换风格词或同义词来制造差异；"
-                        "请根据原要求自由选择合适的变化，只返回一条 Prompt。"
+                        "批次上下文中的结果只用于排除重复，不要复制其措辞、构图、动作或物品组合；"
+                        "请根据原要求自由选择变化，不要把任何变化维度当作硬性模板。"
                     ),
                 )
             except Exception as error:
@@ -1329,6 +1380,7 @@ def _batch_generate(
                 )
                 return
             if generated:
+                batch_history.append(generated)
                 set_result(index, generated, "生成成功")
                 pending.append({
                     "prompt": generated, "output_mode": preset, "base_model": base_model, "score": 0,
@@ -1376,6 +1428,7 @@ def _batch_generate(
                 if _BATCH_ACTIVE_TASK_ID == task_id:
                     _BATCH_ACTIVE_TASK_ID = ""
                     _BATCH_CANCEL.clear()
+            _BATCH_CONTEXT.history = None
             _BATCH_LOCK.release()
 
 
@@ -1520,15 +1573,44 @@ def _recommended_base_model_for_preset(preset: str):
     return PRESET_BASE_MODEL_DEFAULTS.get(str(preset), "Auto / checkpoint default")
 
 
-def _static_prompt_reference(source: str, related_limit: int = 20, sample_limit: int = 20) -> list[str]:
-    """Provide related plus fresh random lexicon terms for every creative request."""
+def _aligned_preset(preset: str, base_model: str) -> tuple[str, bool]:
+    """Keep an explicit checkpoint and output profile on the same prompt protocol."""
+    current = str(preset or "Danbooru Tags").strip()
+    model = str(base_model or "Auto / checkpoint default").strip()
+    expected = MODEL_PRESET_ALIGNMENT.get(model)
+    if expected and current != expected:
+        return expected, True
+    return current, False
+
+
+def _aligned_quality_guidance(base_model: str) -> str:
+    return MODEL_QUALITY_GUIDANCE.get(
+        str(base_model or "Auto / checkpoint default").strip(),
+        MODEL_QUALITY_GUIDANCE["Auto / checkpoint default"],
+    )
+
+
+def _static_prompt_reference(
+    source: str, related_limit: int = 12, sample_limit: int = 16,
+    exclude_terms: list[str] | None = None,
+) -> list[str]:
+    """Provide small fresh lexicon references, excluding concepts used in this batch."""
     related = DB.wildcard_matches(str(source or ""), related_limit)
-    samples = DB.wildcard_samples(sample_limit, exclude=related)
+    excluded = {str(item).strip().casefold() for item in (exclude_terms or []) if str(item).strip()}
+    sample_excluded = excluded | {str(item).strip().casefold() for item in related if str(item).strip()}
+    categorized = DB.wildcard_samples_by_category(
+        max(1, min(3, int(sample_limit or 1) // 6 or 1)), exclude=sample_excluded,
+    )
+    category_order = list(categorized)
+    random.SystemRandom().shuffle(category_order)
+    samples = [term for category in category_order for term in categorized[category]][:max(0, int(sample_limit or 0))]
+    if len(samples) < max(0, int(sample_limit or 0)):
+        samples.extend(DB.wildcard_samples(max(0, int(sample_limit or 0)) - len(samples), exclude=sample_excluded | {str(item).casefold() for item in samples}))
     result = []
     seen = set()
     for term in [*related, *samples]:
         normalized = str(term or "").strip()
-        if normalized and normalized.casefold() not in seen:
+        if normalized and normalized.casefold() not in seen and normalized.casefold() not in excluded:
             seen.add(normalized.casefold())
             result.append(normalized)
     return result
@@ -1540,17 +1622,22 @@ def _generate(
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     save_score, cache_result, source_kind="", source_ref="", cache_unrated=False,
     cancel_event=None,
-    batch_directive="",
+    batch_directive="", batch_history=None,
 ):
+    preset, preset_aligned = _aligned_preset(preset, base_model)
     source = str(source_tags or request or "").strip()
     if not source:
         return "", "", "请输入创作要求或源 Danbooru 标签。"
     examples = []
-    static_tags = _static_prompt_reference(source)
+    if batch_history is None:
+        batch_history = list(getattr(_BATCH_CONTEXT, "history", None) or [])
+    batch_history = [str(item).strip() for item in batch_history if str(item).strip()]
     effective_batch_directive = str(batch_directive or "").strip()
     if effective_batch_directive:
         recent_outputs = _recent_diverse_outputs(source)
-        exclusion_terms = _diversity_exclusion_terms(source)
+        context_outputs = [*recent_outputs, *batch_history]
+        exclusion_terms = _diversity_exclusion_terms_from_outputs(context_outputs, source)
+        static_tags = _static_prompt_reference(source, exclude_terms=exclusion_terms)
         if exclusion_terms:
             effective_batch_directive += (
                 "\nDIVERSITY LEDGER: these concepts have appeared repeatedly in earlier outputs. "
@@ -1558,19 +1645,21 @@ def _generate(
                 + ", ".join(exclusion_terms)
                 + "."
             )
-        if recent_outputs:
-            exclusions = "\n".join(f"- {item[:520]}" for item in recent_outputs)
+        if context_outputs:
+            exclusions = "\n".join(f"- {item[:520]}" for item in context_outputs[-_DIVERSITY_REFERENCE_LIMIT:])
             effective_batch_directive += (
                 "\nRecent outputs are exclusion references only. Do not reuse their scene structure, action, "
                 "camera arrangement, prop combination, or distinctive decorative elements:\n" + exclusions
             )
+    else:
+        static_tags = _static_prompt_reference(source)
     system = build_system_prompt(
         preset, base_model, safety, nsfw_injection, user_instruction, examples,
         static_tags, system_override, effective_batch_directive,
     )
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
-        request_temperature = float(temperature or 0.35)
+        request_temperature = float(temperature or 1.0)
         if effective_batch_directive:
             request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
         diversity_retry = False
@@ -1592,7 +1681,12 @@ def _generate(
                 result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
             )
-            accepted = not effective_batch_directive or _remember_diverse_output(source, candidate)
+            context_duplicate = bool(batch_history) and any(
+                _is_diversity_duplicate(candidate, item, source) for item in batch_history
+            )
+            accepted = not effective_batch_directive or (
+                not context_duplicate and _remember_diverse_output(source, candidate)
+            )
             if accepted or attempt == _MAX_DIVERSITY_RETRIES:
                 if effective_batch_directive and not accepted:
                     _remember_diverse_output(source, candidate, force=True)
@@ -1626,7 +1720,7 @@ def _generate(
             source_kind=source_kind or None, source_ref=effective_source_ref or None,
             dedupe=True,
         )
-    status = "生成完成" + ("，结果已缓存" if cache_result else "")
+    status = "生成完成" + ("（预设已按底模对齐）" if preset_aligned else "") + ("，结果已缓存" if cache_result else "")
     return result, system, status
 
 
@@ -1637,6 +1731,7 @@ def _generate_auto_loop(
     structured_mode, region_count, cache_result=False,
 ):
     _AUTO_LOOP_CANCEL.clear()
+    preset, _preset_aligned = _aligned_preset(preset, base_model)
     if cache_result:
         identity = {
             "request": str(request or "").strip(), "preset": preset, "system_override": system_override,
@@ -1686,6 +1781,7 @@ def _expand_or_polish(
         "Polish": "Polish this for clarity, visual specificity, and model compatibility without adding unsupported facts.",
     }
     action_name = str(action)
+    preset, _preset_aligned = _aligned_preset(preset, base_model)
     instruction = instructions.get(action_name, instructions["Convert"])
     static_tags = _static_prompt_reference(source)
     if action_name == "Polish":
@@ -1710,13 +1806,16 @@ def _expand_or_polish(
             " Preserve the core subject identity and explicit user constraints. You may freely reinterpret the scene, action, props, "
             "spatial layout, camera, time, weather, and lighting to create natural variation; do not force any particular combination."
         )
+    use_fixed_krea_polish = action_name == "Polish" and str(base_model or "").strip() in {"Krea 2", "Anima"}
+
     def build_transform_system(active_directive: str) -> str:
-        if action_name != "Polish":
+        if not use_fixed_krea_polish:
             return build_system_prompt(
                 preset, base_model, safety, nsfw_injection, f"{user_instruction}\n{instruction}", static_tags,
                 system_override=system_override, batch_directive=active_directive,
             )
         sections = [KREA_ANIMA_POLISH_ROLE]
+        sections.append("MODEL-ALIGNED QUALITY POLICY:\n" + _aligned_quality_guidance(base_model))
         if str(system_override or "").strip():
             sections.append("Additional system requirements:\n" + str(system_override).strip())
         if str(user_instruction or "").strip():
@@ -1733,9 +1832,9 @@ def _expand_or_polish(
 
     system = build_transform_system(directive)
     try:
-        request_temperature = float(temperature or 0.35)
+        request_temperature = float(temperature or 1.0)
     except (TypeError, ValueError):
-        request_temperature = 0.35
+        request_temperature = 1.0
     if directive:
         request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
     try:
@@ -1755,7 +1854,7 @@ def _expand_or_polish(
                 build_user_message(source), min(2.0, request_temperature + 0.15 * attempt),
                 int(timeout or 90), int(max_tokens or 0), bool(send_temperature), cancel_event=cancel_event,
             )
-            finalize_preset = "Krea 2 Natural" if action_name == "Polish" else preset
+            finalize_preset = "Krea 2 Natural" if use_fixed_krea_polish else preset
             result = _finalize_generated_prompt(
                 result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
@@ -2022,6 +2121,7 @@ def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="
     connection = _connection_settings()
     selected_preset = preset if preset in PRESETS else workflow["preset"]
     selected_base_model = base_model if base_model in BASE_MODEL_GUIDANCE else workflow["base_model"]
+    selected_preset, _preset_aligned = _aligned_preset(selected_preset, selected_base_model)
     yield from _png_batch_run(
         payload, action,
         selected_preset, workflow["system_override"], selected_base_model, workflow["safety"],
@@ -2224,6 +2324,7 @@ def _inline_generate(
     structured_mode, region_count, save_score, cache_result,
     slot="",
 ):
+    preset, _preset_aligned = _aligned_preset(preset, base_model)
     saved_workflow = _workflow_settings()
     shared_updates = {"preset": preset, "base_model": base_model, "safety": safety}
     if any(saved_workflow[key] != value for key, value in shared_updates.items()):
@@ -3366,6 +3467,18 @@ def on_ui_tabs():
             for current in inline_components:
                 other_inline = [component for component in inline_components if component is not current]
                 _bind_workflow_sync(current, [generate_component, batch_component, *other_inline])
+        all_preset_components = [preset, batch_preset, *[components["preset"] for components in inline_workflows]]
+
+        def _preset_alignment_update(base_model_value, current_preset):
+            aligned, _changed = _aligned_preset(current_preset, base_model_value)
+            return tuple(aligned for _ in all_preset_components)
+
+        base_model.change(
+            _preset_alignment_update, inputs=[base_model, preset], outputs=all_preset_components, queue=False,
+        )
+        batch_base_model.change(
+            _preset_alignment_update, inputs=[batch_base_model, batch_preset], outputs=all_preset_components, queue=False,
+        )
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
         save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint, model])
