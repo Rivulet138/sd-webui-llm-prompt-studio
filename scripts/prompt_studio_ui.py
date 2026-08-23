@@ -48,11 +48,11 @@ GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创
 保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
 
 本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
-KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量创作彼此不同的二次元兽耳角色日系插画方向，保持角色可爱但不把可爱或兽耳特写设为每张图的固定视觉中心。
+KEMONOMIMI_LOLI_BATCH_TEMPLATE = """批量创作彼此不同的日常类二次元日系插画：可爱兽耳角色与生活环境共同组成画面，但不固定突出角色、脸部或兽耳特写。
 
-保留原始 Prompt 中明确指定的主体身份、外观特征、LoRA/权重和内容限制；兽耳角色与环境背景共同构成完整画面，角色可以位于前景、中景或远景，也可以作为环境叙事的一部分，不强制近景、不强制突出脸部或兽耳。环境、背景和空间叙事与角色同等重要：让地点、建筑或地形、前中后景层次、天气、时间、季节、光线、色彩氛围和可见环境事件真正参与构图，并与角色的动作、视线和道具产生关系。背景不要只写成泛化的虚化色块，也不要堆砌与主体无关的物品。
+保留原始 Prompt 明确指定的主体、外观、LoRA/权重和内容限制。角色可在前景、中景或远景，环境背景与角色同等重要；选择一个具体的日常地点，并写出可见的建筑或地形、前中后景层次、生活物品、天气、时间、自然光和色彩关系，让背景承担真实的空间信息。只描述画面中可见的角色、姿态、服装、物品、环境、构图、镜头、光线和材质，不写故事、剧情、心理活动、旁白、对话、象征意义、镜头脚本或叙事性总结。
 
-发色、瞳色、服装、动作、场景、道具、镜头距离、视角、空间关系、时间、天气和光线都交由模型结合当前预设自由选择，不固定清单，不套用模板，不用重复元素凑差异。批量结果应在角色与环境的比例、主体位置、景别、背景类型、空间深度、天气光线和环境事件上自然变化，优先改变有视觉意义的画面关系，而不是只改同义词、颜色、质量词或标签顺序。静态词库只作参考，按当前预设选择兼容且有用的角色、环境、镜头和材质词汇，不要机械复制或堆词。
+发色、瞳色、服装、动作、地点、道具、景别、视角、空间关系、时间、天气和光线由模型结合当前预设自由选择，不固定清单，不套用模板，不用重复元素凑差异。批量结果优先改变日常地点、角色与背景的比例、主体位置、空间深度、天气光线和可见生活细节，而不是只改同义词、颜色或标签顺序。静态词库只作参考，按当前预设选择兼容且有用的角色、环境、镜头和材质词汇，不要机械复制或堆词。
 
 本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
 KREA_ANIMA_POLISH_ROLE = """Role: Krea2 & Anima extreme-detail expansion prompt engineer for Japanese light-novel illustrations.
@@ -1684,13 +1684,18 @@ def _generate(
                 attempt_system = build_system_prompt(
                     preset, base_model, safety, nsfw_injection, user_instruction, examples,
                     static_tags, system_override,
-                    effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; keep the model free to choose and return one complete single-image prompt. LANGUAGE RETRY: output English only and translate any source-language descriptions into English.",
+                    effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; keep the model free to choose and return one complete single-image prompt. LANGUAGE RETRY: output English only and translate any source-language descriptions into English. RESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise complete prompt directly and do not spend output on analysis or reasoning.",
                 )
-            result = call_llm(
-                provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
-                min(2.0, request_temperature + 0.15 * attempt), int(timeout or 90), int(max_tokens or 0),
-                bool(send_temperature), cancel_event=cancel_event,
-            )
+            try:
+                result = call_llm(
+                    provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
+                    min(2.0, request_temperature + 0.15 * attempt), int(timeout or 90), int(max_tokens or 0),
+                    bool(send_temperature), cancel_event=cancel_event,
+                )
+            except RuntimeError as error:
+                if "response did not contain assistant text" not in str(error).lower() or attempt == _MAX_DIVERSITY_RETRIES:
+                    raise
+                continue
             candidate = _finalize_generated_prompt(
                 result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
@@ -1870,14 +1875,20 @@ def _expand_or_polish(
                     )
                 retry_directive += (
                     "\nLANGUAGE RETRY: the previous candidate was not English. Translate all visible prompt content into English "
-                    "and return English only, with no Chinese, Japanese, Korean, Cyrillic, Arabic, or other non-Latin script."
+                    "and return English only, with no Chinese, Japanese, Korean, Cyrillic, Arabic, or other non-Latin script. "
+                    "RESPONSE RETRY: return one concise complete prompt directly and do not spend output on analysis or reasoning."
                 )
                 attempt_system = build_transform_system(retry_directive)
-            result = call_llm(
-                provider, endpoint, model, resolved_key, attempt_system,
-                build_user_message(source), min(2.0, request_temperature + 0.15 * attempt),
-                int(timeout or 90), int(max_tokens or 0), bool(send_temperature), cancel_event=cancel_event,
-            )
+            try:
+                result = call_llm(
+                    provider, endpoint, model, resolved_key, attempt_system,
+                    build_user_message(source), min(2.0, request_temperature + 0.15 * attempt),
+                    int(timeout or 90), int(max_tokens or 0), bool(send_temperature), cancel_event=cancel_event,
+                )
+            except RuntimeError as error:
+                if "response did not contain assistant text" not in str(error).lower() or attempt == _MAX_DIVERSITY_RETRIES:
+                    raise
+                continue
             finalize_preset = "Krea 2 Natural" if use_fixed_krea_polish else preset
             result = _finalize_generated_prompt(
                 result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
