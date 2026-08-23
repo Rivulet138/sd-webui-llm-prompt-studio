@@ -860,14 +860,25 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         timeout = max(5, min(int(saved.get("timeout", DEFAULT_LLM_SETTINGS["timeout"])), 600))
     except (TypeError, ValueError):
         timeout = DEFAULT_LLM_SETTINGS["timeout"]
+    migrated_max_tokens = False
     try:
         saved_max_tokens = saved.get("max_tokens", DEFAULT_LLM_SETTINGS["max_tokens"])
         # Older releases used 1024 or 4096 as the implicit default; migrate those values only.
         if stored_version < LLM_CONNECTION_SETTINGS_VERSION and int(saved_max_tokens) in {1024, 4096}:
             saved_max_tokens = DEFAULT_LLM_SETTINGS["max_tokens"]
+            migrated_max_tokens = True
         max_tokens = max(0, min(int(saved_max_tokens), 262144))
     except (TypeError, ValueError):
         max_tokens = DEFAULT_LLM_SETTINGS["max_tokens"]
+    if migrated_max_tokens:
+        providers = dict(store.get("providers", {}))
+        migrated = dict(saved)
+        migrated["max_tokens"] = max_tokens
+        providers[provider] = migrated
+        DB.set_setting(
+            "llm_connections_v2",
+            {"version": LLM_CONNECTION_SETTINGS_VERSION, "active_provider": provider, "providers": providers},
+        )
     return {
         "provider": provider,
         "endpoint": str(saved.get("endpoint") or profile["default_endpoint"]),
