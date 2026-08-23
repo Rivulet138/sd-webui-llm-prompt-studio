@@ -48,7 +48,7 @@ GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创
 保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
 
 本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
-KEMONOMIMI_LOLI_BATCH_TEMPLATE = """批量创作彼此不同的日常类二次元日系插画：可爱兽耳小女孩与生活环境共同组成画面，但不固定突出角色、脸部或兽耳特写。
+KEMONOMIMI_LOLI_BATCH_TEMPLATE = """批量创作彼此不同的日常类二次元日系插画：每张图只出现一个可见角色，即一名可爱兽耳小女孩；不要添加其他人物、群像、路人或第二个角色，除非原始 Prompt 明确固定了他们。角色与生活环境共同组成画面，但不固定突出角色、脸部或兽耳特写。
 
 保留原始 Prompt 明确指定的主体、外观、LoRA/权重和内容限制。角色可在前景、中景或远景，环境背景与角色同等重要；选择一个具体的日常地点，并写出可见的建筑或地形、前中后景层次、生活物品、天气、时间、自然光和色彩关系，让背景承担真实的空间信息。只描述画面中可见的角色、姿态、服装、物品、环境、构图、镜头、光线和材质，不写故事、剧情、心理活动、旁白、对话、象征意义、镜头脚本或叙事性总结。
 
@@ -65,7 +65,7 @@ Core requirements:
 - Strengthen motion and cinematic storytelling through body weight, balance, hand placement, gaze direction, wind-driven hair and fabric, object motion, depth, and the small event happening in this exact frame.
 - Allow rich detail density and tasteful decorative complexity, but omit unrelated clutter and contradictory elements.
 - When the source is sparse, add reasonable visible clothing, props, environment, lighting, and material detail that supports the subject and scene. Never invent a separate subject or unrelated setting.
-- Always consult the provided static vocabulary lexicon for compatible hair, clothing, prop, environment, camera, and material terms. Treat it as reference vocabulary: select and combine relevant entries, do not mechanically dump the list or copy unrelated entries.
+- The provided static vocabulary lexicon is optional reference data only. Use zero or more entries when they fit the source and selected model; never copy, combine, or force a term merely because it appears in the lexicon, and ignore unrelated entries.
 - Aim for a polished Japanese light-novel illustration: refined character design, vivid but coherent color, clear material response, commercial finish, camera awareness, and emotional tension.
 
 Anti-lazy rules:
@@ -226,8 +226,9 @@ _VARIATION_DIMENSIONS = (
 _BATCH_VARIATION_FOCI = _VARIATION_DIMENSIONS  # Backward-compatible test/API name; selection is no longer cyclic.
 _COMPLETE_PROMPT_CONTRACT = (
     "Complete prompt contract: preserve every source-fixed subject, identity, tag, and restriction. "
-    "Use the selected output profile and let the model decide which visible dimensions need detail for this image; "
-    "add only compatible action, expression, clothing, environment, props, composition, camera, time, weather, or lighting when useful. "
+    "Always keep the fixed subject and add a compact minimum of visible grounding: choose at least two useful details from action/pose, expression, environment, props, composition/camera, time/weather, or lighting. "
+    "Use the selected output profile and let the model decide which other visible dimensions need detail for this image; "
+    "add only compatible clothing, environment, props, composition, camera, time, weather, or lighting when useful. "
     "Keep one coherent single image and return the prompt without alternatives or explanation; do not force a checklist, storyboard, or collage."
 )
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
@@ -270,6 +271,9 @@ _BATCH_CONTEXT = threading.local()
 _INDEPENDENT_CREATIVE_LOCK = threading.Lock()
 _independent_creative_sequence = 0
 _INDEPENDENT_CREATIVE_FOCI = _VARIATION_DIMENSIONS
+_STATIC_REFERENCE_CATEGORIES = (
+    "action", "character", "clothing", "expression", "setting", "prop", "camera", "light_material",
+)
 
 
 def _choose_variation_lenses(used: set[str] | None = None, count: int = 2) -> tuple[str, ...]:
@@ -1609,18 +1613,20 @@ def _static_prompt_reference(
     source: str, related_limit: int = 8, sample_limit: int = 8,
     exclude_terms: list[str] | None = None,
 ) -> list[str]:
-    """Provide small fresh lexicon references, excluding concepts used in this batch."""
+    """Provide optional, category-balanced lexicon references, excluding batch concepts."""
     related = DB.wildcard_matches(str(source or ""), related_limit)
     excluded = {str(item).strip().casefold() for item in (exclude_terms or []) if str(item).strip()}
     sample_excluded = excluded | {str(item).strip().casefold() for item in related if str(item).strip()}
+    requested = max(0, int(sample_limit or 0))
     categorized = DB.wildcard_samples_by_category(
-        max(1, min(3, int(sample_limit or 1) // 6 or 1)), exclude=sample_excluded,
+        max(1, min(3, (requested + len(_STATIC_REFERENCE_CATEGORIES) - 1) // len(_STATIC_REFERENCE_CATEGORIES) or 1)),
+        exclude=sample_excluded,
     )
-    category_order = list(categorized)
+    category_order = [category for category in _STATIC_REFERENCE_CATEGORIES if category in categorized]
     random.SystemRandom().shuffle(category_order)
-    samples = [term for category in category_order for term in categorized[category]][:max(0, int(sample_limit or 0))]
-    if len(samples) < max(0, int(sample_limit or 0)):
-        samples.extend(DB.wildcard_samples(max(0, int(sample_limit or 0)) - len(samples), exclude=sample_excluded | {str(item).casefold() for item in samples}))
+    samples = [term for category in category_order for term in categorized[category]][:requested]
+    if len(samples) < requested:
+        samples.extend(DB.wildcard_samples(requested - len(samples), exclude=sample_excluded | {str(item).casefold() for item in samples}))
     result = []
     seen = set()
     for term in [*related, *samples]:
@@ -1847,8 +1853,8 @@ def _expand_or_polish(
         sections.append(instruction)
         if static_tags:
             sections.append(
-                "STATIC VOCABULARY REFERENCE (use as vocabulary inspiration; select only compatible visible terms, "
-                "never dump the list):\n" + ", ".join(static_tags[:60])
+                "OPTIONAL STATIC VOCABULARY REFERENCE (use zero or more compatible visible terms; never copy or force entries, "
+                "and ignore unrelated terms):\n" + ", ".join(static_tags[:60])
             )
         if active_directive:
             sections.append(active_directive)
@@ -1872,7 +1878,7 @@ def _expand_or_polish(
                     retry_directive = (
                         f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate was too similar to an existing item. "
                         "Favor a different compatible combination of setting, action, prop relationship, spatial layout, camera angle, "
-                        "time/weather, or narrative event, while leaving the model free to choose; return exactly one complete single-image prompt."
+                        "time/weather, or visible daily-life context, while leaving the model free to choose; return exactly one complete single-image prompt."
                     )
                 retry_directive += (
                     "\nLANGUAGE RETRY: the previous candidate was not English. Translate all visible prompt content into English "
