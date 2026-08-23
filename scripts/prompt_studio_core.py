@@ -1497,7 +1497,7 @@ def validate_endpoint(endpoint: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
 
 
-def build_provider_request(provider: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 1.0, max_tokens: int = 4096, send_temperature: bool = True) -> tuple[str, dict[str, Any], dict[str, str]]:
+def build_provider_request(provider: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 1.0, max_tokens: int = 8096, send_temperature: bool = True) -> tuple[str, dict[str, Any], dict[str, str]]:
     profile = get_provider_profile(provider)
     protocol = profile["protocol"]
     endpoint = validate_endpoint(endpoint)
@@ -1549,7 +1549,7 @@ def build_provider_request(provider: str, endpoint: str, model: str, api_key: st
         else:
             url = endpoint + "/v1/messages"
         headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
-        payload = {"model": model, "max_tokens": limit or 4096, "system": system, "messages": [{"role": "user", "content": user}]}
+        payload = {"model": model, "max_tokens": limit or 8096, "system": system, "messages": [{"role": "user", "content": user}]}
         if send_temperature:
             payload["temperature"] = float(temperature)
         return url, payload, headers
@@ -1799,7 +1799,7 @@ def call_llm(
     user: str,
     temperature: float = 1.0,
     timeout: int = 90,
-    max_tokens: int = 4096,
+    max_tokens: int = 8096,
     send_temperature: bool = True,
     max_retries: int = LLM_MAX_RETRIES,
     cancel_event: threading.Event | None = None,

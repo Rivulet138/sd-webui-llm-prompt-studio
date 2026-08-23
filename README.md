@@ -30,7 +30,7 @@ git pull
 
 ## 首次配置
 
-在 `LLM Prompt Studio` 页面填写 Provider、Endpoint、模型 ID、API Key、温度、超时和最大输出 Token，然后使用“测试 API”验证连接。温度默认值为 `1.0`；独立批量、内嵌多样性和 PNG 批量会将请求温度提升到至少 `1.25`。最大输出 Token 默认值为 `4096`；Krea2/Anima 等长 Prompt 建议设置为 `8192`，以避免响应因达到长度上限而缺少完整的 assistant 文本。API Key 保存在 `user/credentials/llm_credentials.json`，界面不会回填明文。
+在 `LLM Prompt Studio` 页面填写 Provider、Endpoint、模型 ID、API Key、温度、超时和最大输出 Token，然后使用“测试 API”验证连接。温度默认值为 `1.0`；独立批量、内嵌多样性和 PNG 批量会将请求温度提升到至少 `1.25`。最大输出 Token 默认值为 `8096`，适合 Krea2/Anima 等长 Prompt，可避免响应因达到长度上限而缺少完整的 assistant 文本。API Key 保存在 `user/credentials/llm_credentials.json`，界面不会回填明文。
 
 “创作要求”描述本次画面；“源 Danbooru 标签”可选。System Prompt 预设决定输出格式，目标底模会追加对应模型的内容约束。SFW/NSFW 是独立的内容模式；自定义 System Prompt、额外 NSFW 注入和输出后处理参数也在工作参数中统一保存。
 

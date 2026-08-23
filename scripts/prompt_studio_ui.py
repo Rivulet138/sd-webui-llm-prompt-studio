@@ -39,10 +39,10 @@ DEFAULT_LLM_SETTINGS = {
     "model": "",
     "temperature": 1.0,
     "timeout": 90,
-    "max_tokens": 4096,
+    "max_tokens": 8096,
     "send_temperature": True,
 }
-LLM_CONNECTION_SETTINGS_VERSION = 3
+LLM_CONNECTION_SETTINGS_VERSION = 4
 GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创作一条全新、独立成图的日系插画方向。
 
 保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
@@ -492,7 +492,7 @@ def _server_queue_worker() -> None:
                 config.get("base_model", "Auto / checkpoint default"), config.get("safety", "SFW"),
                 config.get("nsfw_injection", ""), config.get("user_instruction", ""),
                 config.get("provider", "OpenAI Compatible"), config.get("endpoint", ""), config.get("model", ""), "",
-                float(config.get("temperature", 1.25) or 1.25), int(config.get("timeout", 90) or 90), int(config.get("max_tokens", 4096) or 4096),
+                float(config.get("temperature", 1.25) or 1.25), int(config.get("timeout", 90) or 90), int(config.get("max_tokens", 8096) or 8096),
                 bool(config.get("send_temperature", True)),
                 bool(config.get("remove_bad", True)), config.get("remove_terms", ""), bool(config.get("shuffle", False)),
                 bool(config.get("spaces", False)), int(config.get("max_tags", 0) or 0), config.get("structured_mode", "Plain Prompt"),
@@ -862,8 +862,8 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         timeout = DEFAULT_LLM_SETTINGS["timeout"]
     try:
         saved_max_tokens = saved.get("max_tokens", DEFAULT_LLM_SETTINGS["max_tokens"])
-        # Version 2 used 1024 as its implicit default; migrate that value only.
-        if stored_version < LLM_CONNECTION_SETTINGS_VERSION and int(saved_max_tokens) == 1024:
+        # Older releases used 1024 or 4096 as the implicit default; migrate those values only.
+        if stored_version < LLM_CONNECTION_SETTINGS_VERSION and int(saved_max_tokens) in {1024, 4096}:
             saved_max_tokens = DEFAULT_LLM_SETTINGS["max_tokens"]
         max_tokens = max(0, min(int(saved_max_tokens), 262144))
     except (TypeError, ValueError):
@@ -3406,7 +3406,7 @@ def on_ui_tabs():
                 api_key = gr.Textbox(label="API Key（留空则使用已保存凭据）", type="password")
                 temperature = gr.Slider(label="温度", minimum=0, maximum=2, value=llm_settings["temperature"], step=0.05)
                 timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=llm_settings["timeout"], step=5)
-                max_tokens = gr.Number(label="最大输出 Token（默认 4096；Krea2/Anima 长 Prompt 建议 8192）", value=llm_settings["max_tokens"], precision=0)
+                max_tokens = gr.Number(label="最大输出 Token（默认 8096）", value=llm_settings["max_tokens"], precision=0)
                 send_temperature = gr.Checkbox(label="发送温度参数（推理模型不支持时关闭）", value=llm_settings["send_temperature"])
                 test = gr.Button("测试 API", elem_id="llm_prompt_studio_test_connection")
                 with gr.Row():
