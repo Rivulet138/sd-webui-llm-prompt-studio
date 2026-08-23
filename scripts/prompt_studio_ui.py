@@ -48,9 +48,11 @@ GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创
 保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
 
 本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
-KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量创作彼此不同的二次元可爱兽耳小萝莉日系插画方向。
+KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 的核心主体，批量创作彼此不同的二次元兽耳角色日系插画方向，保持角色可爱但不把可爱或兽耳特写设为每张图的固定视觉中心。
 
-保留原始 Prompt 中明确指定的主体身份、外观特征、LoRA/权重和内容限制；突出角色作为画面主体的可爱、萌感、兽耳特征、表情与自然姿态。发色、瞳色、服装、动作、场景、道具、构图、时间、天气和光线都交由模型结合当前预设自由选择，不固定清单，不套用模板，不用重复元素凑差异。批量结果应自然地彼此不同，优先改变有视觉意义的动作、空间关系、物品关系、构图或光线，而不是只改同义词、颜色、质量词或标签顺序。静态词库只作参考，选择兼容且有用的词汇，不要堆词。
+保留原始 Prompt 中明确指定的主体身份、外观特征、LoRA/权重和内容限制；兽耳角色与环境背景共同构成完整画面，角色可以位于前景、中景或远景，也可以作为环境叙事的一部分，不强制近景、不强制突出脸部或兽耳。环境、背景和空间叙事与角色同等重要：让地点、建筑或地形、前中后景层次、天气、时间、季节、光线、色彩氛围和可见环境事件真正参与构图，并与角色的动作、视线和道具产生关系。背景不要只写成泛化的虚化色块，也不要堆砌与主体无关的物品。
+
+发色、瞳色、服装、动作、场景、道具、镜头距离、视角、空间关系、时间、天气和光线都交由模型结合当前预设自由选择，不固定清单，不套用模板，不用重复元素凑差异。批量结果应在角色与环境的比例、主体位置、景别、背景类型、空间深度、天气光线和环境事件上自然变化，优先改变有视觉意义的画面关系，而不是只改同义词、颜色、质量词或标签顺序。静态词库只作参考，按当前预设选择兼容且有用的角色、环境、镜头和材质词汇，不要机械复制或堆词。
 
 本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
 KREA_ANIMA_POLISH_ROLE = """Role: Krea2 & Anima extreme-detail expansion prompt engineer for Japanese light-novel illustrations.
@@ -2529,7 +2531,7 @@ def _create_inline_panel(slot, prompt_target):
             elem_id=f"llm_prompt_studio_{slot}_creative_template",
         )
         inline_kemonimimi_template_button = gr.Button(
-            "填入萌系兽耳批量模板",
+            "填入兽耳角色与环境模板",
             elem_id=f"llm_prompt_studio_{slot}_kemonimimi_template",
         )
         with gr.Row(elem_classes=["lps-form-row"]):
@@ -3103,7 +3105,7 @@ def on_ui_tabs():
                             elem_id="llm_prompt_studio_creative_template",
                         )
                         kemonimimi_template_button = gr.Button(
-                            "填入萌系兽耳批量模板",
+                            "填入兽耳角色与环境模板",
                             elem_id="llm_prompt_studio_kemonimimi_template",
                         )
                         preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
