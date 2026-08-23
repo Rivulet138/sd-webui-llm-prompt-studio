@@ -21,7 +21,7 @@ from starlette.requests import Request
 
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, MODEL_QUALITY_GUIDANCE, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
-    build_system_prompt, build_user_message, call_llm, get_provider_profile, is_sfw_output,
+    build_system_prompt, build_user_message, call_llm, get_provider_profile, is_english_prompt, is_sfw_output,
     LLMRequestError,
     discover_ranbooru_cache, load_ranbooru_cache, process_tags,
     regional_format, validate_endpoint, _cosine, _tokens,
@@ -1671,7 +1671,7 @@ def _generate(
                 attempt_system = build_system_prompt(
                     preset, base_model, safety, nsfw_injection, user_instruction, examples,
                     static_tags, system_override,
-                    effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; keep the model free to choose and return one complete single-image prompt.",
+                    effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; keep the model free to choose and return one complete single-image prompt. LANGUAGE RETRY: output English only and translate any source-language descriptions into English.",
                 )
             result = call_llm(
                 provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
@@ -1682,6 +1682,10 @@ def _generate(
                 result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
             )
+            if not is_english_prompt(candidate):
+                if attempt == _MAX_DIVERSITY_RETRIES:
+                    raise ValueError("LLM 输出不是英文。请检查模型的语言指令或更换模型后重试。")
+                continue
             context_duplicate = bool(batch_history) and any(
                 _is_diversity_duplicate(candidate, item, source) for item in batch_history
             )
@@ -1843,11 +1847,17 @@ def _expand_or_polish(
         result = ""
         for attempt in range(_MAX_DIVERSITY_RETRIES + 1):
             attempt_system = system
-            if attempt and directive:
-                retry_directive = (
-                    f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate was too similar to an existing item. "
-                    "Favor a different compatible combination of setting, action, prop relationship, spatial layout, camera angle, "
-                    "time/weather, or narrative event, while leaving the model free to choose; return exactly one complete single-image prompt."
+            if attempt:
+                retry_directive = ""
+                if directive:
+                    retry_directive = (
+                        f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate was too similar to an existing item. "
+                        "Favor a different compatible combination of setting, action, prop relationship, spatial layout, camera angle, "
+                        "time/weather, or narrative event, while leaving the model free to choose; return exactly one complete single-image prompt."
+                    )
+                retry_directive += (
+                    "\nLANGUAGE RETRY: the previous candidate was not English. Translate all visible prompt content into English "
+                    "and return English only, with no Chinese, Japanese, Korean, Cyrillic, Arabic, or other non-Latin script."
                 )
                 attempt_system = build_transform_system(retry_directive)
             result = call_llm(
@@ -1860,6 +1870,10 @@ def _expand_or_polish(
                 result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
             )
+            if not is_english_prompt(result):
+                if attempt == _MAX_DIVERSITY_RETRIES:
+                    raise ValueError("LLM 输出不是英文。请检查模型的语言指令或更换模型后重试。")
+                continue
             if not directive or not any(_is_diversity_duplicate(result, item, source) for item in previous):
                 break
         return result, "LLM 提示词处理完成"
