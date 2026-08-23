@@ -201,61 +201,24 @@ _BATCH_ACTIVE_TASK_ID = ""
 _AUTO_LOOP_CANCEL = threading.Event()
 _INLINE_CANCEL_EVENTS = {"txt2img": threading.Event(), "img2img": threading.Event()}
 _BATCH_VARIATION_FOCI = (
-    "主体动作与人物互动",
-    "场景布局与环境事件",
-    "镜头构图与景别",
-    "时间天气与现场状态",
-    "道具关系与叙事细节",
+    "subject action or gesture",
+    "facial expression or emotional beat",
+    "clothing and accessory details",
+    "handheld object or nearby prop",
+    "setting and environmental identity",
+    "spatial layout and depth",
+    "camera distance and framing",
+    "time, weather, and light",
+    "color relationship and material contrast",
+    "interaction with a companion or object",
+    "small event happening in this frame",
+    "silhouette, balance, and movement direction",
 )
-_INDEPENDENT_BATCH_BLUEPRINTS = (
-    "a crowded public place with layered foreground, middle ground, and background action",
-    "a quiet enclosed interior with a strong light source and a meaningful object interaction",
-    "an outdoor journey or rescue event with visible movement and environmental obstacles",
-    "a festival, market, or social gathering with several simultaneous interactions",
-    "an intimate character moment interrupted by an unexpected event or discovery",
-    "a work, craft, or investigation scene showing tools, process, and cause-and-effect details",
-    "a dramatic change of weather or time that materially affects the scene and action",
-    "an unusual scale contrast, such as a tiny subject in a vast place or a giant subject in a confined place",
-    "a before-and-after transition captured at the turning point of a story",
-    "a location with a distinct architectural layout that drives the composition and movement",
-)
-_INDEPENDENT_BATCH_DYNAMICS = (
-    "an urgent rescue or escape with a visible obstacle and consequence",
-    "a careful craft, repair, or construction process with specific tools",
-    "a tense negotiation or disagreement expressed through action and spatial relationships",
-    "a discovery that changes what the subject is doing at that exact moment",
-    "a coordinated group task with distinct roles and simultaneous activity",
-    "a chase, pursuit, or race whose route is readable in the environment",
-    "a quiet observation that reveals a hidden detail elsewhere in the scene",
-    "a performance or demonstration with a reacting audience",
-    "an arrival or departure with luggage, vehicles, gates, or thresholds",
-    "a natural or mechanical failure that forces an immediate response",
-    "an exchange of an important object that establishes a clear story relationship",
-)
-_INDEPENDENT_BATCH_COMPOSITIONS = (
-    "a wide establishing view with several readable depth layers",
-    "a close interaction framed through foreground objects",
-    "a high-angle view that exposes paths, layout, and crowd movement",
-    "a low-angle view emphasizing scale while keeping the environment specific",
-    "a side-on composition organized around opposing movement",
-    "a view from behind the subject toward the event they are facing",
-    "an asymmetrical composition with the key event away from the center",
-    "a compressed long-distance view with overlapping environmental layers",
-    "a doorway, window, arch, or corridor used as an active frame",
-    "a diagonal composition built around travel between near and far points",
-    "a split-depth composition where foreground and background actions affect each other",
-)
-_INDEPENDENT_BATCH_CONDITIONS = (
-    "early morning after overnight rain",
-    "harsh midday light during strong wind",
-    "late afternoon as weather begins to change",
-    "blue hour with practical lights turning on",
-    "night under uneven artificial illumination",
-    "dense fog that reveals only selected depth layers",
-    "falling snow that visibly affects movement and surfaces",
-    "heavy rain with runoff, reflections, and shelter behavior",
-    "dry heat with dust and hard shadows",
-    "calm overcast light immediately before a major event",
+_COMPLETE_PROMPT_CONTRACT = (
+    "Complete prompt contract: preserve every source-fixed subject, identity, tag, and restriction; then cover the visible "
+    "subject/appearance, clothing, action/expression, environment/objects, composition/camera, and time/weather/lighting. "
+    "Use the selected output profile, keep one coherent single image, and return the complete prompt without headings, alternatives, or explanation; "
+    "not a storyboard or collage."
 )
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
@@ -296,37 +259,28 @@ _INDEPENDENT_CREATIVE_FOCI = (
 
 
 def _independent_batch_directive(sequence: int = 0) -> str:
-    """Create a fresh, stateless diversity hint without fixing the scene shape."""
+    """Create a compact variation directive; the ledger, not a scene blueprint, drives diversity."""
     global _independent_batch_sequence
     requested_sequence = int(sequence or 0)
     if requested_sequence > 0:
-        plan_index = requested_sequence - 1
+        focus_index = requested_sequence - 1
     else:
         with _INDEPENDENT_BATCH_LOCK:
-            plan_index = _independent_batch_sequence
+            focus_index = _independent_batch_sequence
             _independent_batch_sequence += 1
-    blueprint = _INDEPENDENT_BATCH_BLUEPRINTS[plan_index % len(_INDEPENDENT_BATCH_BLUEPRINTS)]
-    plan_index //= len(_INDEPENDENT_BATCH_BLUEPRINTS)
-    dynamic = _INDEPENDENT_BATCH_DYNAMICS[plan_index % len(_INDEPENDENT_BATCH_DYNAMICS)]
-    plan_index //= len(_INDEPENDENT_BATCH_DYNAMICS)
-    composition = _INDEPENDENT_BATCH_COMPOSITIONS[plan_index % len(_INDEPENDENT_BATCH_COMPOSITIONS)]
-    plan_index //= len(_INDEPENDENT_BATCH_COMPOSITIONS)
-    condition = _INDEPENDENT_BATCH_CONDITIONS[plan_index % len(_INDEPENDENT_BATCH_CONDITIONS)]
+    focus = _BATCH_VARIATION_FOCI[focus_index % len(_BATCH_VARIATION_FOCI)]
     nonce = uuid.uuid4().hex[:12]
     return (
-        "Independent single-image request; independent one-shot batch request. Preserve the core subject and explicit restrictions. "
-        "Use the following only as optional variation inspiration, not as a mandatory template; reinterpret it, replace it, or ignore it "
-        f"when another idea better serves the source: setting idea: {blueprint}; event idea: {dynamic}; composition idea: {composition}; "
-        f"condition idea: {condition}. Prefer a meaningfully different result from nearby items, but choose any compatible combination "
-        "of changes and do not force a fixed number of changed dimensions. Do not vary only style, quality words, synonyms, or tag order. "
-        "Return one complete Prompt, not a storyboard, collage, montage, sequence, or alternatives. Consult the static_tag_lexicon for "
-        "compatible vocabulary and use only terms that support the chosen idea. "
+        "Independent single-image batch item. " + _COMPLETE_PROMPT_CONTRACT + " "
+        f"Optional variation axis for this item: {focus}. Use it as inspiration, not a fixed template; choose fresh compatible details "
+        "and avoid repeated concepts, actions, and props from the diversity ledger. Do not vary only style, quality words, synonyms, or tag order. "
+        "Use static vocabulary only as a reference. "
         f"独立请求标识: {nonce}."
     )
 
 
 def _independent_creative_directive(sequence: int = 0) -> str:
-    """Create a stateless content-variation hint for auto/inline generation."""
+    """Create the compact inline variation and completeness contract."""
     global _independent_creative_sequence
     requested_sequence = int(sequence or 0)
     if requested_sequence > 0:
@@ -338,12 +292,9 @@ def _independent_creative_directive(sequence: int = 0) -> str:
     focus = _INDEPENDENT_CREATIVE_FOCI[focus_index % len(_INDEPENDENT_CREATIVE_FOCI)]
     nonce = uuid.uuid4().hex[:12]
     return (
-        "Independent single-image request; independent one-shot creative request. Preserve the core subject, fixed user constraints, LoRA, "
-        "weights, and base tags; do not repeat or invent those tokens. Treat this as optional variation inspiration and reinterpret it freely: "
-        f"{focus}. Add only useful visible details that fit the chosen idea: action, expression, clothing, props, environment, "
-        "composition, camera, time, weather, and lighting. Return one complete Prompt, not a storyboard, "
-        "collage, alternatives, explanation, artist name, or style-name list. Consult the static_tag_lexicon "
-        "for compatible vocabulary; use it as reference, never as a word dump. "
+        "Independent single-image inline request. " + _COMPLETE_PROMPT_CONTRACT + " "
+        f"Optional variation axis: {focus}. Reinterpret it freely and avoid repeated concepts from the diversity ledger. "
+        "Use static vocabulary only as a reference. "
         f"Independent request id: {nonce}."
     )
 

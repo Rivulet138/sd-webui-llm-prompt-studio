@@ -817,8 +817,8 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         systems = [call[0][4] for call in calls]
         self.assertEqual(len(set(systems)), 3)
         for index, system in enumerate(systems, start=1):
-            self.assertIn("independent one-shot batch request", system)
-            self.assertIn(ui._INDEPENDENT_BATCH_BLUEPRINTS[index - 1], system)
+            self.assertIn("Independent single-image batch item", system)
+            self.assertIn(ui._BATCH_VARIATION_FOCI[index - 1], system)
             self.assertNotIn("independent_scene_", system)
         for args, kwargs in calls:
             self.assertEqual(len(args), 10)
@@ -830,13 +830,13 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         list(ui._batch_generate(*high_temperature_args))
         self.assertEqual(calls[-1][0][6], 1.25)
 
-    async def test_batch_diversity_plan_does_not_repeat_across_supported_queue_size(self):
+    async def test_batch_diversity_plan_cycles_compact_variation_axes(self):
         semantic_directives = {
             ui._independent_batch_directive(index).split("独立请求标识:", 1)[0]
             for index in range(1, 10002)
         }
 
-        self.assertEqual(len(semantic_directives), 10001)
+        self.assertEqual(len(semantic_directives), len(ui._BATCH_VARIATION_FOCI))
 
     async def test_inline_generation_uses_fresh_request_with_prior_exclusions(self):
         calls = []
@@ -861,11 +861,11 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call[0][6] for call in calls], [1.25, 1.25])
         self.assertEqual(calls[0][0][5], calls[1][0][5])
         self.assertNotEqual(calls[0][0][4], calls[1][0][4])
-        self.assertIn("independent one-shot creative request", calls[0][0][4])
+        self.assertIn("Independent single-image inline request", calls[0][0][4])
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
-        self.assertFalse(any(blueprint in calls[0][0][4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
-        self.assertFalse(any(blueprint in calls[1][0][4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
+        self.assertIn("Complete prompt contract", calls[0][0][4])
+        self.assertIn("Complete prompt contract", calls[1][0][4])
         self.assertIn("Recent outputs are exclusion references only", calls[1][0][4])
         self.assertIn("inline_scene_1", calls[1][0][4])
 
@@ -897,7 +897,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
         for call, _kwargs in calls:
-            self.assertFalse(any(blueprint in call[4] for blueprint in ui._INDEPENDENT_BATCH_BLUEPRINTS))
+            self.assertIn("Complete prompt contract", call[4])
             self.assertNotIn("previous outputs", call[5])
 
     async def test_batch_cache_skip_only_considers_records_existing_at_batch_start(self):
@@ -941,7 +941,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["args"][-8:-5], (1, 0, False))
         self.assertEqual(captured["args"][-5:-2], ("", "", False))
         self.assertIs(captured["args"][-2], ui._AUTO_LOOP_CANCEL)
-        self.assertIn("independent one-shot creative request", captured["args"][-1])
+        self.assertIn("Independent single-image inline request", captured["args"][-1])
 
         result = ui._generate_auto_loop(
             "request", "NoobAI Tags", "", "NoobAI", "SFW", "", "",
@@ -955,7 +955,7 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(captured["args"][-4].startswith("auto_loop:"))
         self.assertTrue(captured["args"][-3])
         self.assertIs(captured["args"][-2], ui._AUTO_LOOP_CANCEL)
-        self.assertIn("independent one-shot creative request", captured["args"][-1])
+        self.assertIn("Independent single-image inline request", captured["args"][-1])
 
     async def test_auto_loop_cache_is_unrated_and_model_configuration_is_part_of_identity(self):
         common = (

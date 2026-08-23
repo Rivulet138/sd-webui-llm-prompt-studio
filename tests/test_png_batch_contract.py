@@ -296,7 +296,7 @@ class PngBatchContractTests(unittest.TestCase):
             ui._PNG_BATCH_CANCEL.clear()
 
         self.assertEqual([item[0] for item in calls], ["same", "same"])
-        self.assertTrue(all("Independent single-image request" in str(item[1][-2]) for item in calls))
+        self.assertTrue(all("Independent single-image batch item" in str(item[1][-2]) for item in calls))
         records = ui._normalize_png_batch_payload(updates[-1][0])["records"]
         self.assertEqual([record["prompt"]["processed"] for record in records], ["processed 1", "processed 2"])
 
