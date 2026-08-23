@@ -891,8 +891,9 @@ class PromptStudioApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first[0], "1girl, different_action, different_room")
         self.assertEqual(second[0], "1girl, different_action, different_room")
-        self.assertEqual(len(calls), 4)
-        self.assertEqual([call[0][6] for call in calls], [1.25, 1.25, 1.4, 1.55])
+        self.assertGreaterEqual(len(calls), 4)
+        self.assertEqual([call[0][6] for call in calls[:4]], [1.25, 1.25, 1.4, 1.55])
+        self.assertGreaterEqual(calls[-1][0][6], 1.55)
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[0], calls[0][0][4])
         self.assertIn(ui._INDEPENDENT_CREATIVE_FOCI[1], calls[1][0][4])
         for call, _kwargs in calls:

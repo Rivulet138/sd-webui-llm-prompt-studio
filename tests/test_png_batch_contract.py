@@ -360,6 +360,26 @@ class PngBatchContractTests(unittest.TestCase):
             with ui._RECENT_BATCH_OUTPUTS_LOCK:
                 ui._RECENT_BATCH_OUTPUTS.pop(key, None)
 
+    def test_diversity_ledger_surfaces_repeated_content_concepts(self):
+        source = "one fox girl"
+        outputs = [
+            "one fox girl holding a red umbrella beside a stone bridge",
+            "one fox girl holding a red umbrella beneath a paper lantern",
+            "one fox girl holding a red umbrella near a quiet canal",
+        ]
+        terms = ui._diversity_exclusion_terms_from_outputs(outputs, source)
+        self.assertIn("holding", terms)
+        self.assertIn("umbrella", terms)
+        self.assertNotIn("girl", terms)
+
+    def test_diversity_duplicate_check_catches_repeated_item_and_action(self):
+        source = "one fox girl"
+        first = "one fox girl holding a red umbrella beside a stone bridge"
+        near_copy = "one fox girl holding a blue umbrella beside a stone bridge"
+        fresh = "one fox girl repairing a clock inside a sunlit workshop"
+        self.assertTrue(ui._is_diversity_duplicate(near_copy, first, source))
+        self.assertFalse(ui._is_diversity_duplicate(fresh, first, source))
+
     def test_native_append_javascript_dispatches_prompt_events(self):
         script = (ROOT / "javascript" / "llm_prompt_studio_png_batch.js").read_text(encoding="utf-8")
         self.assertIn('dispatchEvent(new Event("input"', script)

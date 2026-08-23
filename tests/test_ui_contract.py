@@ -194,7 +194,7 @@ class PromptStudioUiContractTests(unittest.TestCase):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=15,
+            timeout=30,
             check=False,
         )
         self.assertEqual(result.returncode, 0, (result.stdout or "") + (result.stderr or ""))

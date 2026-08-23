@@ -11,6 +11,7 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -259,8 +260,21 @@ _INDEPENDENT_BATCH_CONDITIONS = (
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
 _MIN_INDEPENDENT_BATCH_TEMPERATURE = 1.25
-_MAX_BATCH_SIMILARITY = 0.70
-_MAX_DIVERSITY_RETRIES = 2
+_MAX_BATCH_SIMILARITY = 0.62
+_MIN_DISTINCTIVE_OVERLAP = 0.40
+_MIN_DISTINCTIVE_COMMON = 4
+_MAX_DIVERSITY_RETRIES = 3
+_DIVERSITY_MEMORY_SIZE = 64
+_DIVERSITY_REFERENCE_LIMIT = 10
+_DIVERSITY_LEDGER_LIMIT = 18
+_DIVERSITY_STOP_TOKENS = frozenset({
+    "a", "an", "and", "anime", "art", "best", "background", "character", "clothes", "clothing",
+    "color", "composition", "cute", "detailed", "expression", "face", "girl", "hair", "image",
+    "illustration", "japanese", "light", "lighting", "masterpiece", "outfit", "pose", "quality",
+    "scene", "setting", "subject", "style", "the", "very", "visual", "weather", "with",
+    "anchors", "backgrounds", "break", "description", "detail", "details", "extreme", "layered",
+    "master", "part", "paragraph", "props", "reference", "section", "tags", "three", "two", "use",
+})
 _RECENT_BATCH_OUTPUTS: dict[str, list[str]] = {}
 _RECENT_BATCH_OUTPUTS_LOCK = threading.Lock()
 _INDEPENDENT_CREATIVE_LOCK = threading.Lock()
@@ -334,28 +348,76 @@ def _independent_creative_directive(sequence: int = 0) -> str:
     )
 
 
+def _distinctive_tokens(text: str, stable_source: str = "") -> set[str]:
+    """Return content-bearing tokens, excluding the fixed subject and boilerplate."""
+    stable = _tokens(stable_source)
+    tokens = _tokens(text) - stable
+    return {
+        token for token in tokens
+        if token not in _DIVERSITY_STOP_TOKENS and (len(token) >= 3 or "_" in token)
+    }
+
+
 def _prompt_similarity(left: str, right: str, stable_source: str = "") -> float:
     """Measure content overlap without requiring an embedding service."""
     stable = _tokens(stable_source)
     return _cosine(_tokens(left) - stable, _tokens(right) - stable)
 
 
-def _remember_diverse_output(source: str, prompt: str) -> bool:
+def _distinctive_overlap(left: str, right: str, stable_source: str = "") -> float:
+    left_tokens = _distinctive_tokens(left, stable_source)
+    right_tokens = _distinctive_tokens(right, stable_source)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+
+
+def _is_diversity_duplicate(left: str, right: str, stable_source: str = "") -> bool:
+    """Catch both near-copy prompts and long prompts sharing the same key concepts."""
+    if _prompt_similarity(left, right, stable_source) >= _MAX_BATCH_SIMILARITY:
+        return True
+    left_tokens = _distinctive_tokens(left, stable_source)
+    right_tokens = _distinctive_tokens(right, stable_source)
+    common = len(left_tokens & right_tokens)
+    return common >= _MIN_DISTINCTIVE_COMMON and _distinctive_overlap(left, right, stable_source) >= _MIN_DISTINCTIVE_OVERLAP
+
+
+def _diversity_exclusion_terms_from_outputs(
+    outputs: list[str], source: str = "", limit: int = _DIVERSITY_LEDGER_LIMIT,
+) -> list[str]:
+    """Build a compact ledger of concepts repeatedly used by earlier outputs."""
+    counts: Counter[str] = Counter()
+    for output in outputs:
+        counts.update(_distinctive_tokens(str(output or ""), source))
+    return [
+        token for token, count in counts.most_common()
+        if count >= 2
+    ][:max(1, int(limit or 1))]
+
+
+def _remember_diverse_output(source: str, prompt: str, force: bool = False) -> bool:
     """Reject near-identical outputs for the same repeated batch request."""
     key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
     with _RECENT_BATCH_OUTPUTS_LOCK:
         previous = _RECENT_BATCH_OUTPUTS.setdefault(key, [])
-        duplicate = any(_prompt_similarity(prompt, item, source) >= _MAX_BATCH_SIMILARITY for item in previous)
-        if not duplicate:
+        duplicate = any(_is_diversity_duplicate(prompt, item, source) for item in previous)
+        if not duplicate or force:
             previous.append(prompt)
-            del previous[:-16]
+            del previous[:-_DIVERSITY_MEMORY_SIZE]
         return not duplicate
 
 
-def _recent_diverse_outputs(source: str, limit: int = 4) -> list[str]:
+def _recent_diverse_outputs(source: str, limit: int = _DIVERSITY_REFERENCE_LIMIT) -> list[str]:
     key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
     with _RECENT_BATCH_OUTPUTS_LOCK:
         return list(_RECENT_BATCH_OUTPUTS.get(key, [])[-max(1, int(limit or 1)):])
+
+
+def _diversity_exclusion_terms(source: str, limit: int = _DIVERSITY_LEDGER_LIMIT) -> list[str]:
+    key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
+    with _RECENT_BATCH_OUTPUTS_LOCK:
+        previous = list(_RECENT_BATCH_OUTPUTS.get(key, []))
+    return _diversity_exclusion_terms_from_outputs(previous, source, limit)
 
 
 _PNG_BATCH_CANCEL = threading.Event()
@@ -1537,8 +1599,16 @@ def _generate(
     effective_batch_directive = str(batch_directive or "").strip()
     if effective_batch_directive:
         recent_outputs = _recent_diverse_outputs(source)
+        exclusion_terms = _diversity_exclusion_terms(source)
+        if exclusion_terms:
+            effective_batch_directive += (
+                "\nDIVERSITY LEDGER: these concepts have appeared repeatedly in earlier outputs. "
+                "Prefer fresh alternatives and do not reuse them unless the source explicitly fixes them: "
+                + ", ".join(exclusion_terms)
+                + "."
+            )
         if recent_outputs:
-            exclusions = "\n".join(f"- {item[:360]}" for item in recent_outputs)
+            exclusions = "\n".join(f"- {item[:520]}" for item in recent_outputs)
             effective_batch_directive += (
                 "\nRecent outputs are exclusion references only. Do not reuse their scene structure, action, "
                 "camera arrangement, prop combination, or distinctive decorative elements:\n" + exclusions
@@ -1571,7 +1641,10 @@ def _generate(
                 result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
             )
-            if not effective_batch_directive or _remember_diverse_output(source, candidate) or attempt == _MAX_DIVERSITY_RETRIES:
+            accepted = not effective_batch_directive or _remember_diverse_output(source, candidate)
+            if accepted or attempt == _MAX_DIVERSITY_RETRIES:
+                if effective_batch_directive and not accepted:
+                    _remember_diverse_output(source, candidate, force=True)
                 result = candidate
                 system = attempt_system
                 break
@@ -1668,12 +1741,19 @@ def _expand_or_polish(
         instruction = "Enhance the source prompt with concrete visible detail while preserving its subject and constraints."
     directive = str(batch_directive or "").strip()
     previous = [str(item).strip() for item in (previous_outputs or []) if str(item).strip()]
-    if directive and previous:
-        previous_summary = "\n".join(f"- {item[:480]}" for item in previous[-6:])
-        directive += (
-            "\nPrevious outputs are supplied only as exclusion constraints; do not copy their wording or scene structure:\n"
-            + previous_summary
-        )
+    if directive:
+        exclusion_terms = _diversity_exclusion_terms_from_outputs(previous, source)
+        if exclusion_terms:
+            directive += (
+                "\nDIVERSITY LEDGER: concepts already repeated in this batch; prefer fresh alternatives and avoid reusing them "
+                "unless the source explicitly fixes them: " + ", ".join(exclusion_terms) + "."
+            )
+        if previous:
+            previous_summary = "\n".join(f"- {item[:520]}" for item in previous[-_DIVERSITY_REFERENCE_LIMIT:])
+            directive += (
+                "\nPrevious outputs are supplied only as exclusion constraints; do not copy their wording, scene structure, action, "
+                "or prop combination:\n" + previous_summary
+            )
     if directive:
         instruction += (
             " Preserve the core subject identity and explicit user constraints. You may freely reinterpret the scene, action, props, "
@@ -1729,10 +1809,8 @@ def _expand_or_polish(
                 result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
             )
-            if not directive or not any(_prompt_similarity(result, item, source) >= _MAX_BATCH_SIMILARITY for item in previous):
+            if not directive or not any(_is_diversity_duplicate(result, item, source) for item in previous):
                 break
-        if directive and result:
-            previous.append(result)
         return result, "LLM 提示词处理完成"
     except Exception as error:
         return "", f"处理失败：{_safe_error(error)}"
