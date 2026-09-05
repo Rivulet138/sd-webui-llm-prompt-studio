@@ -411,7 +411,19 @@ def _diversity_exclusion_terms(source: str, limit: int = _DIVERSITY_LEDGER_LIMIT
     return _diversity_exclusion_terms_from_outputs(previous, source, limit)
 
 
+_PNG_BATCH_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_PNG_BATCH_CANCEL_LOCK = threading.Lock()
+# Backward-compatible test/integration handle. New UI jobs use their own
+# tokenized events; callers that only clear this legacy event remain harmless.
 _PNG_BATCH_CANCEL = threading.Event()
+
+
+def _png_batch_cancel_event(cancel_id: str = "") -> tuple[str, threading.Event]:
+    """Return the cancellation event for one UI job token."""
+    key = str(cancel_id or "").strip() or f"direct:{threading.get_ident()}"
+    with _PNG_BATCH_CANCEL_LOCK:
+        event = _PNG_BATCH_CANCEL_EVENTS.setdefault(key, threading.Event())
+    return key, event
 _SERVER_QUEUE_WAKE = threading.Event()
 _SERVER_QUEUE_CANCEL = threading.Event()
 _SERVER_QUEUE_CANCEL_BATCHES: set[str] = set()
@@ -2160,12 +2172,13 @@ def _png_batch_move(payload, selection, offset):
     return selected, current
 
 
-def _cancel_png_batch():
-    _PNG_BATCH_CANCEL.set()
+def _cancel_png_batch(cancel_id=""):
+    _key, event = _png_batch_cancel_event(cancel_id)
+    event.set()
     return "已请求取消；当前 LLM 请求返回后停止，已完成结果会保留。"
 
 
-def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="independent"):
+def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="independent", cancel_id=""):
     """Run JSON Prompt processing from the Forge txt2img inline panel."""
     workflow = _workflow_settings()
     connection = _connection_settings()
@@ -2180,7 +2193,7 @@ def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
         workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
-        variation_mode,
+        variation_mode, cancel_id,
     )
 
 
@@ -2202,6 +2215,7 @@ def _png_batch_run(
     max_tokens, send_temperature, remove_bad=True, remove_terms="", shuffle=False,
     spaces=False, max_tags=0, structured_mode="Plain Prompt", region_count=1,
     variation_mode="faithful",
+    cancel_id="",
 ):
     try:
         data = _normalize_png_batch_payload(payload or {})
@@ -2211,7 +2225,8 @@ def _png_batch_run(
     if not data["records"]:
         yield _png_batch_json(data), [], 1, "", "批次为空，请先导入逐图 Prompt。"
         return
-    _PNG_BATCH_CANCEL.clear()
+    event_key, cancel_event = _png_batch_cancel_event(cancel_id)
+    cancel_event.clear()
     records = [dict(record) for record in data["records"]]
     independent = str(variation_mode or "faithful") == "independent"
     progress_interval = max(1, (len(records) + 99) // 100)
@@ -2220,7 +2235,7 @@ def _png_batch_run(
     previous_outputs = []
     try:
         for position, record in enumerate(records, 1):
-            if _PNG_BATCH_CANCEL.is_set():
+            if cancel_event.is_set():
                 for pending in records[position - 1:]:
                     if not str(pending.get("prompt", {}).get("processed") or "").strip():
                         pending["status"] = "已取消"
@@ -2251,11 +2266,11 @@ def _png_batch_run(
                     nsfw_injection, user_instruction, provider, endpoint, model,
                     api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
-                    _PNG_BATCH_CANCEL, batch_directive, previous_outputs,
+                    cancel_event, batch_directive, previous_outputs,
                 )
-                if not independent and not _PNG_BATCH_CANCEL.is_set():
+                if not independent and not cancel_event.is_set():
                     outcomes[outcome_key] = (processed, llm_status)
-            if not processed and _PNG_BATCH_CANCEL.is_set() and "request cancelled" in str(llm_status or "").lower():
+            if not processed and cancel_event.is_set() and "request cancelled" in str(llm_status or "").lower():
                 record["status"], record["error"] = "已取消", "当前 LLM 请求已取消"
                 for pending in records[position:]:
                     if not str(pending.get("prompt", {}).get("processed") or "").strip():
@@ -2264,7 +2279,11 @@ def _png_batch_run(
             if processed:
                 if independent:
                     previous_outputs.append(processed)
-                processed_kind = "mixed" if action == "Polish" else _processed_kind_for_preset(preset)
+                # The receiver uses this field to decide whether the result is
+                # safe to store as natural language. The selected output
+                # preset defines the protocol; the operation only changes how
+                # the source is transformed.
+                processed_kind = _processed_kind_for_preset(preset)
                 record["prompt"] = {
                     **record["prompt"], "processed": processed,
                     "processed_kind": processed_kind, "output_kind": processed_kind,
@@ -2286,7 +2305,10 @@ def _png_batch_run(
             f"已有结果跳过 {skipped_existing}（同目标），失败 {failed}，取消 {cancelled}。"
         )
     finally:
-        _PNG_BATCH_CANCEL.clear()
+        cancel_event.clear()
+        with _PNG_BATCH_CANCEL_LOCK:
+            if _PNG_BATCH_CANCEL_EVENTS.get(event_key) is cancel_event:
+                _PNG_BATCH_CANCEL_EVENTS.pop(event_key, None)
 
 
 def _png_batch_advance_after_append(payload, selection, succeeded):
@@ -2495,6 +2517,7 @@ def _create_inline_json_batch_panel(slot):
         json_selection = gr.Number(value=1, precision=0, visible=False, elem_id=f"{prefix}_selection")
         json_current = gr.Textbox(value="", visible=False, elem_id=f"{prefix}_current")
         json_append_succeeded = gr.Checkbox(value=False, visible=False, elem_id=f"{prefix}_append_succeeded")
+        json_cancel_id = gr.State(lambda: uuid.uuid4().hex)
         json_file.change(
             _png_batch_load,
             inputs=json_file,
@@ -2527,10 +2550,10 @@ def _create_inline_json_batch_panel(slot):
         )
         json_run.click(
             _inline_json_batch_run,
-            inputs=[json_payload, json_action, json_preset, json_base_model, json_variation_mode],
+            inputs=[json_payload, json_action, json_preset, json_base_model, json_variation_mode, json_cancel_id],
             outputs=[json_payload, json_table, json_selection, json_current, json_status],
         )
-        json_cancel.click(_cancel_png_batch, outputs=json_status, queue=False)
+        json_cancel.click(_cancel_png_batch, inputs=json_cancel_id, outputs=json_status, queue=False)
         json_export.click(_png_batch_export_file, inputs=json_payload, outputs=json_export)
         json_append_all.click(
             fn=None,
@@ -3266,7 +3289,7 @@ def on_ui_tabs():
                             server_queue_id = gr.Textbox(label="服务端任务 ID", interactive=False, elem_id="llm_prompt_studio_server_queue_id")
                             server_queue_status = gr.HTML("尚未提交服务端任务。", elem_id="llm_prompt_studio_server_queue_status", elem_classes=["lps-status"])
                             server_queue_log = gr.HTML("", elem_id="llm_prompt_studio_server_queue_log", elem_classes=["lps-auto-loop-log"])
-                    with gr.Tab("JSON Prompt 批量处理", visible=False, elem_id="llm_prompt_studio_png_batch_tab"):
+                    with gr.Tab("JSON Prompt 批量处理", visible=True, elem_id="llm_prompt_studio_png_batch_tab"):
                         png_batch_file = gr.File(label="导入 Prompt JSON", file_types=[".json"], type="filepath", elem_id="llm_prompt_studio_png_batch_file")
                         with gr.Accordion("批次 JSON", open=False):
                             png_batch_payload = gr.Textbox(
@@ -3293,6 +3316,7 @@ def on_ui_tabs():
                         gr.Markdown("", elem_id="llm_prompt_studio_png_batch_results")
                         png_batch_status = gr.HTML("等待导入 JSON。", elem_id="llm_prompt_studio_png_batch_status", elem_classes=["lps-status"])
                         png_batch_append_succeeded = gr.Checkbox(value=False, visible=False, elem_id="llm_prompt_studio_png_batch_append_succeeded")
+                        png_batch_cancel_id = gr.State(lambda: uuid.uuid4().hex)
                         png_batch_file.change(
                             _png_batch_load,
                             inputs=png_batch_file,
@@ -3545,10 +3569,10 @@ def on_ui_tabs():
         png_batch_selection.change(_png_batch_current, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_selection, png_batch_current])
         png_batch_run.click(
             _png_batch_run,
-            inputs=[png_batch_payload, png_batch_action, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count],
+            inputs=[png_batch_payload, png_batch_action, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, png_batch_cancel_id],
             outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status],
         )
-        png_batch_cancel.click(_cancel_png_batch, outputs=png_batch_status, queue=False)
+        png_batch_cancel.click(_cancel_png_batch, inputs=png_batch_cancel_id, outputs=png_batch_status, queue=False)
         png_batch_export.click(_png_batch_export_file, inputs=png_batch_payload, outputs=png_batch_export)
         png_batch_append_all.click(
             fn=None,
