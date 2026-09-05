@@ -1235,6 +1235,55 @@ def _sync_ranbooru_link(
         return f"Ranbooru 同步失败：{_safe_error(error)}", gr.update(), gr.update()
 
 
+def _load_ranbooru_to_png_batch(
+    database_path, content_mode, rating_filter, min_source_score, source_limit,
+    tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+):
+    """Build a shared batch from the selected Ranbooru cache slice.
+
+    This keeps source metadata and lets the existing batch controls apply the
+    selected model-aware Convert, Expand, or Polish operation to every row.
+    """
+    try:
+        result = _ranbooru_load(
+            database_path, content_mode, rating_filter, min_source_score, source_limit,
+            tag_output_mode, tag_base_model, natural_output_mode, natural_base_model,
+        )
+        records = []
+        for index, item in enumerate(result["records"], start=1):
+            prompt_text = str(item.get("prompt") or "").strip()
+            if not prompt_text:
+                continue
+            variant = str(item.get("_ranbooru_variant") or "tags").strip().lower()
+            prompt = {"positive": prompt_text}
+            if variant == "natural":
+                prompt["natural"] = prompt_text
+            source_id = str(item.get("_ranbooru_id") or index)
+            source_ref = str(item.get("source_ref") or f"ranbooru:{source_id}:{variant}")
+            records.append({
+                "record_id": f"ranbooru-{source_id}-{variant}",
+                "source_identity": source_ref,
+                "index": index,
+                "image": {"filename": f"ranbooru-{source_id}.png"},
+                "prompt": prompt,
+                "booru": {"score": item.get("_ranbooru_score", 0), "rating": item.get("_ranbooru_rating", "")},
+                "status": "源 Tag" if variant == "tags" else "源自然语言",
+            })
+        if not records:
+            return _png_batch_json({"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "Ranbooru"}, "records": []}), "Ranbooru 缓存没有可处理的 Prompt。"
+        payload = _normalize_png_batch_payload({
+            "schema_version": PNG_BATCH_SCHEMA,
+            "producer": {"name": "Ranbooru"},
+            "records": records,
+        })
+        message = f"已载入 Ranbooru 缓存 {len(records)} 条到 LLM 批处理；请选择转换、扩写或润色并开始处理。"
+        if result.get("truncated"):
+            message += " 当前数量受读取上限限制。"
+        return _png_batch_json(payload), message
+    except Exception as error:
+        return gr.update(), f"Ranbooru 批处理载入失败：{_safe_error(error)}"
+
+
 def _cancel_batch_generation(task_id=""):
     with _BATCH_CONTROL_LOCK:
         if not task_id or str(task_id) != _BATCH_ACTIVE_TASK_ID:
@@ -3417,6 +3466,7 @@ def on_ui_tabs():
                         ranbooru_save = gr.Button("保存联动参数")
                         ranbooru_preview_button = gr.Button("预览 Ranbooru 缓存")
                         ranbooru_sync_button = gr.Button("同步到本插件缓存", variant="primary")
+                        ranbooru_batch_button = gr.Button("载入到 LLM 批处理", variant="primary", elem_id="llm_prompt_studio_ranbooru_batch_load")
                     ranbooru_status = gr.Markdown("已自动填入上次保存的 Ranbooru 联动参数。")
                     ranbooru_preview = gr.Dataframe(
                         headers=["序号", "Ranbooru ID", "内容类型", "源评分", "分级", "输出预设", "目标底模", "Prompt"],
@@ -3660,6 +3710,11 @@ def on_ui_tabs():
             _sync_ranbooru_link,
             inputs=[*ranbooru_inputs, *cache_filter_inputs],
             outputs=[ranbooru_status, table, selected_records],
+        )
+        ranbooru_batch_button.click(
+            _load_ranbooru_to_png_batch,
+            inputs=ranbooru_inputs,
+            outputs=[png_batch_payload, ranbooru_status],
         )
         handoff_refresh.click(
             _handoff_views, inputs=handoff_selection,

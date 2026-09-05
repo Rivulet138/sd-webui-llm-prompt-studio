@@ -13,6 +13,8 @@ LLM Prompt Studio 是面向 Forge Neo 的 Prompt 生成、转换、批处理、�
 - 保留兽耳萝莉批量模板；模板只规定主体方向和差异规则，SFW/NSFW 由内容模式及现有安全注入负责。
 - 支持本地 SQLite 缓存、服务端队列、取消、导入导出、Ranbooru 交接和 PNG Prompt Collector 批次。
 
+Ranbooru 缓存联动区提供“载入到 LLM 批处理”：按当前来源、分级、评分和数量筛选读取缓存，直接填入 JSON 批处理。随后可选择“格式转换”“扩写”或“润色”、目标底模和写入目标；原始 Tag 与自然语言字段会保留在每条 `prompt_batch.v1` 记录中。
+
 ## 安装与更新
 
 在 Forge Neo 扩展目录执行：
