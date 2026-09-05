@@ -145,7 +145,7 @@ OUTPUT_UI_CHOICES = [
 ]
 PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
 ACTION_UI_CHOICES = [("格式转换", "Convert"), ("扩写", "Expand"), ("润色", "Polish")]
-JSON_VARIATION_MODE_CHOICES = [("多样化灵感", "independent"), ("按原意转换", "faithful")]
+JSON_VARIATION_MODE_CHOICES = [("多样灵感", "independent"), ("保留原意转换", "faithful")]
 PRESET_BASE_MODEL_DEFAULTS = {
     "NoobAI Tags": "NoobAI",
     "Anima Tags": "Anima",
@@ -277,6 +277,16 @@ _independent_creative_sequence = 0
 _INDEPENDENT_CREATIVE_FOCI = _VARIATION_DIMENSIONS
 _STATIC_REFERENCE_CATEGORIES = (
     "action", "character", "clothing", "expression", "setting", "prop", "camera", "light_material",
+)
+_INSPIRATION_TOPIC_POOL = (
+    "日常生活", "校园时光", "节庆活动", "奇幻冒险", "科幻探索", "自然观察",
+    "室内静物", "城市夜景", "旅行见闻", "运动瞬间", "职业场景", "传统文化",
+    "海边度假", "森林秘境", "未来都市", "温馨居家",
+)
+_INSPIRATION_VARIATION_HINTS = (
+    "捕捉动态动作与衣摆运动", "安排手部互动和一个叙事道具", "突出天气变化与空气透视",
+    "采用低机位广角并强调前中后景", "采用近距离肖像构图并突出表情", "加入具有材质层次的环境细节",
+    "使用逆光、轮廓光或彩色光源塑造氛围", "加入时间线索与独特的空间关系",
 )
 
 
@@ -1307,8 +1317,63 @@ def _parse_batch_sources(source_text: str) -> tuple[list[str], dict[str, int]]:
     return sources, {"ignored": ignored, "duplicates": duplicates}
 
 
-def _preview_batch_sources(source_text, skip_existing, preset, base_model):
-    sources, stats = _parse_batch_sources(source_text)
+def _build_inspiration_sources(
+    source_text: str,
+    generation_count: int = 8,
+    topic_pool: str = "",
+    base_prompt: str = "",
+    lock_known: bool = True,
+    sample_static: bool = True,
+) -> tuple[list[str], dict[str, int]]:
+    """Create varied batch requests when the user has no per-line request."""
+    parsed, stats = _parse_batch_sources(source_text)
+    anchor = str(base_prompt or "").strip()
+    if parsed:
+        if anchor:
+            prefix = (
+                "已有固定主体/角色 Tag：" + anchor + "。"
+                + ("保留其中的身份、LoRA、权重、明确属性和安全限制；" if lock_known else "")
+            )
+            parsed = [prefix + "在此基础上完成本条创作要求：" + item for item in parsed]
+        return parsed[:200], stats
+    count = max(1, min(200, int(generation_count or 8)))
+    topics = [item.strip() for item in str(topic_pool or "").replace(",", "\n").splitlines() if item.strip()]
+    topics = topics or list(_INSPIRATION_TOPIC_POOL)
+    rng = random.SystemRandom()
+    rng.shuffle(topics)
+    used_terms: set[str] = set()
+    sources: list[str] = []
+    for index in range(count):
+        topic = topics[index % len(topics)]
+        variation_hint = _INSPIRATION_VARIATION_HINTS[index % len(_INSPIRATION_VARIATION_HINTS)]
+        sampled: list[str] = []
+        if sample_static:
+            categorized = DB.wildcard_samples_by_category(1, exclude=used_terms)
+            categories = list(_STATIC_REFERENCE_CATEGORIES)
+            rng.shuffle(categories)
+            for category in categories:
+                values = categorized.get(category) or []
+                if values:
+                    term = str(values[0]).strip()
+                    if term and term.casefold() not in used_terms:
+                        sampled.append(term)
+                        used_terms.add(term.casefold())
+        reference = "；".join(sampled[:8])
+        source = f"随机题材：{topic}；本条变化重点：{variation_hint}。请创作一条完整、可直接生图的单图 Prompt，主动补足动作、表情、服装、道具、环境、前中后景、镜头、时间天气和光线。"
+        if reference:
+            source += f" 静态词库本条抽样参考（可按语义取舍）：{reference}。"
+        if anchor:
+            source = (
+                "已有固定主体/角色 Tag：" + anchor + "。"
+                + ("必须保留身份、LoRA、权重、明确属性和安全限制；" if lock_known else "")
+                + source
+            )
+        sources.append(source)
+    return sources, {"ignored": 0, "duplicates": 0, "generated": len(sources)}
+
+
+def _preview_batch_sources(source_text, skip_existing, preset, base_model, generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=True):
+    sources, stats = _build_inspiration_sources(source_text, generation_count, topic_pool, base_prompt, lock_known, sample_static)
     cached_sources = DB.existing_source_prompts(sources, preset, base_model) if skip_existing else set()
     cached = sum(1 for source in sources if source in cached_sources)
     rows = []
@@ -1319,6 +1384,8 @@ def _preview_batch_sources(source_text, skip_existing, preset, base_model):
         f"队列共 {len(sources)} 条；重复输入 {stats['duplicates']} 条（均保留为独立任务）；空行或注释 {stats['ignored']} 条；"
         f"按当前规则将跳过已有缓存 {cached} 条。"
     )
+    if stats.get("generated"):
+        message += f" 已按随机题材生成 {stats['generated']} 条内部创作要求。"
     if len(sources) > 200:
         message += " 预览仅显示前 200 条。"
     return gr.update(value=rows), message
@@ -1365,12 +1432,15 @@ def _batch_generate(
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     query="", min_score=0, filter_output_mode="全部", filter_base_model="全部", existing_issues=None, task_id="",
+    generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=True,
 ):
     global _BATCH_ACTIVE_TASK_ID
-    sources, _parse_stats = _parse_batch_sources(source_text)
+    sources, _parse_stats = _build_inspiration_sources(
+        source_text, generation_count, topic_pool, base_prompt, lock_known, sample_static,
+    )
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     if not sources:
-        yield _batch_output("请输入批量请求，每行一条。", gr.update(), gr.update(), existing_issues or [])
+        yield _batch_output("没有可生成的批量任务。", gr.update(), gr.update(), existing_issues or [])
         return
     if not _BATCH_LOCK.acquire(blocking=False):
         yield _batch_output("已有批量任务正在运行。", gr.update(), gr.update(), existing_issues or [])
@@ -1440,6 +1510,7 @@ def _batch_generate(
                         f"这是同一批次中的独立任务第 {index}/{len(sources)} 条。"
                         "批次上下文中的结果只用于排除重复，不要复制其措辞、构图、动作或物品组合；"
                         "请根据原要求自由选择变化，不要把任何变化维度当作硬性模板。"
+                        + ("已有主体/角色 Tag、LoRA、权重和明确属性是锁定内容，只补全动作、表情、道具、环境、构图、天气和光线。" if lock_known and str(base_prompt or "").strip() else "")
                     ),
                 )
             except Exception as error:
@@ -3243,23 +3314,47 @@ def on_ui_tabs():
                         elem_id="llm_prompt_studio_batch_safety",
                     )
                 with gr.Tabs():
-                    with gr.Tab("灵感批量生成（仅 Prompt）"):
+                    with gr.Tab("灵感探索（批量 Prompt）"):
                         gr.Markdown(
-                            "服务端逐行调用 LLM，只生成并缓存 Prompt，不会自动启动 Forge 生图；下方浏览器队列是独立链路。重复要求也会分别调用 LLM。"
+                            "可留空创作要求，按数量从多种题材和静态词库分类中随机抽样；也可提供角色 Tag，让 LLM 保留主体并补全动作、道具、环境、构图和光线。"
                         )
                         batch_sources = gr.Textbox(
-                            label="批量创作要求（每行一条）", lines=12,
-                            placeholder="红发魔法师在月光图书馆阅读\n蓝发少女站在雨中的车站",
+                            label="已有创作要求（可留空；每行一条）", lines=8,
+                            placeholder="留空将自动生成多种题材；或逐行填写创作要求",
                             elem_id="llm_prompt_studio_auto_loop_request",
                         )
                         auto_loop_request = batch_sources
+                        with gr.Row(elem_classes=["lps-form-row"]):
+                            batch_generation_count = gr.Number(
+                                label="生成数量（留空时）", value=8, minimum=1, maximum=200, precision=0,
+                                elem_id="llm_prompt_studio_batch_generation_count",
+                            )
+                            batch_topic_pool = gr.Textbox(
+                                label="随机题材（可选，逗号或换行分隔）", lines=2,
+                                placeholder="日常生活、奇幻冒险、科幻探索、城市夜景",
+                                elem_id="llm_prompt_studio_batch_topic_pool",
+                            )
+                        batch_base_prompt = gr.Textbox(
+                            label="已有 Prompt / 角色 Tag（可选）", lines=3,
+                            placeholder="例如：1girl, red hair, <lora:character:0.8>；将作为每条结果的固定主体",
+                            elem_id="llm_prompt_studio_batch_base_prompt",
+                        )
+                        with gr.Row(elem_classes=["lps-form-row"]):
+                            batch_lock_known = gr.Checkbox(
+                                label="锁定已有主体、LoRA、权重和明确属性", value=True,
+                                elem_id="llm_prompt_studio_batch_lock_known",
+                            )
+                            batch_sample_static = gr.Checkbox(
+                                label="自动从静态词库分类抽样", value=True,
+                                elem_id="llm_prompt_studio_batch_sample_static",
+                            )
                         with gr.Row():
                             batch_skip_existing = gr.Checkbox(
                                 label="跳过批次开始前已有缓存的要求（取消勾选可重复生成）",
                                 value=workflow["batch_skip_existing"],
                             )
                             batch_skip_failed = gr.Checkbox(label="单条失败后跳过并继续", value=workflow["batch_skip_failed"])
-                        gr.Markdown("批量结果统一保存为未评分，可稍后在缓存编辑器中手动调整评分。")
+                        gr.Markdown("批量结果统一保存为未评分，可稍后在缓存编辑器中手动调整评分。格式转换、扩写和润色仍在 PNG / Ranbooru 批处理链路中保留。")
                         with gr.Row():
                             batch_preview_button = gr.Button("预览生成队列")
                             batch_generate = gr.Button("开始生成并缓存", variant="primary")
@@ -3750,10 +3845,14 @@ def on_ui_tabs():
         save_as_new.click(_save_record_as_new, inputs=[record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
         bulk_preview_button.click(_preview_bulk_cache, inputs=[bulk_import, bulk_output_mode, bulk_base_model, bulk_default_score], outputs=[bulk_preview, bulk_import_status])
         bulk_import_button.click(_bulk_cache, inputs=[bulk_import, bulk_output_mode, bulk_base_model, bulk_default_score, *cache_filter_inputs], outputs=[bulk_import_status, table, selected_records])
-        batch_preview_button.click(_preview_batch_sources, inputs=[batch_sources, batch_skip_existing, batch_preset, batch_base_model], outputs=[batch_queue, batch_preview_status])
+        batch_preview_button.click(
+            _preview_batch_sources,
+            inputs=[batch_sources, batch_skip_existing, batch_preset, batch_base_model, batch_generation_count, batch_topic_pool, batch_base_prompt, batch_lock_known, batch_sample_static],
+            outputs=[batch_queue, batch_preview_status],
+        )
         batch_generate.click(
             _batch_generate,
-            inputs=[batch_sources, batch_skip_existing, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_issue_state, batch_task_id],
+            inputs=[batch_sources, batch_skip_existing, batch_skip_failed, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_issue_state, batch_task_id, batch_generation_count, batch_topic_pool, batch_base_prompt, batch_lock_known, batch_sample_static],
             outputs=[batch_status, table, selected_records, batch_issues, batch_issue_selection, batch_issue_state, batch_queue],
         )
         batch_cancel.click(_cancel_batch_generation, inputs=batch_task_id, outputs=batch_status)
