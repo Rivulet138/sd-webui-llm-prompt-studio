@@ -1823,15 +1823,26 @@ def _expand_or_polish(
             "into fluent prose when the selected profile is natural language, and never return the original tag dump "
             "when the selected profile forbids tags."
         ),
-        "Expand": "Expand this while keeping all explicit facts and the requested output format.",
-        "Polish": "Polish this for clarity, visual specificity, and model compatibility without adding unsupported facts.",
+        "Expand": (
+            "Expand the source into a richer image-generation prompt. Keep every explicit identity, clothing, "
+            "object, setting, composition, and safety constraint. Add only concrete visible details that are "
+            "compatible with the selected output profile and model profile: pose/expression, spatial relations, "
+            "materials, camera/framing, time, weather, and lighting. Do not add plot, backstory, named entities, "
+            "style filler, or quality boilerplate."
+        ),
+        "Polish": (
+            "Conservatively polish the source for the selected output profile and model profile. Preserve meaning, "
+            "identity, quantities, negations, and requested constraints; normalize ordering, grammar, tag syntax, "
+            "weights, and redundant wording only when the target format supports it. Do not invent new subjects, "
+            "actions, props, styles, or story claims."
+        ),
     }
     action_name = str(action)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     instruction = instructions.get(action_name, instructions["Convert"])
     static_tags = _static_prompt_reference(source)
     if action_name == "Polish":
-        instruction = "Enhance the source prompt with concrete visible detail while preserving its subject and constraints."
+        instruction = instructions["Polish"]
     directive = str(batch_directive or "").strip()
     previous = [str(item).strip() for item in (previous_outputs or []) if str(item).strip()]
     if directive:
@@ -1849,8 +1860,9 @@ def _expand_or_polish(
             )
     if directive:
         instruction += (
-            " Preserve the core subject identity and explicit user constraints. You may freely reinterpret the scene, action, props, "
-            "spatial layout, camera, time, weather, and lighting to create natural variation; do not force any particular combination."
+            " Preserve the core subject identity and all explicit user constraints. Vary only the dimensions named by the batch directive "
+            "(for example action, prop, scene, camera, or lighting); keep unlisted dimensions stable. Every item must be independently "
+            "usable as a complete prompt and must not mention the batch or previous items."
         )
     use_fixed_krea_polish = action_name == "Polish" and str(base_model or "").strip() in {"Krea 2", "Anima"}
 
