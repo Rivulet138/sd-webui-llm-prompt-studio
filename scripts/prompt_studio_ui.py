@@ -3380,7 +3380,7 @@ def on_ui_tabs():
                             batch_clear_issue_selection = gr.Button("清空选择")
                             batch_retry_selected = gr.Button("重新提交所选（每条一次）", variant="primary")
                         with gr.Accordion("另一条路径：浏览器生图队列（可选）", open=False, elem_id="llm_prompt_studio_auto_loop_tab"):
-                            gr.Markdown("这里不会读取上方已生成结果，而会重新调用 LLM 建立浏览器队列，再逐条写入 txt2img/img2img 并生图。")
+                            gr.Markdown("这里会重新调用 LLM 建立浏览器队列；创作要求可留空以随机探索。勾选“仅生成 Prompt”可持续积累到队列，取消勾选后再逐条写入 txt2img/img2img 生图。")
                             with gr.Row(elem_classes=["lps-form-row"]):
                                 auto_loop_target = gr.Radio(
                                     label="生图目标", choices=[("txt2img", "txt2img"), ("img2img", "img2img")],
@@ -3397,6 +3397,10 @@ def on_ui_tabs():
                                 auto_loop_continuous = gr.Checkbox(
                                     label="持续生成并生图", value=False,
                                     elem_id="llm_prompt_studio_auto_loop_continuous",
+                                )
+                                auto_loop_prompt_only = gr.Checkbox(
+                                    label="仅生成 Prompt（不生图）", value=False,
+                                    elem_id="llm_prompt_studio_auto_loop_prompt_only",
                                 )
                                 auto_loop_cycles = gr.Number(
                                     label="循环轮数（0 表示持续到取消）", value=1, minimum=0, precision=0,
@@ -3763,9 +3767,9 @@ def on_ui_tabs():
         )
         auto_loop_generate_run.click(
             fn=None,
-            inputs=[auto_loop_request, auto_loop_target, auto_loop_write_mode, auto_loop_continuous, auto_loop_cycles],
+            inputs=[auto_loop_request, auto_loop_target, auto_loop_write_mode, auto_loop_continuous, auto_loop_cycles, auto_loop_prompt_only],
             outputs=auto_loop_status,
-            js="(request, target, writeMode, continuous, cycles) => window.llmPromptStudioAutoLoop.generateAndRun({request, target, writeMode, continuous, cycles})",
+            js="(request, target, writeMode, continuous, cycles, promptOnly) => window.llmPromptStudioAutoLoop.generateAndRun({request, target, writeMode, continuous, cycles, promptOnly})",
         )
         auto_loop_cancel.click(
             fn=_cancel_auto_loop_generation,

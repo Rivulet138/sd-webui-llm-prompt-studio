@@ -18,6 +18,12 @@
     };
     const inlineRuns = { txt2img: null, img2img: null };
     const serverQueueWatchers = new Map();
+    const inspirationRequests = [
+        "日常生活场景", "校园时光场景", "节庆活动场景", "奇幻冒险场景",
+        "科幻探索场景", "自然观察场景", "城市夜景场景", "旅行见闻场景",
+        "运动瞬间场景", "职业工作场景", "传统文化场景", "海边度假场景",
+        "森林秘境场景", "未来都市场景", "温馨居家场景",
+    ];
     let backgroundTimer = undefined;
 
     function root() {
@@ -602,10 +608,21 @@
         return { requests, duplicateCount };
     }
 
+    function randomInspirationRequest(previous = "") {
+        const candidates = inspirationRequests.filter((item) => item !== previous);
+        const pool = candidates.length ? candidates : inspirationRequests;
+        const topic = pool[Math.floor(Math.random() * pool.length)];
+        const nonce = Math.random().toString(36).slice(2, 8);
+        return `请围绕${topic}创作一条完整、可直接生图的单图 Prompt；主动补足动作、表情、服装、道具、环境、构图、镜头、时间天气和光线；本轮变化标识 ${nonce}`;
+    }
+
     async function generateBatch(config, parentRun = null) {
         if (state.active && state.active !== parentRun) return "已有队列任务正在运行";
-        const parsed = parseRequests(config.request);
-        if (!parsed.requests.length) return "缺少每轮创作要求";
+            const parsed = parseRequests(config.request);
+            if (!parsed.requests.length) {
+                parsed.requests.push(randomInspirationRequest());
+                parsed.generatedInspiration = true;
+            }
         const run = parentRun || await beginRun("llm");
         if (!run) return "已有队列任务正在运行";
         run.phase = "llm";
@@ -626,15 +643,25 @@
                     continue;
                 }
                 const button = ensureLlmIdle();
-                const prompt = await runStudioGenerationWithRetry(run, request, button);
-                assertActive(run);
-                state.requestIds.add(requestId);
-                const promptKey = canonicalPrompt(prompt);
-                if (!allowDuplicateOutput && queuedPrompts.has(promptKey)) {
+                let prompt = "";
+                let promptKey = "";
+                let accepted = false;
+                for (let attempt = 0; attempt < 3; attempt += 1) {
+                    const attemptRequest = parsed.generatedInspiration && attempt
+                        ? randomInspirationRequest(request)
+                        : request;
+                    prompt = await runStudioGenerationWithRetry(run, attemptRequest, button);
+                    assertActive(run);
+                    promptKey = canonicalPrompt(prompt);
+                    if (allowDuplicateOutput || !queuedPrompts.has(promptKey)) {
+                        accepted = true;
+                        break;
+                    }
                     duplicateOutputCount += 1;
-                    saveQueue();
-                    continue;
+                    render("warning", "检测到重复 Prompt，正在重新抽样", "当前连续任务会继续运行");
                 }
+                if (!accepted) continue;
+                state.requestIds.add(requestId);
                 const row = {
                     index: state.queue.length + 1,
                     id: createId("row"),
@@ -734,18 +761,21 @@
                 const generated = await generateBatch({
                     ...config,
                     allowRepeat: true,
-                    allowDuplicateOutput: continuous,
+                    allowDuplicateOutput: false,
                 }, run);
                 if (!String(generated).startsWith("Prompt 批量生成完成")) return generated;
                 const rowIds = state.lastBatchRowIds.slice();
                 if (!rowIds.length) return "本轮没有新增 Prompt";
-                const generatedImages = await runStored(config, rowIds, run);
-                if (!String(generatedImages).startsWith("队列生图完成")) return generatedImages;
+                if (!config.promptOnly) {
+                    const generatedImages = await runStored(config, rowIds, run);
+                    if (!String(generatedImages).startsWith("队列生图完成")) return generatedImages;
+                }
                 completedCycles += 1;
                 if (continuous) {
-                    render("success", `持续自动生图已完成 ${completedCycles} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "将持续运行到取消");
+                    render("success", config.promptOnly ? `持续 Prompt 生成已完成 ${completedCycles} 轮` : `持续自动生图已完成 ${completedCycles} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "将持续运行到取消");
                 }
             }
+            if (config.promptOnly) return continuous ? `持续 Prompt 生成完成，共 ${completedCycles} 轮` : `Prompt 生成完成，共 ${completedCycles} 轮`;
             return continuous ? `持续自动生图完成，共 ${completedCycles} 轮` : `生成并生图完成，共 ${completedCycles} 轮`;
         } finally {
             finishRun(run);
