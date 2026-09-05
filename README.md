@@ -6,6 +6,7 @@ LLM Prompt Studio 是面向 Forge Neo 的 Prompt 生成、转换、批处理、�
 
 - 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic、Gemini、OpenRouter、DeepSeek、Ollama、LM Studio 和自定义 OpenAI 兼容接口。
 - 输出预设覆盖 Danbooru Tags、Danbooru + Natural、Natural Language、NoobAI Tags、Anima Tags 和 Krea 2 Natural。
+- 每个底模均有独立的生成、转换、扩写、润色模板（共 24 个模型/操作组合），不会把 Pony/NoobAI 标签规则套到 Flux/Krea 2。
 - 支持 `Plain Prompt`、`Regional JSON` 和 `Regional Markdown` 结构化输出。
 - txt2img/img2img 下方提供内嵌 Prompt 生成与 JSON 批量转换面板。
 - 通过独立的构图指令、静态词库参考和最近结果排除项，降低批量结果的构图、动作、道具和装饰重复。
@@ -139,6 +140,16 @@ user/
 - `backups/`：删除操作创建的可恢复备份。
 
 修改 Python 或 JavaScript 后重启 Forge，并使用 `Ctrl + F5` 刷新页面。缺少 Ranbooru、PNG Prompt Collector 或 WD14 Tagger 时，本插件的基础生成和缓存仍可独立运行，相应联动按钮会显示不可用状态。
+
+## 模板依据
+
+System Prompt 使用任务、模型规则、输入数据和输出契约分区，并将用户原文作为不执行的数据传入。这套结构参考了官方提示词工程建议：
+
+- [OpenAI Prompt Engineering](https://platform.openai.com/docs/guides/prompt-engineering)：明确指令、Markdown/XML 分隔、固定快照并进行评测。
+- [Anthropic Prompt Engineering](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview) 与 [XML 标签](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/use-xml-tags)：用清晰角色、边界和结构化标签隔离输入。
+- [Gemini Prompting Strategies](https://ai.google.dev/gemini-api/docs/prompting-strategies)：具体约束、统一分隔符和严格输出格式。
+
+这些资料提供的是工程原则，不是某个 Provider 的固定成品 Prompt；插件会根据所选操作（转换、扩写、润色）和底模协议（Pony/Illustrious、NoobAI、Flux、Anima、Krea 2 或自动）选择对应模板。
 
 ## 相关扩展
 

@@ -21,7 +21,7 @@ from starlette.requests import Request
 
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, MODEL_QUALITY_GUIDANCE, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
-    build_system_prompt, build_user_message, call_llm, get_provider_profile, is_english_prompt, is_sfw_output,
+    build_system_prompt, build_user_message, build_operation_instruction, call_llm, get_provider_profile, is_english_prompt, is_sfw_output,
     LLMRequestError,
     discover_ranbooru_cache, load_ranbooru_cache, process_tags,
     regional_format, validate_endpoint, _cosine, _tokens,
@@ -1690,9 +1690,10 @@ def _generate(
             )
     else:
         static_tags = _static_prompt_reference(source)
+    operation_instruction = build_operation_instruction("Generate", base_model)
     system = build_system_prompt(
         preset, base_model, safety, nsfw_injection, user_instruction, examples,
-        static_tags, system_override, effective_batch_directive,
+        static_tags, system_override, effective_batch_directive, operation_instruction,
     )
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
@@ -1708,6 +1709,7 @@ def _generate(
                     preset, base_model, safety, nsfw_injection, user_instruction, examples,
                     static_tags, system_override,
                     effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; keep the model free to choose and return one complete single-image prompt. LANGUAGE RETRY: output English only and translate any source-language descriptions into English. RESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise complete prompt directly and do not spend output on analysis or reasoning.",
+                    operation_instruction,
                 )
             try:
                 result = call_llm(
@@ -1816,33 +1818,10 @@ def _expand_or_polish(
     cancel_event=None,
     batch_directive="", previous_outputs=None,
 ):
-    instructions = {
-        "Convert": (
-            "Convert the source prompt into exactly the selected output profile and target-model format. "
-            "Preserve every explicit visual fact that is compatible with the target format, translate Danbooru tags "
-            "into fluent prose when the selected profile is natural language, and never return the original tag dump "
-            "when the selected profile forbids tags."
-        ),
-        "Expand": (
-            "Expand the source into a richer image-generation prompt. Keep every explicit identity, clothing, "
-            "object, setting, composition, and safety constraint. Add only concrete visible details that are "
-            "compatible with the selected output profile and model profile: pose/expression, spatial relations, "
-            "materials, camera/framing, time, weather, and lighting. Do not add plot, backstory, named entities, "
-            "style filler, or quality boilerplate."
-        ),
-        "Polish": (
-            "Conservatively polish the source for the selected output profile and model profile. Preserve meaning, "
-            "identity, quantities, negations, and requested constraints; normalize ordering, grammar, tag syntax, "
-            "weights, and redundant wording only when the target format supports it. Do not invent new subjects, "
-            "actions, props, styles, or story claims."
-        ),
-    }
     action_name = str(action)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
-    instruction = instructions.get(action_name, instructions["Convert"])
+    instruction = build_operation_instruction(action_name, base_model)
     static_tags = _static_prompt_reference(source)
-    if action_name == "Polish":
-        instruction = instructions["Polish"]
     directive = str(batch_directive or "").strip()
     previous = [str(item).strip() for item in (previous_outputs or []) if str(item).strip()]
     if directive:
@@ -1869,8 +1848,9 @@ def _expand_or_polish(
     def build_transform_system(active_directive: str) -> str:
         if not use_fixed_krea_polish:
             return build_system_prompt(
-                preset, base_model, safety, nsfw_injection, f"{user_instruction}\n{instruction}", static_tags,
+                preset, base_model, safety, nsfw_injection, user_instruction, static_tags,
                 system_override=system_override, batch_directive=active_directive,
+                operation_instruction=instruction,
             )
         sections = [KREA_ANIMA_POLISH_ROLE]
         sections.append("MODEL-ALIGNED QUALITY POLICY:\n" + _aligned_quality_guidance(base_model))
@@ -3147,6 +3127,7 @@ def on_ui_tabs():
     with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio") as ui:
         gr.Markdown("## LLM 提示词工作室\n本地静态词库、提示词缓存与 Forge 扩展集成。")
         gr.Markdown("核心流程：生成单条 Prompt；批处理多条任务；缓存与联动负责筛选、评分、导入导出和 Ranbooru。连接设置只需首次配置，工具按需使用。")
+        gr.Markdown("**模板状态**：生成、转换、扩写、润色会按所选目标底模自动采用对应模板；Flux/Krea 2 使用自然语言约束，Pony/NoobAI/Anima 使用标签规则。", elem_id="llm_prompt_studio_template_notice", elem_classes=["lps-template-notice"])
         with gr.Tabs(elem_id="llm_prompt_studio_main_tabs"):
             with gr.Tab("生成", elem_id="llm_prompt_studio_generate_tab"):
                 with gr.Row():
@@ -3170,8 +3151,8 @@ def on_ui_tabs():
                             "填入兽耳角色与环境模板",
                             elem_id="llm_prompt_studio_kemonimimi_template",
                         )
-                        preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
-                        base_model = gr.Dropdown(label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
+                        preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
+                        base_model = gr.Dropdown(label="目标底模（自动匹配模板）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
                         with gr.Accordion("高级 Prompt 约束", open=False):
                             system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=6, value=workflow["system_override"], placeholder="留空则使用所选预设。安全策略、用户要求和静态词库会自动追加。")
@@ -3193,7 +3174,7 @@ def on_ui_tabs():
                     generate = gr.Button("生成提示词", variant="primary", elem_id="llm_prompt_studio_generate_button")
                     save_workflow = gr.Button("保存全部工作参数")
                     reset_workflow = gr.Button("恢复默认工作参数")
-                output = gr.Textbox(label="生成的提示词", lines=8, elem_id="llm_prompt_studio_output")
+                output = gr.Textbox(label="生成的提示词", lines=8, elem_id="llm_prompt_studio_output", elem_classes=["lps-output"])
                 system_preview = gr.Textbox(label="最终 System Prompt", lines=12)
                 status = gr.Markdown(elem_id="llm_prompt_studio_status", elem_classes=["lps-status"])
                 workflow_status = gr.Markdown("已自动载入上次保存的工作参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认工作参数；保存后下次会自动填入。")
@@ -3556,6 +3537,7 @@ def on_ui_tabs():
                 other_inline = [component for component in inline_components if component is not current]
                 _bind_workflow_sync(current, [generate_component, batch_component, *other_inline])
         all_preset_components = [preset, batch_preset, *[components["preset"] for components in inline_workflows]]
+        all_base_model_components = [base_model, batch_base_model, *[components["base_model"] for components in inline_workflows]]
 
         def _preset_alignment_update(base_model_value, current_preset):
             aligned, _changed = _aligned_preset(current_preset, base_model_value)
@@ -3566,6 +3548,19 @@ def on_ui_tabs():
         )
         batch_base_model.change(
             _preset_alignment_update, inputs=[batch_base_model, batch_preset], outputs=all_preset_components, queue=False,
+        )
+
+        def _preset_base_model_update(preset_value):
+            recommended = _recommended_base_model_for_preset(preset_value)
+            return tuple(recommended for _ in all_base_model_components)
+
+        # Selecting an output template also selects its compatible checkpoint
+        # protocol across the standalone, batch, and inline prompt panels.
+        preset.change(
+            _preset_base_model_update, inputs=preset, outputs=all_base_model_components, queue=False,
+        )
+        batch_preset.change(
+            _preset_base_model_update, inputs=batch_preset, outputs=all_base_model_components, queue=False,
         )
         provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
         test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
