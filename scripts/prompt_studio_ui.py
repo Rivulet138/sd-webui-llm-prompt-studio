@@ -2571,6 +2571,11 @@ def _create_inline_panel(slot, prompt_target):
             label="本轮创作要求", lines=2, placeholder="例如：复杂二次元场景，不要只生成风格词",
             elem_id=f"llm_prompt_studio_{slot}_inline_request",
         )
+        inline_variation = gr.Textbox(
+            label="批量变化维度（可选）", lines=2,
+            placeholder="例如：保持人物身份和画风不变，只变化动作、道具、场景、镜头和光线。",
+            elem_id=f"llm_prompt_studio_{slot}_inline_variation",
+        )
         inline_creative_template_button = gr.Button(
             "填入通用创作需求",
             elem_id=f"llm_prompt_studio_{slot}_creative_template",
@@ -2628,7 +2633,7 @@ def _create_inline_panel(slot, prompt_target):
         inline_generate.click(
             _inline_generate,
             inputs=[
-                request, gr.State(""), inline_preset, gr.State(workflow["system_override"]),
+                request, prompt_target, inline_preset, gr.State(workflow["system_override"]),
                 inline_base_model, inline_safety, gr.State(workflow["nsfw_injection"]),
                 gr.State(workflow["user_instruction"]), gr.State(workflow["remove_bad"]),
                 gr.State(workflow["remove_terms"]), gr.State(workflow["shuffle"]),
@@ -2642,15 +2647,15 @@ def _create_inline_panel(slot, prompt_target):
         inline_cache_button.click(_inline_cached_prompt, inputs=inline_cache_cursor, outputs=[inline_cache_output, inline_cache_status, inline_cache_cursor])
         inline_once.click(
             fn=None,
-            inputs=[request, inline_source],
+            inputs=[request, inline_variation, inline_source],
             outputs=inline_loop_status,
-            js=f"(request, source) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, source}})",
+            js=f"(request, variation, source) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, variation, source}})",
         )
         inline_start.click(
             fn=None,
-            inputs=[request, inline_source, inline_cycles],
+            inputs=[request, inline_variation, inline_source, inline_cycles],
             outputs=inline_loop_status,
-            js=f"(request, source, cycles) => window.llmPromptStudioAutoLoop.inlineLoop({{slot: '{slot}', request, source, cycles}})",
+            js=f"(request, variation, source, cycles) => window.llmPromptStudioAutoLoop.inlineLoop({{slot: '{slot}', request, variation, source, cycles}})",
         )
         inline_cancel.click(
             fn=_cancel_inline_generation, inputs=gr.State(slot), outputs=inline_loop_status,

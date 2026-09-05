@@ -415,7 +415,7 @@
         throw new Error("读取缓存超时");
     }
 
-    async function generateInlinePrompt(slot, request, run) {
+    async function generateInlinePrompt(slot, request, variation, run) {
         const inlineButton = findButton(inlineId(slot, "generate"));
         const mainButton = findButton("llm_prompt_studio_generate_button");
         const isInline = Boolean(inlineButton);
@@ -425,7 +425,11 @@
         const status = isInline ? find(inlineId(slot, "status")) : find("llm_prompt_studio_status");
         if (!button || !requestInput || !output || !status) throw new Error("未找到主生成面板");
         if (button.disabled) throw new Error("LLM Studio 当前已有生成任务");
-        setValue(isInline ? inlineId(slot, "request") : "llm_prompt_studio_request", request);
+        const variationScope = String(variation || "").trim();
+        const instruction = variationScope
+            ? `${String(request || "").trim()}\n\nBATCH VARIATION SCOPE:\n${variationScope}`
+            : String(request || "").trim();
+        setValue(isInline ? inlineId(slot, "request") : "llm_prompt_studio_request", instruction);
         if (!isInline && input("llm_prompt_studio_source_tags")) setValue("llm_prompt_studio_source_tags", "");
         const beforeStatus = String(status.textContent || "");
         const beforeOutput = String(output.value || "");
@@ -483,7 +487,7 @@
     async function getInlinePrompt(config, run) {
         return config.source === "cache"
             ? readInlineCache(config.slot, run)
-            : generateInlinePrompt(config.slot, config.request, run);
+            : generateInlinePrompt(config.slot, config.request, config.variation, run);
     }
 
     async function getInlinePromptWithRetry(config, run) {
