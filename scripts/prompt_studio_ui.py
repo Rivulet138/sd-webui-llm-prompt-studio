@@ -145,7 +145,7 @@ OUTPUT_UI_CHOICES = [
 ]
 PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
 ACTION_UI_CHOICES = [("格式转换", "Convert"), ("扩写", "Expand"), ("润色", "Polish")]
-JSON_VARIATION_MODE_CHOICES = [("独立构图转换", "independent"), ("忠实格式转换", "faithful")]
+JSON_VARIATION_MODE_CHOICES = [("多样化灵感", "independent"), ("按原意转换", "faithful")]
 PRESET_BASE_MODEL_DEFAULTS = {
     "NoobAI Tags": "NoobAI",
     "Anima Tags": "Anima",
@@ -2606,7 +2606,7 @@ def _create_inline_json_batch_panel(slot):
 
 def _create_inline_panel(slot, prompt_target):
     workflow = _workflow_settings()
-    with gr.Accordion("Prompt 批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
+    with gr.Accordion("灵感批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
         gr.Markdown("用于连续生图时换 Prompt；生成预设、目标底模和内容模式与独立面板使用同一组选项。")
         request = gr.Textbox(
             label="本轮创作要求", lines=2, placeholder="例如：复杂二次元场景，不要只生成风格词",
@@ -3243,7 +3243,7 @@ def on_ui_tabs():
                         elem_id="llm_prompt_studio_batch_safety",
                     )
                 with gr.Tabs():
-                    with gr.Tab("服务端批量生成（仅 Prompt）"):
+                    with gr.Tab("灵感批量生成（仅 Prompt）"):
                         gr.Markdown(
                             "服务端逐行调用 LLM，只生成并缓存 Prompt，不会自动启动 Forge 生图；下方浏览器队列是独立链路。重复要求也会分别调用 LLM。"
                         )

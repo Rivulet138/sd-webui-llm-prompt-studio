@@ -1,6 +1,6 @@
 # About LLM Prompt Studio
 
-LLM Prompt Studio 是面向 Stable Diffusion Forge Neo 的提示词工作台。它把模型连接、模型适配模板、提示词生成/转换/扩写/润色、批处理和缓存放在同一界面，并通过稳定的 `prompt_batch.v1` 数据格式与 PNG Prompt Collector、Ranbooru 交接。
+LLM Prompt Studio 是面向 Stable Diffusion Forge Neo 的提示词工作台。它把模型连接、模型适配模板、灵感批量生成、格式转换、扩写、润色、批处理和缓存放在同一界面，并通过稳定的 `prompt_batch.v1` 数据格式接收 PNG Prompt Collector 与 Ranbooru 内容。灵感生成既支持空白输入随机探索，也支持保留角色 Tag、由模型补全动作、物品和背景；静态词库按类别抽样以保持题材多样性。
 
 模板按目标底模和操作分别维护：标签型模型保留其训练语法，自然语言模型不会被套用 SD 标签质量串。模板依据模型维护者资料及官方提示词工程原则整理，不代表服务商发布的固定 system prompt。
 
