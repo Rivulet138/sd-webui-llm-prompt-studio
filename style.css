@@ -21,7 +21,7 @@
 .lps-auto-loop-empty { padding: .6rem; color: var(--body-text-color-subdued, #999); }
 .lps-primary { font-weight: 600; }
 .lps-danger { border-color: var(--error-500, #ef4444); }
-button:focus-visible, input:focus-visible, textarea:focus-visible, [role="tab"]:focus-visible { outline: 2px solid var(--primary-500, #3b82f6) !important; outline-offset: 2px; }
+#llm_prompt_studio :is(button, input, textarea, [role="tab"]):focus-visible { outline: 2px solid var(--primary-500, #3b82f6) !important; outline-offset: 2px; }
 #llm_prompt_studio_cache_table, #llm_prompt_studio_handoff_table { overflow-x: auto; }
 @media (max-width: 900px) {
   #llm_prompt_studio_main_tabs .gradio-row, #llm_prompt_studio_main_tabs .lps-form-row { flex-wrap: wrap; }
@@ -32,7 +32,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [role="tab"]:
   .lps-auto-loop-row { grid-template-columns: 2rem minmax(0, 1fr); }
   .lps-auto-loop-row code { grid-column: 1 / -1; max-height: 8rem; }
 }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
+@media (prefers-reduced-motion: reduce) { #llm_prompt_studio *, #llm_prompt_studio *::before, #llm_prompt_studio *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
 #llm_prompt_studio_auto_loop_dispatch,
 .lps-auto-loop-dispatch {
     display: none !important;
