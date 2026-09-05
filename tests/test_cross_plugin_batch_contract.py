@@ -18,6 +18,16 @@ class CrossPluginBatchContractTests(unittest.TestCase):
         for label, action in (("格式转换", "Convert"), ("扩写", "Expand"), ("润色", "Polish")):
             self.assertIn(f'("{label}", "{action}")', source)
 
+    def test_inspiration_batch_supports_empty_input_and_locked_subject(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        self.assertIn("def _build_inspiration_sources(", source)
+        self.assertIn("_INSPIRATION_TOPIC_POOL", source)
+        self.assertIn("batch_generation_count", source)
+        self.assertIn("batch_base_prompt", source)
+        self.assertIn("batch_lock_known", source)
+        self.assertIn("batch_sample_static", source)
+        self.assertIn("保留身份、LoRA、权重", source)
+
 
 if __name__ == "__main__":
     unittest.main()
