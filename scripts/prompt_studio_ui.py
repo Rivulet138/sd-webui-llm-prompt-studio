@@ -2719,10 +2719,10 @@ def _create_inline_panel(slot, prompt_target):
                 elem_id=f"llm_prompt_studio_{slot}_inline_cycles",
             )
         with gr.Row():
-            inline_once = gr.Button("只生成并写入 Prompt", elem_id=f"llm_prompt_studio_{slot}_inline_once")
-            inline_start = gr.Button("启动 Prompt + Forge 流程", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
+            inline_once = gr.Button("生成并入队", elem_id=f"llm_prompt_studio_{slot}_inline_once")
+            inline_start = gr.Button("持续生成并入队", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
             inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
-        inline_loop_status = gr.HTML("尚未启动：选择 Prompt 来源后点击“启动 Prompt + Forge 流程”。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+        inline_loop_status = gr.HTML("尚未启动：生成后请在队列中勾选，再写入固定正面 Prompt。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
         inline_generate = gr.Button("内嵌 LLM 生成", visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_generate")
         inline_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_output")
         inline_system_preview = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_system_preview")
@@ -3295,7 +3295,7 @@ def on_ui_tabs():
                     save_workflow = gr.Button("保存全部工作参数")
                     reset_workflow = gr.Button("恢复默认工作参数")
                 output = gr.Textbox(label="生成的提示词", lines=8, elem_id="llm_prompt_studio_output", elem_classes=["lps-output"])
-                system_preview = gr.Textbox(label="最终 System Prompt", lines=12)
+                system_preview = gr.Textbox(visible=False, elem_id="llm_prompt_studio_system_preview")
                 status = gr.Markdown(elem_id="llm_prompt_studio_status", elem_classes=["lps-status"])
                 workflow_status = gr.Markdown("已自动载入上次保存的工作参数。" if DB.get_setting("workflow_settings_v1") else "当前使用默认工作参数；保存后下次会自动填入。")
 
@@ -3383,7 +3383,7 @@ def on_ui_tabs():
                             gr.Markdown("这里会重新调用 LLM 建立浏览器队列；创作要求可留空以随机探索。勾选“仅生成 Prompt”可持续积累到队列，取消勾选后再逐条写入 txt2img/img2img 生图。")
                             with gr.Row(elem_classes=["lps-form-row"]):
                                 auto_loop_target = gr.Radio(
-                                    label="生图目标", choices=[("txt2img", "txt2img"), ("img2img", "img2img")],
+                                    label="写入目标", choices=[("正面 Prompt", "txt2img")],
                                     value="txt2img", elem_id="llm_prompt_studio_auto_loop_target",
                                 )
                                 auto_loop_write_mode = gr.Radio(
@@ -3407,9 +3407,12 @@ def on_ui_tabs():
                                     elem_id="llm_prompt_studio_auto_loop_cycles",
                                 )
                             with gr.Row():
-                                auto_loop_start = gr.Button("重新调用 LLM 并加入生图队列", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
-                                auto_loop_generate_run = gr.Button("重新调用 LLM 并立即生图", variant="primary", elem_id="llm_prompt_studio_auto_loop_generate_run")
-                                auto_loop_run = gr.Button("投入已有队列生图", elem_id="llm_prompt_studio_auto_loop_run")
+                                auto_loop_start = gr.Button("生成并入队", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
+                                auto_loop_generate_run = gr.Button("持续生成并入队", variant="primary", elem_id="llm_prompt_studio_auto_loop_generate_run")
+                                auto_loop_run = gr.Button("使用所选并生图", elem_id="llm_prompt_studio_auto_loop_run")
+                                auto_loop_write_selected = gr.Button("写入所选到正面 Prompt", elem_id="llm_prompt_studio_auto_loop_write_selected")
+                                auto_loop_select_all = gr.Button("全选", elem_id="llm_prompt_studio_auto_loop_select_all")
+                                auto_loop_clear_selected = gr.Button("清空选择", elem_id="llm_prompt_studio_auto_loop_clear_selected")
                                 auto_loop_clear = gr.Button("清空队列", elem_id="llm_prompt_studio_auto_loop_clear")
                                 auto_loop_cancel = gr.Button("取消当前阶段", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
                             auto_loop_dispatch = gr.Button(
@@ -3418,14 +3421,14 @@ def on_ui_tabs():
                                 elem_classes=["lps-auto-loop-dispatch"],
                             )
                             auto_loop_status = gr.HTML(
-                                "等待开始。生成到队列后可检查、追加到 Prompt，或直接投入生图。",
+                                "等待开始。生成后请勾选队列项目，再写入正面 Prompt 或生图。",
                                 elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
                             )
                             gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
                             gr.Markdown("### 服务端队列（页面关闭后仍继续）")
                             gr.Markdown("服务端线程负责逐条调用 LLM，并可通过 Forge API 生成 txt2img。此处日志和已生成 Prompt 来自 SQLite，不依赖浏览器保持连接。")
                             server_queue_target = gr.Radio(
-                                label="服务端生图目标", choices=[("只生成 Prompt", "none"), ("txt2img", "txt2img")],
+                                label="服务端模式", choices=[("只生成 Prompt", "none")],
                                 value="none", elem_id="llm_prompt_studio_server_queue_target",
                             )
                             with gr.Row():
@@ -3764,6 +3767,36 @@ def on_ui_tabs():
             inputs=[auto_loop_target, auto_loop_write_mode],
             outputs=auto_loop_status,
             js="(target, writeMode) => window.llmPromptStudioAutoLoop.runStored({target, writeMode})",
+        )
+        auto_loop_write_selected.click(
+            fn=None, outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.writeSelectedToPositive()", queue=False,
+        )
+        auto_loop_select_all.click(
+            fn=None, outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.selectAllRows()", queue=False,
+        )
+        auto_loop_clear_selected.click(
+            fn=None, outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.clearSelectedRows()", queue=False,
+        )
+        auto_loop_write_selected.click(
+            fn=None,
+            outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.writeSelectedToPositive()",
+            queue=False,
+        )
+        auto_loop_select_all.click(
+            fn=None,
+            outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.selectAllRows()",
+            queue=False,
+        )
+        auto_loop_clear_selected.click(
+            fn=None,
+            outputs=auto_loop_status,
+            js="() => window.llmPromptStudioAutoLoop.clearSelectedRows()",
+            queue=False,
         )
         auto_loop_generate_run.click(
             fn=None,

@@ -28,6 +28,15 @@ class CrossPluginBatchContractTests(unittest.TestCase):
         self.assertIn("batch_sample_static", source)
         self.assertIn("保留身份、LoRA、权重", source)
 
+    def test_queue_write_is_explicit_and_system_preview_is_hidden(self):
+        ui = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        js = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
+        self.assertIn('system_preview = gr.Textbox(visible=False', ui)
+        self.assertIn("writeSelectedToPositive", ui)
+        self.assertIn("selectAllRows", js)
+        self.assertIn("请先勾选待使用的 Prompt", js)
+        self.assertIn('const target = "txt2img";', js)
+
 
 if __name__ == "__main__":
     unittest.main()
