@@ -2157,6 +2157,7 @@ def _normalize_png_batch_payload(payload):
         item = {"record_id": record_id, "index": position,
                 "image": {"filename": filename, "sha256": sha256},
                 "prompt": {"positive": positive}}
+        item["selected"] = bool(record.get("selected", False))
         source_identity = str(record.get("source_identity") or "").strip()
         if source_identity:
             if len(source_identity) > 512:
@@ -2231,9 +2232,10 @@ def _png_batch_load(file_path):
         path = Path(file_path)
         data = _normalize_png_batch_payload(path.read_text(encoding="utf-8"))
         selected, current = _png_batch_current(data, 1)
-        return _png_batch_json(data), _png_batch_table(data), selected, current, f"已导入 {len(data['records'])} 条逐图 Prompt。"
+        choices, values = _png_batch_selection_choices(data)
+        return _png_batch_json(data), _png_batch_table(data), selected, current, f"已导入 {len(data['records'])} 条逐图 Prompt。", gr.update(choices=choices, value=values)
     except Exception as error:
-        return gr.update(), [], 1, "", f"导入失败：{_safe_error(error)}"
+        return gr.update(), [], 1, "", f"导入失败：{_safe_error(error)}", gr.update(choices=[], value=[])
 
 
 def _png_batch_table(payload):
@@ -2252,6 +2254,58 @@ def _png_batch_table(payload):
         ]
         for record in data["records"]
     ]
+
+
+def _png_batch_selection_choices(payload):
+    """Return processed records as explicit write-back choices."""
+    try:
+        data = _normalize_png_batch_payload(payload or {})
+    except Exception:
+        return [], []
+    choices = []
+    selected = []
+    for record in data["records"]:
+        processed = str(record.get("prompt", {}).get("processed") or "").strip()
+        if not processed or record.get("appended"):
+            continue
+        record_id = str(record.get("record_id") or "")
+        label = f"{record['index']} · {record['image']['filename']}"
+        choices.append((label, record_id))
+        if record.get("selected") is True:
+            selected.append(record_id)
+    return choices, selected
+
+
+def _png_batch_set_selection(payload, selected_ids):
+    try:
+        data = _normalize_png_batch_payload(payload or {})
+    except Exception as error:
+        return payload, [], 1, "", f"批次 JSON 无效：{_safe_error(error)}", gr.update(choices=[], value=[])
+    selected = {str(value) for value in (selected_ids or [])}
+    for record in data["records"]:
+        record["selected"] = str(record.get("record_id") or "") in selected
+    choices, values = _png_batch_selection_choices(data)
+    current_index, current = _png_batch_current(data, 1)
+    return _png_batch_json(data), _png_batch_table(data), current_index, current, f"已选择 {len(values)} 条结果。", gr.update(choices=choices, value=values)
+
+
+def _png_batch_mark_selected_appended(payload, selected_ids, succeeded):
+    if not succeeded:
+        data = _normalize_png_batch_payload(payload or {})
+        choices, values = _png_batch_selection_choices(data)
+        current_index, current = _png_batch_current(data, 1)
+        return _png_batch_json(data), _png_batch_table(data), current_index, current, "所选结果未写入。", gr.update(choices=choices, value=values)
+    data = _normalize_png_batch_payload(payload or {})
+    selected = {str(value) for value in (selected_ids or [])}
+    marked = 0
+    for record in data["records"]:
+        if str(record.get("record_id") or "") in selected:
+            record["appended"] = True
+            record["selected"] = False
+            marked += 1
+    choices, values = _png_batch_selection_choices(data)
+    current_index, current = _png_batch_current(data, 1)
+    return _png_batch_json(data), _png_batch_table(data), current_index, current, f"已写入 {marked} 条到 txt2img 正面 Prompt。", gr.update(choices=choices, value=values)
 
 
 def _png_batch_current(payload, selection):
@@ -2273,10 +2327,11 @@ def _png_batch_refresh(payload, selection=1):
     try:
         data = _normalize_png_batch_payload(payload or {})
     except Exception as error:
-        return [], 1, "", f"批次 JSON 无效：{_safe_error(error)}"
+        return [], 1, "", f"批次 JSON 无效：{_safe_error(error)}", gr.update(choices=[], value=[])
     selected, current = _png_batch_current(data, selection)
     table = _png_batch_table(data)
-    return table, selected, current, f"已载入 {len(table)} 条逐图 Prompt。"
+    choices, values = _png_batch_selection_choices(data)
+    return table, selected, current, f"已载入 {len(table)} 条逐图 Prompt。", gr.update(choices=choices, value=values)
 
 
 def _png_batch_move(payload, selection, offset):
@@ -2297,7 +2352,7 @@ def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="
     selected_preset = preset if preset in PRESETS else workflow["preset"]
     selected_base_model = base_model if base_model in BASE_MODEL_GUIDANCE else workflow["base_model"]
     selected_preset, _preset_aligned = _aligned_preset(selected_preset, selected_base_model)
-    yield from _png_batch_run(
+    for update in _png_batch_run(
         payload, action,
         selected_preset, workflow["system_override"], selected_base_model, workflow["safety"],
         workflow["nsfw_injection"], workflow["user_instruction"],
@@ -2306,7 +2361,9 @@ def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="
         workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
         workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
         variation_mode, cancel_id,
-    )
+    ):
+        # The compact inline panel predates the optional selection control.
+        yield tuple(update[:5])
 
 
 def _cancel_auto_loop_generation():
@@ -2332,10 +2389,10 @@ def _png_batch_run(
     try:
         data = _normalize_png_batch_payload(payload or {})
     except Exception as error:
-        yield payload, [], 1, "", f"处理失败：{_safe_error(error)}"
+        yield payload, [], 1, "", f"处理失败：{_safe_error(error)}", gr.update(choices=[], value=[])
         return
     if not data["records"]:
-        yield _png_batch_json(data), [], 1, "", "批次为空，请先导入逐图 Prompt。"
+        yield _png_batch_json(data), [], 1, "", "批次为空，请先导入逐图 Prompt。", gr.update(choices=[], value=[])
         return
     event_key, cancel_event = _png_batch_cancel_event(cancel_id)
     cancel_event.clear()
@@ -2364,7 +2421,7 @@ def _png_batch_run(
                 if not record.get("status"):
                     record["status"] = "已完成"
                 if position % progress_interval == 0 or position == len(records):
-                    yield gr.update(), gr.update(), gr.update(), gr.update(), f"处理中 {position}/{len(records)}"
+                    yield gr.update(), gr.update(), gr.update(), gr.update(), f"处理中 {position}/{len(records)}", gr.update()
                 continue
             source = record["prompt"]["positive"]
             outcome_key = source.strip()
@@ -2405,17 +2462,18 @@ def _png_batch_run(
             else:
                 record["status"], record["error"] = "失败", llm_status or "LLM 未返回结果"
             if position % progress_interval == 0 or position == len(records):
-                yield gr.update(), gr.update(), gr.update(), gr.update(), f"处理中 {position}/{len(records)}"
+                yield gr.update(), gr.update(), gr.update(), gr.update(), f"处理中 {position}/{len(records)}", gr.update()
 
         result = {"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": records}
         selected, current = _png_batch_current(result, 1)
         completed = sum(1 for record in records if record.get("status") == "已完成")
         failed = sum(1 for record in records if record.get("status") == "失败")
         cancelled = sum(1 for record in records if record.get("status") == "已取消")
+        choices, values = _png_batch_selection_choices(result)
         yield _png_batch_json(result), _png_batch_table(result), selected, current, (
             f"批处理结束：目标 {preset} / {base_model}；完成 {completed}，相同 Prompt 复用 {reused}，"
             f"已有结果跳过 {skipped_existing}（同目标），失败 {failed}，取消 {cancelled}。"
-        )
+        ), gr.update(choices=choices, value=values)
     finally:
         cancel_event.clear()
         with _PNG_BATCH_CANCEL_LOCK:
@@ -2426,16 +2484,22 @@ def _png_batch_run(
 def _png_batch_advance_after_append(payload, selection, succeeded):
     if not succeeded:
         selected, current = _png_batch_current(payload, selection)
-        return payload, selected, current, "当前结果未写入。"
+        data = _normalize_png_batch_payload(payload or {})
+        choices, values = _png_batch_selection_choices(data)
+        return payload, selected, current, "当前结果未写入。", gr.update(choices=choices, value=values)
     data = _normalize_png_batch_payload(payload or {})
     selected = int(selection or 0)
     if selected < 1 or selected > len(data["records"]):
-        return _png_batch_json(data), 0, "", "没有待追加的结果。"
+        choices, values = _png_batch_selection_choices(data)
+        return _png_batch_json(data), 0, "", "没有待追加的结果。", gr.update(choices=choices, value=values)
     data["records"][selected - 1]["appended"] = True
+    data["records"][selected - 1]["selected"] = False
     if selected == len(data["records"]):
-        return _png_batch_json(data), 0, "", "全部逐图结果已追加完成。"
+        choices, values = _png_batch_selection_choices(data)
+        return _png_batch_json(data), 0, "", "全部逐图结果已追加完成。", gr.update(choices=choices, value=values)
     next_selection, current = _png_batch_current(data, selected + 1)
-    return _png_batch_json(data), next_selection, current, f"已追加第 {selected} 条，当前为第 {next_selection} 条。"
+    choices, values = _png_batch_selection_choices(data)
+    return _png_batch_json(data), next_selection, current, f"已写入第 {selected} 条，当前为第 {next_selection} 条。", gr.update(choices=choices, value=values)
 
 
 def _png_batch_export_file(payload):
@@ -3380,7 +3444,7 @@ def on_ui_tabs():
                             batch_clear_issue_selection = gr.Button("清空选择")
                             batch_retry_selected = gr.Button("重新提交所选（每条一次）", variant="primary")
                         with gr.Accordion("另一条路径：浏览器生图队列（可选）", open=False, elem_id="llm_prompt_studio_auto_loop_tab"):
-                            gr.Markdown("这里会重新调用 LLM 建立浏览器队列；创作要求可留空以随机探索。勾选“仅生成 Prompt”可持续积累到队列，取消勾选后再逐条写入 txt2img/img2img 生图。")
+                            gr.Markdown("这里会重新调用 LLM 建立浏览器队列；创作要求可留空以随机探索。结果不会自动改写 Prompt，需先勾选队列项目，再写入固定 txt2img 正面 Prompt 或生图。")
                             with gr.Row(elem_classes=["lps-form-row"]):
                                 auto_loop_target = gr.Radio(
                                     label="写入目标", choices=[("正面 Prompt", "txt2img")],
@@ -3426,7 +3490,7 @@ def on_ui_tabs():
                             )
                             gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
                             gr.Markdown("### 服务端队列（页面关闭后仍继续）")
-                            gr.Markdown("服务端线程负责逐条调用 LLM，并可通过 Forge API 生成 txt2img。此处日志和已生成 Prompt 来自 SQLite，不依赖浏览器保持连接。")
+                            gr.Markdown("服务端线程负责逐条调用 LLM 并保存结果。此处日志和已生成 Prompt 来自 SQLite，不依赖浏览器保持连接。")
                             server_queue_target = gr.Radio(
                                 label="服务端模式", choices=[("只生成 Prompt", "none")],
                                 value="none", elem_id="llm_prompt_studio_server_queue_target",
@@ -3453,14 +3517,18 @@ def on_ui_tabs():
                         with gr.Row():
                             png_batch_previous = gr.Button("上一条", elem_id="llm_prompt_studio_png_batch_previous")
                             png_batch_next = gr.Button("下一条", elem_id="llm_prompt_studio_png_batch_next")
-                        png_batch_target = gr.Radio(label="目标 Prompt", choices=[("不写入", "none"), ("txt2img", "txt2img"), ("img2img", "img2img")], value="none", elem_id="llm_prompt_studio_png_batch_target")
+                        png_batch_target = gr.Radio(label="写入目标", choices=[("正面 Prompt（txt2img）", "txt2img")], value="txt2img", elem_id="llm_prompt_studio_png_batch_target")
                         png_batch_append = gr.Radio(label="写入方式", choices=[("追加", "append"), ("覆盖", "replace")], value="append", elem_id="llm_prompt_studio_png_batch_append")
                         with gr.Row():
                             png_batch_run = gr.Button("开始处理", variant="primary", elem_id="llm_prompt_studio_png_batch_run")
                             png_batch_cancel = gr.Button("取消", variant="stop", elem_id="llm_prompt_studio_png_batch_cancel")
-                            png_batch_append_button = gr.Button("追加并下一条", variant="primary", elem_id="llm_prompt_studio_png_batch_append_button")
-                            png_batch_append_all = gr.Button("全部结果写入正面 Prompt", elem_id="llm_prompt_studio_png_batch_append_all")
+                            png_batch_append_button = gr.Button("写入当前到正面 Prompt", variant="primary", elem_id="llm_prompt_studio_png_batch_append_button")
+                            png_batch_append_all = gr.Button("写入所选到正面 Prompt", elem_id="llm_prompt_studio_png_batch_append_all")
                             png_batch_export = gr.DownloadButton("导出结果", elem_id="llm_prompt_studio_png_batch_export")
+                        png_batch_selected = gr.CheckboxGroup(
+                            label="选择要写入的结果（仅写入 txt2img 正面 Prompt）",
+                            choices=[], value=[], elem_id="llm_prompt_studio_png_batch_selected",
+                        )
                         png_batch_table = gr.Dataframe(headers=["序号", "文件", "原始正向 Prompt", "状态", "LLM 结果", "错误"], datatype=["number", "str", "str", "str", "str", "str"], interactive=False, wrap=True, elem_id="llm_prompt_studio_png_batch_table", elem_classes=["lps-table"])
                         gr.Markdown("", elem_id="llm_prompt_studio_png_batch_results")
                         png_batch_status = gr.HTML("等待导入 JSON。", elem_id="llm_prompt_studio_png_batch_status", elem_classes=["lps-status"])
@@ -3469,7 +3537,7 @@ def on_ui_tabs():
                         png_batch_file.change(
                             _png_batch_load,
                             inputs=png_batch_file,
-                            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status],
+                            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
                         )
 
                     with gr.Tab("直接批量导入"):
@@ -3727,22 +3795,33 @@ def on_ui_tabs():
             inputs=wildcard_path,
             outputs=[wildcard_status, wildcard_results],
         )
-        png_batch_payload.input(_png_batch_refresh, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_table, png_batch_selection, png_batch_current, png_batch_status])
+        png_batch_payload.input(_png_batch_refresh, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected])
+        png_batch_selected.change(
+            _png_batch_set_selection,
+            inputs=[png_batch_payload, png_batch_selected],
+            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
+        )
         png_batch_previous.click(_png_batch_move, inputs=[png_batch_payload, png_batch_selection, gr.State(-1)], outputs=[png_batch_selection, png_batch_current])
         png_batch_next.click(_png_batch_move, inputs=[png_batch_payload, png_batch_selection, gr.State(1)], outputs=[png_batch_selection, png_batch_current])
         png_batch_selection.change(_png_batch_current, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_selection, png_batch_current])
         png_batch_run.click(
             _png_batch_run,
             inputs=[png_batch_payload, png_batch_action, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, png_batch_cancel_id],
-            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status],
+            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
         )
         png_batch_cancel.click(_cancel_png_batch, inputs=png_batch_cancel_id, outputs=png_batch_status, queue=False)
         png_batch_export.click(_png_batch_export_file, inputs=png_batch_payload, outputs=png_batch_export)
-        png_batch_append_all.click(
+        png_append_selected_event = png_batch_append_all.click(
             fn=None,
-            inputs=[png_batch_payload, png_batch_target, png_batch_append],
+            inputs=[png_batch_payload, png_batch_selected, png_batch_append],
             outputs=[png_batch_status, png_batch_append_succeeded],
-            js="(payload, target, mode) => window.llmPromptStudioPngBatch.appendAllToPrompt(payload, target, mode)",
+            js="(payload, selected, mode) => window.llmPromptStudioPngBatch.appendSelectedToPrompt(payload, selected, mode)",
+        )
+        png_append_selected_event.then(
+            _png_batch_mark_selected_appended,
+            inputs=[png_batch_payload, png_batch_selected, png_batch_append_succeeded],
+            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
+            queue=False,
         )
         png_append_event = png_batch_append_button.click(
             fn=None,
@@ -3753,7 +3832,7 @@ def on_ui_tabs():
         png_append_event.then(
             _png_batch_advance_after_append,
             inputs=[png_batch_payload, png_batch_selection, png_batch_append_succeeded],
-            outputs=[png_batch_payload, png_batch_selection, png_batch_current, png_batch_status],
+            outputs=[png_batch_payload, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
             queue=False,
         )
         auto_loop_start.click(
@@ -3779,24 +3858,6 @@ def on_ui_tabs():
         auto_loop_clear_selected.click(
             fn=None, outputs=auto_loop_status,
             js="() => window.llmPromptStudioAutoLoop.clearSelectedRows()", queue=False,
-        )
-        auto_loop_write_selected.click(
-            fn=None,
-            outputs=auto_loop_status,
-            js="() => window.llmPromptStudioAutoLoop.writeSelectedToPositive()",
-            queue=False,
-        )
-        auto_loop_select_all.click(
-            fn=None,
-            outputs=auto_loop_status,
-            js="() => window.llmPromptStudioAutoLoop.selectAllRows()",
-            queue=False,
-        )
-        auto_loop_clear_selected.click(
-            fn=None,
-            outputs=auto_loop_status,
-            js="() => window.llmPromptStudioAutoLoop.clearSelectedRows()",
-            queue=False,
         )
         auto_loop_generate_run.click(
             fn=None,

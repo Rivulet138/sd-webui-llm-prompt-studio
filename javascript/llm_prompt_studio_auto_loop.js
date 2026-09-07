@@ -211,9 +211,12 @@
         const host = find("llm_prompt_studio_auto_loop_log");
         if (!host) return;
         const rows = state.queue.slice(-MAX_LOG_ROWS);
+        const selected = state.queue.filter((row) => row.selected !== false).length;
+        const pending = state.queue.filter((row) => row.status !== STATUS.completed).length;
+        const summary = `<div class="lps-queue-summary" role="status" aria-live="polite"><strong>队列 ${state.queue.length} 条</strong><span>已选 ${selected} · 待生图 ${pending}</span></div>`;
         host.innerHTML = rows.length
-            ? rows.map((row) => `<label class="lps-auto-loop-row"><input type="checkbox" class="lps-auto-loop-select" data-row-id="${escapeHtml(row.id)}" ${row.selected !== false ? "checked" : ""}><span>${row.index}</span><span>${escapeHtml(row.status)}</span><code>${escapeHtml(row.prompt)}</code></label>`).join("")
-            : '<div class="lps-auto-loop-empty">暂无已保存 Prompt。</div>';
+            ? summary + rows.map((row) => `<label class="lps-auto-loop-row"><input type="checkbox" class="lps-auto-loop-select" data-row-id="${escapeHtml(row.id)}" ${row.selected !== false ? "checked" : ""}><span>${row.index}</span><span>${escapeHtml(row.status)}</span><code>${escapeHtml(row.prompt)}</code></label>`).join("")
+            : summary + '<div class="lps-auto-loop-empty">暂无已保存 Prompt。</div>';
         host.querySelectorAll(".lps-auto-loop-select").forEach((checkbox) => {
             checkbox.addEventListener("change", () => {
                 const row = state.queue.find((item) => item.id === checkbox.dataset.rowId);
@@ -602,11 +605,10 @@
         const target = slot;
         const run = beginInlineRun(slot, target);
         if (!run) return "当前内嵌面板已有任务正在运行";
-        run.phase = "forge";
+        run.phase = "llm";
         const parsedCycles = Number(config.cycles);
         const cycleLimit = Number.isFinite(parsedCycles) ? Math.max(0, Math.floor(parsedCycles)) : 0;
         let completed = 0;
-        const basePrompt = String(root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`)?.value || "");
         try {
             while (cycleLimit === 0 || completed < cycleLimit) {
                 assertActive(run);
@@ -616,7 +618,7 @@
                 assertActive(run);
                 enqueuePrompt(prompt, config.request);
                 completed += 1;
-                renderInline(slot, "success", `内嵌连续生成已完成 ${completed} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
+                renderInline(slot, "success", `内嵌 Prompt 已加入队列 ${completed} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
             }
             return `内嵌 Prompt 生成完成，共 ${completed} 轮`;
         } catch (error) {
@@ -761,7 +763,7 @@
         if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
         const run = parentRun || await beginRun("forge", target);
         if (!run) return "已有队列任务正在运行";
-        run.phase = "llm";
+        run.phase = "forge";
         run.target = target;
         const basePrompt = freezeBasePrompt(run, target, targetInput);
         let currentRow = null;
@@ -813,10 +815,6 @@
             : 1;
         let completedCycles = 0;
         try {
-            const target = config.target === "img2img" ? "img2img" : "txt2img";
-            const targetInput = root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`);
-            if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
-            freezeBasePrompt(run, target, targetInput);
             while (cycleLimit === 0 || completedCycles < cycleLimit) {
                 assertActive(run);
                 const generated = await generateBatch({

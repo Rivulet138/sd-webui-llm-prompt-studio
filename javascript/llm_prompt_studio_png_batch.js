@@ -67,6 +67,24 @@
         return appendToPrompt(prompts.join(", "), target, mode);
     }
 
+    function appendSelectedToPrompt(payload, selectedIds, mode) {
+        let data;
+        try {
+            data = typeof payload === "string" ? JSON.parse(payload || "{}") : payload;
+        } catch (error) {
+            return [status("error", "JSON invalid", error?.message || error), false];
+        }
+        const selected = new Set(Array.isArray(selectedIds) ? selectedIds.map(String) : []);
+        const prompts = (Array.isArray(data?.records) ? data.records : [])
+            .filter((record) => selected.has(String(record?.record_id || "")) && !record?.appended)
+            .map((record) => String(record?.prompt?.processed || "").trim())
+            .filter(Boolean);
+        if (!prompts.length) {
+            return [status("warning", "请先勾选结果", "只有已完成且未写入的结果可以写入。"), false];
+        }
+        return appendToPrompt(prompts.join(", "), "txt2img", mode);
+    }
+
     function receiveCollectorBatch(slot) {
         const targetId = `#llm_prompt_studio_${slot || "txt2img"}_json_batch_payload`;
         const target = root().querySelector(targetId);
@@ -80,5 +98,5 @@
         return status("success", "已接收 PNG Collector 批次", "批次已写入当前 txt2img JSON 面板。");
     }
 
-    window.llmPromptStudioPngBatch = { appendToPrompt, appendAllToPrompt, receiveCollectorBatch };
+    window.llmPromptStudioPngBatch = { appendToPrompt, appendAllToPrompt, appendSelectedToPrompt, receiveCollectorBatch };
 })();
