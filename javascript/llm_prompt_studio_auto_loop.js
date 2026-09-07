@@ -365,7 +365,9 @@
         if (!targetInput) return "未找到固定正面 Prompt 框";
         const text = rows.map((row) => row.prompt).join(", ");
         setValue("txt2img_prompt", text);
-        rows.forEach((row) => { row.status = STATUS.completed; row.selected = false; });
+        // Writing a prompt is separate from running Forge, so keep the row
+        // pending and only clear the explicit selection.
+        rows.forEach((row) => { row.selected = false; });
         saveQueue();
         renderQueue();
         return `已写入 ${rows.length} 条到正面 Prompt`;
@@ -827,7 +829,7 @@
                 if (!rowIds.length) return "本轮没有新增 Prompt";
                 completedCycles += 1;
                 if (continuous) {
-                    render("success", config.promptOnly ? `持续 Prompt 生成已完成 ${completedCycles} 轮` : `持续自动生图已完成 ${completedCycles} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "将持续运行到取消");
+                    render("success", `持续 Prompt 生成已完成 ${completedCycles} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "将持续运行到取消");
                 }
             }
             return continuous ? `持续 Prompt 生成完成，共 ${completedCycles} 轮` : `Prompt 生成完成，共 ${completedCycles} 轮`;
