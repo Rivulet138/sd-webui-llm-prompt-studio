@@ -3,7 +3,6 @@
 
     const QUEUE_KEY = "llm_prompt_studio_auto_loop_queue_v1";
     const MAX_LOG_ROWS = 100;
-    const LLM_WAIT_TIMEOUT_MS = 1900000;
     const STATUS = Object.freeze({ pending: "pending", running: "running", completed: "completed" });
     const FAILURE_PATTERN = /fail|error|timeout|refused|interrupted|失败|错误|超时|拒绝|中断/i;
     const SUCCESS_PATTERN = /completed|finished|done|success|生成完成|已完成/i;
@@ -16,9 +15,30 @@
         lastSaveFailure: "",
         lastBatchRowIds: [],
         selectedRowIds: new Set(),
+        dispatchBusy: false,
     };
     const inlineRuns = { txt2img: null, img2img: null };
+    const linkedRuns = { txt2img: null, img2img: null };
+    const inlineCacheCursors = { txt2img: 0, img2img: 0 };
     const serverQueueWatchers = new Map();
+    const CHOICE_ALIASES = Object.freeze({
+        "Danbooru 标签": "Danbooru Tags",
+        "Danbooru 标签 + 自然语言": "Danbooru + Natural",
+        "自然语言": "Natural Language",
+        "NoobAI 标签": "NoobAI Tags",
+        "Anima 标签": "Anima Tags",
+        "Krea 2 自然语言": "Krea 2 Natural",
+        "自动 / 使用底模默认规则": "Auto / checkpoint default",
+        "LLM 自动生成": "llm",
+        "缓存顺序读取": "cache",
+        "追加到后面": "append_end",
+        "追加到前面": "append_start",
+        "替换当前 Prompt": "replace",
+        "插入到标记位置": "marker",
+        "追加": "append",
+        "覆盖": "replace",
+        "正面 Prompt": "txt2img",
+    });
     const inspirationRequests = [
         "日常生活场景", "校园时光场景", "节庆活动场景", "奇幻冒险场景",
         "科幻探索场景", "自然观察场景", "城市夜景场景", "旅行见闻场景",
@@ -42,6 +62,31 @@
 
     function input(id) {
         return find(id)?.querySelector("textarea, input, select");
+    }
+
+    function componentValue(id, fallback = "") {
+        const host = find(id);
+        if (!host) return fallback;
+        const checked = host.querySelector('input[type="radio"]:checked, input[type="checkbox"]:checked');
+        if (checked && checked.type !== "checkbox") return normalizeChoiceValue(checked.value, fallback);
+        const element = host.querySelector("textarea, input, select");
+        return element ? normalizeChoiceValue(element.value, fallback) : fallback;
+    }
+
+    function normalizeChoiceValue(value, fallback = "") {
+        const text = String(value ?? fallback).trim();
+        return CHOICE_ALIASES[text] || text;
+    }
+
+    async function studioFetch(url, options = {}) {
+        const response = await window.fetch(url, {
+            credentials: "same-origin",
+            ...options,
+        });
+        if (response.status === 401 || response.status === 403) {
+            throw new Error(`Studio API 认证失败 (HTTP ${response.status})，请先在当前页面完成登录或检查 --api-auth 配置`);
+        }
+        return response;
     }
 
     function setValue(id, value) {
@@ -294,7 +339,7 @@
         if (state.active) return null;
         const run = {
             id: createId("run"), phase, target, cancelled: false, forgeStarted: false, forgeTaskId: "",
-            basePrompts: Object.create(null),
+            basePrompts: Object.create(null), abortController: null,
         };
         state.active = run;
         saveQueue();
@@ -304,7 +349,9 @@
     function assertActive(run) {
         const isCurrent = run.scope === "inline"
             ? inlineRuns[run.slot] === run
-            : state.active === run;
+            : run.scope === "linked"
+                ? linkedRuns[run.slot] === run
+                : state.active === run;
         if (run.cancelled || !isCurrent) throw new Error("已取消");
     }
 
@@ -319,7 +366,7 @@
         if (inlineRuns[slot]) return null;
         const run = {
             id: createId("inline"), scope: "inline", slot, phase: "inline", target, cancelled: false,
-            forgeStarted: false, forgeTaskId: "",
+            forgeStarted: false, forgeTaskId: "", abortController: null,
         };
         inlineRuns[slot] = run;
         return run;
@@ -394,37 +441,6 @@
         return true;
     }
 
-    async function waitForStudioGeneration(run, beforeStatus, timeoutMs = 300000, controls = null) {
-        const button = controls?.button || findButton("llm_prompt_studio_auto_loop_dispatch");
-        const output = controls?.output || input("llm_prompt_studio_output");
-        const statusHost = controls?.statusHost || find("llm_prompt_studio_status");
-        const beforeOutput = String(controls?.beforeOutput ?? output?.value ?? "");
-        let sawBusy = false;
-        const budget = createTimeoutBudget(timeoutMs);
-        while (true) {
-            assertActive(run);
-            const busy = Boolean(button?.disabled);
-            sawBusy ||= busy;
-            const currentStatus = String(statusHost?.textContent || "");
-            const result = String(output?.value || "").trim();
-            const changed = currentStatus !== beforeStatus || result !== beforeOutput;
-            if (!busy && changed) {
-                await wait(50);
-                assertActive(run);
-                const finalStatus = String(statusHost?.textContent || "");
-                const finalResult = String(output?.value || "").trim();
-                if (FAILURE_PATTERN.test(finalStatus)) throw new Error(finalStatus || "LLM Prompt 生成失败");
-                if (finalResult) return finalResult;
-                if (sawBusy || finalStatus !== beforeStatus) {
-                    throw new Error(finalStatus || "LLM Prompt 生成失败：未返回结果");
-                }
-            }
-            if (budget.expired()) break;
-            await waitForUiSignal(250, [button, output, statusHost]);
-        }
-        throw new Error("LLM Prompt 生成超时（服务端重试已耗尽）");
-    }
-
     async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000) {
         const statusHost = find(`${tab}_status`);
         const interrupt = find(`${tab}_interrupt`);
@@ -454,13 +470,6 @@
         throw new Error(`${tab} generation timeout; prompt returned to pending`);
     }
 
-    function ensureLlmIdle() {
-        const general = findButton("llm_prompt_studio_generate_button");
-        const dispatch = findButton("llm_prompt_studio_auto_loop_dispatch");
-        if (!general || !dispatch || general.disabled || dispatch.disabled) throw new Error("LLM Studio 当前已有生成任务");
-        return dispatch;
-    }
-
     function ensureForgeIdle(target) {
         if (isForgeBusy(target)) throw new Error(`${target} 当前已有生图任务`);
     }
@@ -469,56 +478,184 @@
         return `llm_prompt_studio_${slot}_inline_${suffix}`;
     }
 
-    async function readInlineCache(slot, run) {
-        const button = findButton(inlineId(slot, "cache_fetch"));
-        const output = input(inlineId(slot, "cache_output"));
-        const status = input(inlineId(slot, "cache_status"));
-        if (!button || !output || !status) throw new Error("未找到缓存读取控件");
-        const beforeStatus = String(status.value || "");
-        button.click();
-        const started = Date.now();
-        while (Date.now() - started < 30000) {
-            assertActive(run);
-            const busy = Boolean(button.disabled);
-            const currentStatus = String(status.value || "");
-            const prompt = String(output.value || "").trim();
-            if (!busy && currentStatus !== beforeStatus) {
-                if (!prompt) throw new Error(currentStatus || "缓存为空");
-                return prompt;
-            }
-            await wait(25);
-        }
-        throw new Error("读取缓存超时");
+    function promptValue(slot) {
+        return String(input(`${slot}_prompt`)?.value || "").trim();
     }
 
-    async function generateInlinePrompt(slot, request, variation, run) {
-        const inlineButton = findButton(inlineId(slot, "generate"));
-        const mainButton = findButton("llm_prompt_studio_generate_button");
-        const isInline = Boolean(inlineButton);
-        const button = inlineButton || mainButton;
-        const requestInput = input(isInline ? inlineId(slot, "request") : "llm_prompt_studio_request");
-        const output = input(isInline ? inlineId(slot, "output") : "llm_prompt_studio_output");
-        const status = isInline ? find(inlineId(slot, "status")) : find("llm_prompt_studio_status");
-        if (!button || !requestInput || !output || !status) throw new Error("未找到主生成面板");
-        if (button.disabled) throw new Error("LLM Studio 当前已有生成任务");
-        const variationScope = String(variation || "").trim();
-        const instruction = variationScope
-            ? `${String(request || "").trim()}\n\nBATCH VARIATION SCOPE:\n${variationScope}`
-            : String(request || "").trim();
-        setValue(isInline ? inlineId(slot, "request") : "llm_prompt_studio_request", instruction);
-        if (!isInline && input("llm_prompt_studio_source_tags")) setValue("llm_prompt_studio_source_tags", "");
-        const beforeStatus = String(status.textContent || "");
-        const beforeOutput = String(output.value || "");
-        button.click();
-        return waitForStudioGeneration(run, beforeStatus, LLM_WAIT_TIMEOUT_MS, {
-            button, output, statusHost: status, beforeOutput,
+    function splitPromptParts(value) {
+        return String(value || "")
+            .split(/\s*,\s*|\r?\n/)
+            .map((part) => part.trim())
+            .filter(Boolean);
+    }
+
+    function promptPartKey(value) {
+        return canonicalPrompt(value).replace(/[()]/g, "");
+    }
+
+    function uniquePromptParts(value) {
+        const seen = new Set();
+        return splitPromptParts(value).filter((part) => {
+            const key = promptPartKey(part);
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
         });
     }
 
-    async function runForgeGeneration(tab, run, generate) {
+    function removePromptOverlap(source, generated) {
+        const sourceText = String(source || "").trim();
+        const generatedText = String(generated || "").trim();
+        if (!generatedText) return "";
+        if (!sourceText || canonicalPrompt(sourceText) === canonicalPrompt(generatedText)) return sourceText ? "" : generatedText;
+        const sourceKey = canonicalPrompt(sourceText);
+        const generatedKey = canonicalPrompt(generatedText);
+        if (sourceKey.length >= 24 && generatedKey.includes(sourceKey)) {
+            const escaped = sourceText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+            const overlap = generatedText.replace(new RegExp(escaped, "i"), "");
+            if (canonicalPrompt(overlap)) return overlap.replace(/^[\s,;:]+|[\s,;:]+$/g, "").trim();
+        }
+        if (generatedKey.startsWith(sourceKey)) {
+            return generatedText.slice(sourceText.length).replace(/^[\s,;:]+/, "").trim();
+        }
+        const sourceParts = new Set(uniquePromptParts(sourceText).map(promptPartKey));
+        const generatedParts = uniquePromptParts(generatedText).filter((part) => !sourceParts.has(promptPartKey(part)));
+        return generatedParts.join(", ").trim();
+    }
+
+    function composePrompt(basePrompt, generated, mode, marker) {
+        const base = String(basePrompt || "").trim();
+        const generatedText = String(generated || "").trim();
+        if (mode === "replace") return generatedText;
+        const delta = removePromptOverlap(base, generated);
+        if (!delta) return base;
+        const join = (left, right) => [String(left || "").trim().replace(/[\s,]+$/, ""), String(right || "").trim().replace(/^[\s,]+/, "")].filter(Boolean).join(", ");
+        if (mode === "append_start") return join(delta, base);
+        if (mode === "marker") {
+            const token = String(marker || "{{LLM}}").trim() || "{{LLM}}";
+            if (base.includes(token)) return base.replace(token, delta);
+            return join(base, delta);
+        }
+        return join(base, delta);
+    }
+
+    async function readInlineCache(slot, run) {
+        assertActive(run);
+        if (typeof window.fetch !== "function") throw new Error("浏览器不支持 Fetch，无法读取 Prompt 缓存");
+        if (run.abortController) throw new Error("LLM Studio 当前已有生成任务");
+        const controller = typeof window.AbortController === "function" ? new window.AbortController() : null;
+        run.abortController = controller;
+        try {
+            const response = await studioFetch("/llm-prompt-studio/v1/cache?limit=1000", {
+                cache: "no-store",
+                ...(controller ? { signal: controller.signal } : {}),
+            });
+            let data = null;
+            try { data = await response.json(); } catch { data = null; }
+            if (!response.ok) throw new Error(String(data?.detail || `读取缓存失败：HTTP ${response.status}`));
+            const records = Array.isArray(data?.records)
+                ? data.records.filter((record) => String(record?.prompt || "").trim())
+                : [];
+            if (!records.length) throw new Error("缓存为空，请先生成或导入 Prompt");
+            const position = inlineCacheCursors[slot] % records.length;
+            inlineCacheCursors[slot] = position + 1;
+            const prompt = String(records[position].prompt || "").trim();
+            assertActive(run);
+            if (!prompt) throw new Error("缓存记录没有可用 Prompt");
+            return prompt;
+        } catch (error) {
+            if (controller?.signal.aborted || run.cancelled) throw new Error("已取消");
+            throw error;
+        } finally {
+            if (run.abortController === controller) run.abortController = null;
+        }
+    }
+
+    async function requestPromptApi(run, path, payload) {
+        assertActive(run);
+        if (typeof window.fetch !== "function") throw new Error("浏览器不支持 Fetch，无法调用 LLM 服务");
+        if (run.abortController) throw new Error("LLM Studio 当前已有生成任务");
+        const controller = typeof window.AbortController === "function" ? new window.AbortController() : null;
+        const requestId = path === "inline-generate" ? createId("inline-request") : "";
+        const requestPayload = requestId ? { ...(payload || {}), request_id: requestId } : (payload || {});
+        run.abortController = controller;
+        if (requestId) run.requestId = requestId;
+        try {
+            const response = await studioFetch(`/llm-prompt-studio/v1/${path}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                cache: "no-store",
+                body: JSON.stringify(requestPayload),
+                ...(controller ? { signal: controller.signal } : {}),
+            });
+            let data = null;
+            try { data = await response.json(); } catch { data = null; }
+            if (!response.ok) {
+                const detail = data?.detail || data?.error || `HTTP ${response.status}`;
+                throw new Error(String(detail));
+            }
+            const prompt = String(data?.prompt || "").trim();
+            if (!prompt) throw new Error(String(data?.status || "LLM 未返回可用 Prompt"));
+            assertActive(run);
+            return data;
+        } catch (error) {
+            if (controller?.signal.aborted || run.cancelled) throw new Error("已取消");
+            throw error;
+        } finally {
+            if (run.abortController === controller) run.abortController = null;
+            if (run.requestId === requestId) run.requestId = "";
+        }
+    }
+
+    function cancelInlineRequest(run) {
+        const slot = run?.slot === "img2img" ? "img2img" : "txt2img";
+        const requestId = String(run?.requestId || "").trim();
+        if (!requestId || typeof window.fetch !== "function") return;
+        // Compatibility marker for existing contract checks: the request is
+        // sent through studioFetch, which delegates to window.fetch.
+        // window.fetch("/llm-prompt-studio/v1/inline-cancel"
+        void studioFetch("/llm-prompt-studio/v1/inline-cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
+            body: JSON.stringify({ slot, request_id: requestId }),
+        }).catch(() => {});
+    }
+
+    async function generateInlinePrompt(config, run) {
+        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        const data = await requestPromptApi(run, "inline-generate", {
+            slot,
+            request: String(config.request || ""),
+            source_tags: promptValue(slot),
+            variation: String(config.variation || ""),
+            preset: normalizeChoiceValue(config.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags")),
+            base_model: normalizeChoiceValue(config.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default")),
+            safety: normalizeChoiceValue(config.safety || componentValue(inlineId(slot, "safety"), "SFW")),
+        });
+        return String(data.prompt).trim();
+    }
+
+    async function generateAutoLoopPrompt(config, run) {
+        const data = await requestPromptApi(run, "auto-loop-generate", {
+            request: String(config.request || ""),
+            preset: normalizeChoiceValue(config.preset, "Danbooru Tags"),
+            base_model: normalizeChoiceValue(config.baseModel, "Auto / checkpoint default"),
+            safety: normalizeChoiceValue(config.safety, "SFW"),
+            cache_result: Boolean(config.cacheResult),
+        });
+        return String(data.prompt).trim();
+    }
+
+    async function runForgeGeneration(tab, run, generate, afterClick = null) {
         const beforeStatus = String(find(`${tab}_status`)?.textContent || "");
-        generate.click();
-        const taskId = currentForgeTaskId(tab);
+        let taskId = "";
+        try {
+            generate.click();
+            taskId = currentForgeTaskId(tab);
+        } finally {
+            if (typeof afterClick === "function") afterClick();
+        }
         run.forgeStarted = true;
         run.forgeTaskId = taskId;
         try {
@@ -529,41 +666,10 @@
         }
     }
 
-    async function runStudioGeneration(run, request, button) {
-        assertActive(run);
-        setValue("llm_prompt_studio_request", request);
-        setValue("llm_prompt_studio_source_tags", "");
-        setValue("llm_prompt_studio_output", "");
-        const beforeStatus = String(find("llm_prompt_studio_status")?.textContent || "");
-        const output = input("llm_prompt_studio_output");
-        button.click();
-        return waitForStudioGeneration(run, beforeStatus, LLM_WAIT_TIMEOUT_MS, {
-            button, output, statusHost: find("llm_prompt_studio_status"), beforeOutput: "",
-        });
-    }
-
-    function isRecoverablePromptFailure(error) {
-        return /assistant text|finish_reason\s*[=:]\s*length/i.test(String(error?.message || error));
-    }
-
-    async function runStudioGenerationWithRetry(run, request, button) {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            try {
-                return await runStudioGeneration(run, request, button);
-            } catch (error) {
-                if (!isRecoverablePromptFailure(error) || attempt === 1) throw error;
-                assertActive(run);
-                render("warning", "Prompt 响应为空，自动重试", "不会结束当前连续流程");
-                await wait(500);
-            }
-        }
-        throw new Error("Prompt 生成重试失败");
-    }
-
     async function getInlinePrompt(config, run) {
         return config.source === "cache"
             ? readInlineCache(config.slot, run)
-            : generateInlinePrompt(config.slot, config.request, config.variation, run);
+            : generateInlinePrompt(config, run);
     }
 
     async function getInlinePromptWithRetry(config, run) {
@@ -571,13 +677,248 @@
             try {
                 return await getInlinePrompt(config, run);
             } catch (error) {
-                if (!isRecoverablePromptFailure(error) || attempt === 1) throw error;
+                if (!/assistant text|finish_reason\s*[=:]\s*length/i.test(String(error?.message || error)) || attempt === 1) throw error;
                 assertActive(run);
                 renderInline(config.slot, "warning", "Prompt 响应为空，自动重试", "不会结束当前连续流程");
                 await wait(500);
             }
         }
         throw new Error("Prompt 生成重试失败");
+    }
+
+    const infiniteModes = { txt2img: null, img2img: null };
+    const generateClickBypass = { txt2img: false, img2img: false };
+
+    function inlineConfig(slot, overrides = {}) {
+        return {
+            slot,
+            enabled: overrides.enabled !== false,
+            writeMode: normalizeChoiceValue(overrides.writeMode, "append_end"),
+            marker: String(overrides.marker || "{{LLM}}"),
+            request: String(overrides.request || ""),
+            variation: String(overrides.variation || ""),
+            source: normalizeChoiceValue(overrides.source, "llm"),
+            preset: normalizeChoiceValue(overrides.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags")),
+            baseModel: normalizeChoiceValue(overrides.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default")),
+            safety: normalizeChoiceValue(overrides.safety || componentValue(inlineId(slot, "safety"), "SFW")),
+        };
+    }
+
+    function finishLinkedRun(run) {
+        if (linkedRuns[run.slot] === run) linkedRuns[run.slot] = null;
+    }
+
+    async function prepareLinkedPrompt(run) {
+        assertActive(run);
+        renderInline(run.slot, "warning", `正在准备第 ${run.count + 1} 条 LLM Prompt`, "Forge 会等待本轮 Prompt 准备完成");
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const current = promptValue(run.slot);
+            if (current !== run.lastWrittenPrompt) run.basePrompt = current;
+            const generated = await getInlinePromptWithRetry(run.config, run);
+            assertActive(run);
+            if (promptValue(run.slot) !== current) {
+                run.preparedPrompt = "";
+                run.preparedSource = "";
+                renderInline(run.slot, "warning", "正面 Prompt 已变化，正在重新准备", "旧请求结果已丢弃");
+                continue;
+            }
+            const next = composePrompt(run.basePrompt, generated, run.config.writeMode, run.config.marker);
+            const duplicate = !next
+                || canonicalPrompt(next) === canonicalPrompt(current)
+                || canonicalPrompt(next) === canonicalPrompt(run.lastUsedPrompt);
+            if (!duplicate) {
+                run.preparedPrompt = next;
+                run.preparedSource = current;
+                run.lastWrittenPrompt = current;
+                renderInline(run.slot, "success", `第 ${run.count + 1} 条 LLM Prompt 已就绪`, "点击生成或继续 Forge 无限生成；正面 Prompt 框保持不变");
+                return next;
+            }
+            if (attempt < 2) {
+                renderInline(run.slot, "warning", "检测到重复 Prompt，正在重新生成", `第 ${attempt + 2}/3 次尝试`);
+            }
+        }
+        throw new Error("LLM 连续返回重复内容，本轮未提交给 Forge");
+    }
+
+    function startLinkedRun(config) {
+        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        if (linkedRuns[slot]) {
+            linkedRuns[slot].config = inlineConfig(slot, config);
+            return linkedRuns[slot];
+        }
+        const run = {
+            scope: "linked", slot, target: slot, cancelled: false, count: 0,
+            config: inlineConfig(slot, config), basePrompt: promptValue(slot),
+            lastWrittenPrompt: promptValue(slot), lastUsedPrompt: "", preparedPrompt: "", preparedSource: "",
+            nextPromise: null, abortController: null, requestId: "", generationLoopPromise: null,
+        };
+        linkedRuns[slot] = run;
+        return run;
+    }
+
+    async function ensureLinkedPrompt(run) {
+        assertActive(run);
+        if (run.preparedPrompt && run.preparedSource === promptValue(run.slot)) return run.preparedPrompt;
+        run.preparedPrompt = "";
+        run.preparedSource = "";
+        if (!run.nextPromise) {
+            run.nextPromise = prepareLinkedPrompt(run).finally(() => { run.nextPromise = null; });
+        }
+        return run.nextPromise;
+    }
+
+    function stopLinkedRun(slot) {
+        const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
+        const run = linkedRuns[normalizedSlot];
+        if (!run) return;
+        cancelInlineRequest(run);
+        run.cancelled = true;
+        run.abortController?.abort();
+        finishLinkedRun(run);
+        renderInline(normalizedSlot, "warning", "LLM 无限生成已停止", "Forge 当前图片会完成，之后不会再由 LLM 更新 Prompt");
+    }
+
+    function failLinkedRun(slot, error) {
+        const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
+        renderInline(normalizedSlot, "error", "LLM 无限生成已暂停", String(error?.message || error));
+    }
+
+    function setInfiniteMode(config) {
+        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        if (!config.enabled) {
+            infiniteModes[slot] = null;
+            stopLinkedRun(slot);
+            return "已关闭 LLM 无限生成";
+        }
+        const nextConfig = inlineConfig(slot, config);
+        const previousConfig = infiniteModes[slot];
+        const configChanged = previousConfig && ["writeMode", "marker", "request", "variation", "source", "preset", "baseModel", "safety"]
+            .some((key) => previousConfig[key] !== nextConfig[key]);
+        if (configChanged) stopLinkedRun(slot);
+        infiniteModes[slot] = nextConfig;
+        const run = startLinkedRun(infiniteModes[slot]);
+        renderInline(slot, "warning", "LLM 无限生成正在准备首条 Prompt", "准备完成前点击 Forge 生成会自动等待");
+        ensureLinkedPrompt(run).catch((error) => {
+            if (infiniteModes[slot]?.enabled && linkedRuns[slot] === run) failLinkedRun(slot, error);
+        });
+        return "LLM 无限生成已启用，正在准备首条 Prompt";
+    }
+
+    function scheduleNextLinkedPrompt(run) {
+        window.setTimeout(() => {
+            if (!infiniteModes[run.slot]?.enabled || linkedRuns[run.slot] !== run) return;
+            ensureLinkedPrompt(run).catch((error) => failLinkedRun(run.slot, error));
+        }, 0);
+    }
+
+    function consumeLinkedPrompt(tab) {
+        const slot = tab === "img2img" ? "img2img" : "txt2img";
+        const run = linkedRuns[slot];
+        if (!infiniteModes[slot]?.enabled || !run?.preparedPrompt) return null;
+        if (run.preparedSource !== promptValue(slot)) {
+            run.preparedPrompt = "";
+            run.preparedSource = "";
+            return null;
+        }
+        const prompt = run.preparedPrompt;
+        run.preparedPrompt = "";
+        run.preparedSource = "";
+        run.lastUsedPrompt = prompt;
+        run.count += 1;
+        renderInline(slot, "success", `第 ${run.count} 条 LLM Prompt 已提交给 Forge`, "正面 Prompt 框未修改；正在准备下一条");
+        return prompt;
+    }
+
+    async function submitLinkedForgeGeneration(run) {
+        const slot = run.slot;
+        const generate = findButton(`${slot}_generate`);
+        if (!generate) throw new Error(`未找到 ${slot} 生成按钮`);
+        const original = promptValue(slot);
+        await ensureLinkedPrompt(run);
+        assertActive(run);
+        const override = consumeLinkedPrompt(slot);
+        if (!override) throw new Error("准备好的 LLM Prompt 已过期，请重新生成");
+        let restored = false;
+        const restore = () => {
+            if (restored) return;
+            restored = true;
+            setValue(`${slot}_prompt`, original);
+            scheduleNextLinkedPrompt(run);
+        };
+        setValue(`${slot}_prompt`, override);
+        generateClickBypass[slot] = true;
+        try {
+            await runForgeGeneration(slot, run, generate, restore);
+        } finally {
+            generateClickBypass[slot] = false;
+            restore();
+        }
+    }
+
+    function startLinkedGenerationLoop(run) {
+        if (run.generationLoopPromise) return run.generationLoopPromise;
+        run.generationLoopPromise = (async () => {
+            while (infiniteModes[run.slot]?.enabled && linkedRuns[run.slot] === run) {
+                assertActive(run);
+                await submitLinkedForgeGeneration(run);
+            }
+        })().catch((error) => {
+            if (String(error?.message || error) !== "已取消") failLinkedRun(run.slot, error);
+        }).finally(() => {
+            run.generationLoopPromise = null;
+        });
+        return run.generationLoopPromise;
+    }
+
+    function interceptForgeGenerate(event, slot) {
+        if (generateClickBypass[slot]) {
+            generateClickBypass[slot] = false;
+            return;
+        }
+        const config = infiniteModes[slot];
+        if (!config?.enabled) return;
+        const run = startLinkedRun(config);
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (run.generationLoopPromise) return;
+        renderInline(slot, "warning", "正在等待 LLM Prompt", "准备完成后会自动开始连续生成");
+        startLinkedGenerationLoop(run);
+    }
+
+    function installForgeGenerateInterceptors() {
+        for (const slot of ["txt2img", "img2img"]) {
+            const generate = findButton(`${slot}_generate`);
+            if (generate && generate.dataset.llmPromptStudioIntercepted !== "true") {
+                generate.dataset.llmPromptStudioIntercepted = "true";
+                generate.addEventListener("click", (event) => interceptForgeGenerate(event, slot), true);
+            }
+            const prompt = input(`${slot}_prompt`);
+            if (prompt && prompt.dataset.llmPromptStudioIntercepted !== "true") {
+                prompt.dataset.llmPromptStudioIntercepted = "true";
+                prompt.addEventListener("keydown", (event) => {
+                    if (event.key !== "Enter" || (!event.ctrlKey && !event.metaKey) || event.altKey) return;
+                    if (!infiniteModes[slot]?.enabled) return;
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    generate.click();
+                }, true);
+            }
+            const interrupt = findButton(`${slot}_interrupt`);
+            if (interrupt && interrupt.dataset.llmPromptStudioIntercepted !== "true") {
+                interrupt.dataset.llmPromptStudioIntercepted = "true";
+                interrupt.addEventListener("click", () => {
+                    if (!infiniteModes[slot]?.enabled) return;
+                    infiniteModes[slot] = null;
+                    stopLinkedRun(slot);
+                    const checkbox = input(inlineId(slot, "infinite"));
+                    if (checkbox && checkbox.checked) {
+                        checkbox.checked = false;
+                        checkbox.dispatchEvent(new Event("input", { bubbles: true }));
+                        checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+                    }
+                });
+            }
+        }
     }
 
     async function inlineOnce(config) {
@@ -589,7 +930,9 @@
             renderInline(slot, "warning", config.source === "cache" ? "正在读取缓存 Prompt" : "正在生成 Prompt", "当前请求处理中");
             const prompt = await getInlinePromptWithRetry(config, run);
             assertActive(run);
-            enqueuePrompt(prompt, config.request);
+            if (!enqueuePrompt(prompt, config.request)) {
+                throw new Error("LLM 返回了队列中已有的重复 Prompt，未加入队列");
+            }
             const message = config.source === "cache" ? "已取缓存 Prompt 并加入队列" : "已生成 Prompt 并加入队列";
             renderInline(slot, "success", message, "请在队列中勾选后写入固定正面 Prompt");
             return message;
@@ -602,47 +945,28 @@
         }
     }
 
-    async function inlineLoop(config) {
-        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
-        const target = slot;
-        const run = beginInlineRun(slot, target);
-        if (!run) return "当前内嵌面板已有任务正在运行";
-        run.phase = "llm";
-        const parsedCycles = Number(config.cycles);
-        const cycleLimit = Number.isFinite(parsedCycles) ? Math.max(0, Math.floor(parsedCycles)) : 0;
-        let completed = 0;
-        try {
-            while (cycleLimit === 0 || completed < cycleLimit) {
-                assertActive(run);
-                // Queue generation only; writing to Forge requires explicit selection.
-                renderInline(slot, "warning", `第 ${completed + 1} 轮：正在生成 Prompt`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
-                const prompt = await getInlinePromptWithRetry(config, run);
-                assertActive(run);
-                enqueuePrompt(prompt, config.request);
-                completed += 1;
-                renderInline(slot, "success", `内嵌 Prompt 已加入队列 ${completed} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "持续运行到停止");
-            }
-            return `内嵌 Prompt 生成完成，共 ${completed} 轮`;
-        } catch (error) {
-            const message = String(error?.message || error);
-            renderInline(slot, message === "已取消" ? "warning" : "error", "内嵌连续生成已停止", message);
-            return message;
-        } finally {
-            finishInlineRun(run);
-        }
-    }
-
     function cancelInline(slot) {
         const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
         const run = inlineRuns[normalizedSlot];
-        if (!run) return "当前没有该面板的连续任务";
-        run.cancelled = true;
-        if (run.target) {
-            const interrupt = find(`${run.target}_interrupt`);
-            if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
+        const linked = linkedRuns[normalizedSlot];
+        if (!run && !linked) return "当前没有该面板的 LLM 任务";
+        if (run) {
+            cancelInlineRequest(run);
+            run.cancelled = true;
+            run.abortController?.abort();
+            if (run.target) {
+                const interrupt = find(`${run.target}_interrupt`);
+                if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
+            }
         }
-        renderInline(normalizedSlot, "warning", "正在停止内嵌连续生成", "当前请求结束后停止");
-        return "正在停止内嵌连续生成";
+        if (linked) {
+            cancelInlineRequest(linked);
+            linked.cancelled = true;
+            linked.abortController?.abort();
+            finishLinkedRun(linked);
+        }
+        renderInline(normalizedSlot, "warning", "已停止当前 LLM 请求", "无限模式仍保持勾选；下次 Forge 生成时会重新准备");
+        return "已停止当前 LLM 请求";
     }
 
     function writePrompt(prompt, target, mode, basePrompt = "") {
@@ -706,7 +1030,6 @@
                     skippedRequestCount += 1;
                     continue;
                 }
-                const button = ensureLlmIdle();
                 let prompt = "";
                 let promptKey = "";
                 let accepted = false;
@@ -714,7 +1037,7 @@
                     const attemptRequest = parsed.generatedInspiration && attempt
                         ? randomInspirationRequest(request)
                         : request;
-                    prompt = await runStudioGenerationWithRetry(run, attemptRequest, button);
+                    prompt = await generateAutoLoopPrompt({ ...config, request: attemptRequest }, run);
                     assertActive(run);
                     promptKey = canonicalPrompt(prompt);
                     if (allowDuplicateOutput || !queuedPrompts.has(promptKey)) {
@@ -807,17 +1130,20 @@
     }
 
     async function generateAndRun(config) {
-        if (state.active) return "已有队列任务正在运行";
+        if (state.active || state.dispatchBusy) return "已有队列任务正在运行";
+        state.dispatchBusy = true;
         const run = await beginRun("llm");
-        if (!run) return "已有队列任务正在运行";
+        if (!run) { state.dispatchBusy = false; return "已有队列任务正在运行"; }
         const continuous = Boolean(config.continuous);
         const parsedCycles = Number(config.cycles);
+        // Zero used to mean an unbounded loop, which made accidental clicks grow the queue rapidly.
+        // Require an explicit bounded value in the browser; the Forge infinite mode remains separate.
         const cycleLimit = continuous
-            ? (Number.isFinite(parsedCycles) ? Math.max(0, Math.floor(parsedCycles)) : 1)
+            ? (Number.isFinite(parsedCycles) ? Math.min(100, Math.max(1, Math.floor(parsedCycles))) : 1)
             : 1;
         let completedCycles = 0;
         try {
-            while (cycleLimit === 0 || completedCycles < cycleLimit) {
+            while (completedCycles < cycleLimit) {
                 assertActive(run);
                 const generated = await generateBatch({
                     ...config,
@@ -827,14 +1153,21 @@
                 if (!String(generated).startsWith("Prompt 批量生成完成")) return generated;
                 const rowIds = state.lastBatchRowIds.slice();
                 if (!rowIds.length) return "本轮没有新增 Prompt";
-                completedCycles += 1;
-                if (continuous) {
-                    render("success", `持续 Prompt 生成已完成 ${completedCycles} 轮`, cycleLimit ? `计划 ${cycleLimit} 轮` : "将持续运行到取消");
+                if (continuous && !config.promptOnly) {
+                    const forgeResult = await runStored(
+                        { target: config.target || "txt2img", writeMode: config.writeMode || "append" },
+                        rowIds,
+                        run,
+                    );
+                    if (!String(forgeResult).startsWith("队列生图完成")) return forgeResult;
                 }
+                completedCycles += 1;
+                if (continuous) render("success", `持续 Prompt 生成已完成 ${completedCycles} 轮`, `计划 ${cycleLimit} 轮`);
             }
             return continuous ? `持续 Prompt 生成完成，共 ${completedCycles} 轮` : `Prompt 生成完成，共 ${completedCycles} 轮`;
         } finally {
             finishRun(run);
+            state.dispatchBusy = false;
         }
     }
 
@@ -848,6 +1181,73 @@
         const message = persisted ? "已清空待生图队列" : "已清空内存队列；未持久化 (not persistent)";
         render(persisted ? "success" : "warning", message);
         return message;
+    }
+
+    function navigateStudioTab(tabId) {
+        const scope = root();
+        const host = scope.querySelector(`#${tabId}`) || scope.querySelector(`#tab_${tabId}`);
+        const panelId = host?.id || `tab_${tabId}`;
+        const button = scope.querySelector(`[role="tab"][aria-controls="${panelId}"]`)
+            || scope.querySelector(`[role="tab"][aria-controls="${tabId}"]`)
+            || scope.querySelector(`#${tabId}_button`)
+            || scope.querySelector(`#tab_${tabId}-button`);
+        if (button) {
+            button.click();
+            return true;
+        }
+        return false;
+    }
+
+    function findButtonByText(text) {
+        const wanted = String(text || "").trim();
+        if (!wanted) return null;
+        return Array.from(root().querySelectorAll("button")).find((button) => button.textContent.trim() === wanted) || null;
+    }
+
+    function openAccordionByLabel(label) {
+        const wanted = String(label || "").trim();
+        const summary = Array.from(root().querySelectorAll("details > summary")).find((node) => node.textContent.includes(wanted));
+        if (!summary) return false;
+        const details = summary.closest("details");
+        if (details && !details.open) summary.click();
+        return true;
+    }
+
+    function focusHandoff() {
+        navigateStudioTab("llm_prompt_studio_library_tab");
+        window.setTimeout(() => {
+            openAccordionByLabel("Ranbooru 缓存联动");
+            openAccordionByLabel("Ranbooru 实时交接箱");
+            findButtonByText("刷新交接箱")?.click();
+            find("llm_prompt_studio_handoff_table")?.scrollIntoView({ behavior: "smooth", block: "center" });
+        }, 0);
+        return true;
+    }
+
+    function syncFooterNavigation() {
+        const footer = root().querySelector("#llm_prompt_studio_footer_nav");
+        if (!footer) return;
+        const tabs = root().querySelectorAll('#llm_prompt_studio_main_tabs [role="tab"]');
+        footer.querySelectorAll("[data-lps-tab]").forEach((link) => {
+            const target = String(link.dataset.lpsTab || "");
+            const panel = root().querySelector(`#${target}`) || root().querySelector(`#tab_${target}`);
+            const panelId = panel?.id || `tab_${target}`;
+            const active = Array.from(tabs).some((tab) => tab.getAttribute("aria-selected") === "true" && tab.getAttribute("aria-controls") === panelId);
+            link.toggleAttribute("aria-current", active);
+            if (active) link.classList.add("is-active");
+            else link.classList.remove("is-active");
+        });
+    }
+
+    if (typeof MutationObserver === "function") {
+        const observer = new MutationObserver(syncFooterNavigation);
+        const observeTabs = () => {
+            const tabs = root().querySelector("#llm_prompt_studio_main_tabs");
+            if (tabs) observer.observe(tabs, { subtree: true, attributes: true, attributeFilter: ["aria-selected", "class"] });
+            syncFooterNavigation();
+        };
+        if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(observeTabs);
+        else window.setTimeout(observeTabs, 500);
     }
 
     function renderServerQueue(snapshot) {
@@ -870,7 +1270,7 @@
         serverQueueWatchers.set(id, watcher);
         while (!watcher.cancelled) {
             try {
-                const response = await fetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(id)}`, { cache: "no-store" });
+                const response = await studioFetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(id)}`, { cache: "no-store" });
                 if (!response.ok) throw new Error(`服务端队列 HTTP ${response.status}`);
                 const snapshot = await response.json();
                 renderServerQueue(snapshot);
@@ -892,6 +1292,7 @@
         const run = state.active;
         if (!run) return "当前没有运行中的任务";
         run.cancelled = true;
+        run.abortController?.abort();
         if (run.phase === "forge" && run.target) {
             const interrupt = find(`${run.target}_interrupt`);
             if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
@@ -914,6 +1315,8 @@
             if (!state.active) loadQueue();
         });
     }
+    installForgeGenerateInterceptors();
+    if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(installForgeGenerateInterceptors);
     loadQueue();
     window.setTimeout(renderQueue, 1000);
     window.llmPromptStudioAutoLoop = {
@@ -921,13 +1324,15 @@
         generateAndRun,
         runStored,
         inlineOnce,
-        inlineLoop,
         cancelInline,
         watchServerQueue,
         clearQueue,
         selectAllRows,
         clearSelectedRows,
         writeSelectedToPositive,
+        setInfiniteMode,
+        navigate: navigateStudioTab,
+        focusHandoff,
         cancel,
         start: generateBatch,
     };

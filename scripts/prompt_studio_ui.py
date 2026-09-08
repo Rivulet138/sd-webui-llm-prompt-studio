@@ -9,6 +9,7 @@ import logging
 import random
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -22,7 +23,7 @@ from starlette.requests import Request
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, MODEL_QUALITY_GUIDANCE, PRESETS, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_system_prompt, build_user_message, build_operation_instruction, call_llm, get_provider_profile, is_english_prompt, is_sfw_output,
-    LLMRequestError,
+    LLMRequestError, discover_provider_models,
     discover_ranbooru_cache, load_ranbooru_cache, process_tags,
     regional_format, validate_endpoint, _cosine, _tokens,
 )
@@ -41,8 +42,12 @@ DEFAULT_LLM_SETTINGS = {
     "timeout": 90,
     "max_tokens": 8096,
     "send_temperature": True,
+    "retry_count": 2,
+    "fallback_model": "",
+    "weights_path": "",
+    "model_version": "",
 }
-LLM_CONNECTION_SETTINGS_VERSION = 4
+LLM_CONNECTION_SETTINGS_VERSION = 6
 GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创作一条全新、独立成图的日系插画方向。
 
 保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
@@ -122,6 +127,9 @@ Use long but clear English sentences to confirm the subject's appearance, clothi
 
 MASTER DESCRIPTION
 Write one high-density natural-language paragraph that recombines all important details. Emphasize layered decoration, movement, camera, light, material texture, color relationships, depth, and the small story implied by the frame. Do not make it a short summary."""
+INLINE_DELTA_DIRECTIVE = """INLINE PROMPT UPDATE MODE:
+The current fixed positive Prompt is supplied as the source. Read it carefully and preserve its identity, LoRA, weights, safety limits, and explicit visual anchors. The caller will merge your answer back into that same Prompt before the next image.
+Return one complete, directly usable Prompt in the selected output format, but avoid repeating source fragments that are already present. Change only the requested visual dimensions and add concrete visible detail that is compatible with the source. Never echo the source Prompt twice, never mention this instruction, and never output multiple alternatives."""
 PRESET_UI_CHOICES = [
     ("Danbooru 标签", "Danbooru Tags"),
     ("Danbooru 标签 + 自然语言", "Danbooru + Natural"),
@@ -138,14 +146,53 @@ MODEL_UI_CHOICES = [
     ("Anima", "Anima"),
     ("Krea 2", "Krea 2"),
 ]
+PRESET_VALUE_ALIASES = {label: value for label, value in PRESET_UI_CHOICES}
+BASE_MODEL_VALUE_ALIASES = {label: value for label, value in MODEL_UI_CHOICES}
+
+
+def _canonical_preset(value: Any) -> str:
+    """Accept both Gradio's localized label and the stored API value."""
+    text = str(value or "").strip()
+    return PRESET_VALUE_ALIASES.get(text, text)
+
+
+def _canonical_base_model(value: Any) -> str:
+    text = str(value or "").strip()
+    return BASE_MODEL_VALUE_ALIASES.get(text, text)
+
+
 OUTPUT_UI_CHOICES = [
     ("普通提示词", "Plain Prompt"),
     ("Regional JSON", "Regional JSON"),
     ("Regional Markdown", "Regional Markdown"),
 ]
 PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
+OUTPUT_VALUE_ALIASES = {label: value for label, value in OUTPUT_UI_CHOICES}
+PROVIDER_VALUE_ALIASES = {label: value for label, value in PROVIDER_UI_CHOICES}
 ACTION_UI_CHOICES = [("格式转换", "Convert"), ("扩写", "Expand"), ("润色", "Polish")]
 JSON_VARIATION_MODE_CHOICES = [("多样灵感", "independent"), ("保留原意转换", "faithful")]
+ACTION_VALUE_ALIASES = {label: value for label, value in ACTION_UI_CHOICES}
+VARIATION_MODE_VALUE_ALIASES = {label: value for label, value in JSON_VARIATION_MODE_CHOICES}
+
+
+def _canonical_output_mode(value: Any) -> str:
+    text = str(value or "").strip()
+    return OUTPUT_VALUE_ALIASES.get(text, text)
+
+
+def _canonical_provider(value: Any) -> str:
+    text = str(value or "").strip()
+    return PROVIDER_VALUE_ALIASES.get(text, text)
+
+
+def _canonical_action(value: Any) -> str:
+    text = str(value or "").strip()
+    return ACTION_VALUE_ALIASES.get(text, text)
+
+
+def _canonical_variation_mode(value: Any) -> str:
+    text = str(value or "").strip()
+    return VARIATION_MODE_VALUE_ALIASES.get(text, text)
 PRESET_BASE_MODEL_DEFAULTS = {
     "NoobAI Tags": "NoobAI",
     "Anima Tags": "Anima",
@@ -215,6 +262,12 @@ _BATCH_CONTROL_LOCK = threading.Lock()
 _BATCH_ACTIVE_TASK_ID = ""
 _AUTO_LOOP_CANCEL = threading.Event()
 _INLINE_CANCEL_EVENTS = {"txt2img": threading.Event(), "img2img": threading.Event()}
+_INLINE_REQUEST_LOCKS = {"txt2img": threading.Lock(), "img2img": threading.Lock()}
+_INLINE_REQUEST_CONTROL_LOCK = threading.Lock()
+_INLINE_REQUEST_EVENTS: dict[tuple[str, str], threading.Event] = {}
+_INLINE_CANCELLED_REQUESTS: dict[tuple[str, str], float] = {}
+_INLINE_ACTIVE_REQUEST_IDS = {"txt2img": "", "img2img": ""}
+_INLINE_CANCEL_TTL_SECONDS = 600.0
 _VARIATION_DIMENSIONS = (
     "action and expression",
     "clothing and accessory identity",
@@ -435,11 +488,25 @@ def _png_batch_cancel_event(cancel_id: str = "") -> tuple[str, threading.Event]:
         event = _PNG_BATCH_CANCEL_EVENTS.setdefault(key, threading.Event())
     return key, event
 _SERVER_QUEUE_WAKE = threading.Event()
-_SERVER_QUEUE_CANCEL = threading.Event()
-_SERVER_QUEUE_CANCEL_BATCHES: set[str] = set()
+_SERVER_QUEUE_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _SERVER_QUEUE_CANCEL_LOCK = threading.Lock()
 _SERVER_QUEUE_THREAD: threading.Thread | None = None
 _SERVER_QUEUE_START_LOCK = threading.Lock()
+
+
+def _server_queue_cancel_event(batch_id: str) -> threading.Event:
+    key = str(batch_id or "").strip()
+    with _SERVER_QUEUE_CANCEL_LOCK:
+        return _SERVER_QUEUE_CANCEL_EVENTS.setdefault(key, threading.Event())
+
+
+def _release_server_queue_cancel_event(batch_id: str) -> None:
+    key = str(batch_id or "").strip()
+    records = DB.list_server_queue(key, 2000)
+    if records and any(record["status"] in {"pending", "running"} for record in records):
+        return
+    with _SERVER_QUEUE_CANCEL_LOCK:
+        _SERVER_QUEUE_CANCEL_EVENTS.pop(key, None)
 
 
 def _server_queue_snapshot(batch_id: str, limit: int = 500) -> dict[str, Any]:
@@ -504,14 +571,12 @@ def _server_queue_worker() -> None:
             _SERVER_QUEUE_WAKE.wait(1.0)
             _SERVER_QUEUE_WAKE.clear()
             continue
-        with _SERVER_QUEUE_CANCEL_LOCK:
-            batch_cancelled = job["batch_id"] in _SERVER_QUEUE_CANCEL_BATCHES
-        if _SERVER_QUEUE_CANCEL.is_set() or batch_cancelled:
+        cancel_event = _server_queue_cancel_event(job["batch_id"])
+        if cancel_event.is_set():
             DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消")
-            _SERVER_QUEUE_CANCEL.clear()
+            _release_server_queue_cancel_event(job["batch_id"])
             continue
         config = dict(job.get("config") or {})
-        cancel_event = _SERVER_QUEUE_CANCEL
         try:
             batch_id = str(job.get("batch_id") or "")
             if batch_id not in batch_histories and len(batch_histories) >= 32:
@@ -536,7 +601,7 @@ def _server_queue_worker() -> None:
             )
             if cancel_event.is_set():
                 DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消")
-                cancel_event.clear()
+                _release_server_queue_cancel_event(job["batch_id"])
                 continue
             if not generated:
                 raise RuntimeError(status or "LLM 未返回 Prompt")
@@ -548,11 +613,9 @@ def _server_queue_worker() -> None:
             DB.update_server_queue_job(job["id"], "completed", prompt=generated)
         except Exception as error:
             LOGGER.exception("server queue job failed: %s", job["id"])
-            with _SERVER_QUEUE_CANCEL_LOCK:
-                batch_cancelled = job["batch_id"] in _SERVER_QUEUE_CANCEL_BATCHES
-            DB.update_server_queue_job(job["id"], "cancelled" if cancel_event.is_set() or batch_cancelled else "error", error=str(error))
-            if cancel_event.is_set():
-                cancel_event.clear()
+            DB.update_server_queue_job(job["id"], "cancelled" if cancel_event.is_set() else "error", error=str(error))
+        finally:
+            _release_server_queue_cancel_event(job["batch_id"])
 
 
 def _ensure_server_queue_worker() -> None:
@@ -561,7 +624,6 @@ def _ensure_server_queue_worker() -> None:
         if _SERVER_QUEUE_THREAD and _SERVER_QUEUE_THREAD.is_alive():
             return
         DB.recover_server_queue()
-        _SERVER_QUEUE_CANCEL.clear()
         _SERVER_QUEUE_THREAD = threading.Thread(target=_server_queue_worker, name="llm-prompt-studio-server-queue", daemon=True)
         _SERVER_QUEUE_THREAD.start()
 
@@ -594,8 +656,6 @@ def _enqueue_server_queue(payload: dict[str, Any]) -> dict[str, Any]:
     merged.update({key: value for key, value in config.items() if key in merged and key not in {"provider", "endpoint", "model"}})
     merged["preset"], _preset_aligned = _aligned_preset(merged["preset"], merged["base_model"])
     batch_id = uuid.uuid4().hex
-    with _SERVER_QUEUE_CANCEL_LOCK:
-        _SERVER_QUEUE_CANCEL_BATCHES.discard(batch_id)
     count = DB.enqueue_server_queue(batch_id, [
         {"request": request, "position": index, "target": merged["target"], "config": merged}
         for index, request in enumerate(requests, start=1)
@@ -633,10 +693,9 @@ def _server_queue_refresh_ui(batch_id: str):
 
 
 def _server_queue_cancel_ui(batch_id: str):
-    with _SERVER_QUEUE_CANCEL_LOCK:
-        _SERVER_QUEUE_CANCEL_BATCHES.add(str(batch_id or ""))
-    _SERVER_QUEUE_CANCEL.set()
+    _server_queue_cancel_event(batch_id).set()
     DB.cancel_server_queue(batch_id)
+    _release_server_queue_cancel_event(batch_id)
     snapshot = _server_queue_snapshot(batch_id)
     return snapshot["status"] + "；已请求取消", _server_queue_html(snapshot)
 
@@ -663,11 +722,13 @@ def _cache_choices(records: list[dict[str, Any]]) -> list[tuple[str, str]]:
 
 
 def _cache_records(query: str = "", min_score: float = 0, output_mode: str = "全部", base_model: str = "全部") -> list[dict[str, Any]]:
+    normalized_output_mode = _canonical_preset(output_mode)
+    normalized_base_model = _canonical_base_model(base_model)
     return DB.list_prompts(
         str(query or ""),
         min_score=float(min_score or 0),
-        output_mode="" if output_mode == "全部" else str(output_mode or ""),
-        base_model="" if base_model == "全部" else str(base_model or ""),
+        output_mode="" if normalized_output_mode == "全部" else normalized_output_mode,
+        base_model="" if normalized_base_model == "全部" else normalized_base_model,
     )
 
 
@@ -702,6 +763,10 @@ def _safe_error(error: Exception) -> str:
 def _ranbooru_link_settings() -> dict[str, Any]:
     stored = DB.get_setting("ranbooru_link_v1", {}) or {}
     values = {**RANBOORU_LINK_DEFAULTS, **(stored if isinstance(stored, dict) else {})}
+    values["tag_output_mode"] = _canonical_preset(values["tag_output_mode"])
+    values["natural_output_mode"] = _canonical_preset(values["natural_output_mode"])
+    values["tag_base_model"] = _canonical_base_model(values["tag_base_model"])
+    values["natural_base_model"] = _canonical_base_model(values["natural_base_model"])
     if values["content_mode"] not in {value for _, value in RANBOORU_CONTENT_CHOICES}:
         values["content_mode"] = RANBOORU_LINK_DEFAULTS["content_mode"]
     if values["rating_filter"] not in {value for _, value in RANBOORU_RATING_CHOICES}:
@@ -735,10 +800,10 @@ def _save_ranbooru_link_settings(
         "rating_filter": rating_filter,
         "min_source_score": max(0, int(min_source_score or 0)),
         "source_limit": max(0, min(int(source_limit or 0), DB.MAX_IMPORT_RECORDS)),
-        "tag_output_mode": tag_output_mode,
-        "tag_base_model": tag_base_model,
-        "natural_output_mode": natural_output_mode,
-        "natural_base_model": natural_base_model,
+        "tag_output_mode": _canonical_preset(tag_output_mode),
+        "tag_base_model": _canonical_base_model(tag_base_model),
+        "natural_output_mode": _canonical_preset(natural_output_mode),
+        "natural_base_model": _canonical_base_model(natural_base_model),
     }
     DB.set_setting("ranbooru_link_v1", values)
     return "Ranbooru 联动参数已保存，下次打开界面会自动填入。"
@@ -759,6 +824,9 @@ def _workflow_settings() -> dict[str, Any]:
         stored_version = 0
     stored_values = stored if isinstance(stored, dict) else {}
     values = {key: stored_values.get(key, default) for key, default in WORKFLOW_DEFAULTS.items()}
+    values["preset"] = _canonical_preset(values["preset"])
+    values["base_model"] = _canonical_base_model(values["base_model"])
+    values["structured_mode"] = _canonical_output_mode(values["structured_mode"])
     if stored_version < 2:
         values["batch_skip_existing"] = False
     preset_values = {value for _, value in PRESET_UI_CHOICES}
@@ -836,9 +904,10 @@ def _save_workflow_settings(
     wd_endpoint, wd_model, wd_threshold, wildcard_path,
 ):
     return _save_workflow_values({
-        "preset": preset, "system_override": system_override, "base_model": base_model,
+        "preset": _canonical_preset(preset), "system_override": system_override,
+        "base_model": _canonical_base_model(base_model),
         "safety": safety, "nsfw_injection": nsfw_injection, "user_instruction": user_instruction,
-        "structured_mode": structured_mode, "region_count": int(region_count or 1),
+        "structured_mode": _canonical_output_mode(structured_mode), "region_count": int(region_count or 1),
         "remove_bad": bool(remove_bad), "remove_terms": remove_terms, "shuffle": bool(shuffle),
         "spaces": bool(spaces), "max_tags": int(max_tags or 0),
         "save_score": float(save_score or 0), "cache_result": bool(cache_result),
@@ -864,9 +933,47 @@ def _reset_workflow_settings():
 
 
 def _connection_store() -> dict[str, Any]:
-    DB.delete_setting("llm_connection")
     stored = DB.get_setting("llm_connections_v2", {}) or {}
     if isinstance(stored, dict) and isinstance(stored.get("providers"), dict):
+        try:
+            stored_version = int(stored.get("version") or LLM_CONNECTION_SETTINGS_VERSION)
+        except (TypeError, ValueError):
+            stored_version = LLM_CONNECTION_SETTINGS_VERSION
+        providers = {
+            _canonical_provider(provider): values
+            for provider, values in stored["providers"].items()
+            if _canonical_provider(provider) in PROVIDER_PROFILES and isinstance(values, dict)
+        }
+        active_provider = _canonical_provider(stored.get("active_provider") or DEFAULT_LLM_SETTINGS["provider"])
+        normalized = {
+            "version": stored_version,
+            "active_provider": active_provider if active_provider in PROVIDER_PROFILES else DEFAULT_LLM_SETTINGS["provider"],
+            "providers": providers,
+        }
+        if normalized != stored:
+            DB.set_setting("llm_connections_v2", normalized)
+        DB.delete_setting("llm_connection")
+        return normalized
+    legacy = DB.get_setting("llm_connection", {}) or {}
+    if isinstance(legacy, dict) and legacy:
+        provider = _canonical_provider(legacy.get("provider") or DEFAULT_LLM_SETTINGS["provider"])
+        if provider not in PROVIDER_PROFILES:
+            provider = DEFAULT_LLM_SETTINGS["provider"]
+        migrated = {
+            key: legacy[key]
+            for key in (
+                "endpoint", "model", "temperature", "timeout", "max_tokens", "send_temperature", "retry_count",
+                "fallback_model", "weights_path", "model_version",
+            )
+            if key in legacy
+        }
+        stored = {
+            "version": LLM_CONNECTION_SETTINGS_VERSION,
+            "active_provider": provider,
+            "providers": {provider: migrated},
+        }
+        DB.set_setting("llm_connections_v2", stored)
+        DB.delete_setting("llm_connection")
         return stored
     provider = DEFAULT_LLM_SETTINGS["provider"]
     return {"version": 2, "active_provider": provider, "providers": {}}
@@ -874,7 +981,7 @@ def _connection_store() -> dict[str, Any]:
 
 def _connection_settings(provider: str | None = None) -> dict[str, Any]:
     store = _connection_store()
-    provider = str(provider or store.get("active_provider") or DEFAULT_LLM_SETTINGS["provider"])
+    provider = _canonical_provider(provider or store.get("active_provider") or DEFAULT_LLM_SETTINGS["provider"])
     if provider not in PROVIDER_PROFILES:
         provider = DEFAULT_LLM_SETTINGS["provider"]
     profile = get_provider_profile(provider)
@@ -903,6 +1010,10 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         max_tokens = max(0, min(int(saved_max_tokens), 262144))
     except (TypeError, ValueError):
         max_tokens = DEFAULT_LLM_SETTINGS["max_tokens"]
+    try:
+        retry_count = max(0, min(int(saved.get("retry_count", DEFAULT_LLM_SETTINGS["retry_count"])), 5))
+    except (TypeError, ValueError):
+        retry_count = DEFAULT_LLM_SETTINGS["retry_count"]
     if migrated_max_tokens:
         providers = dict(store.get("providers", {}))
         migrated = dict(saved)
@@ -920,6 +1031,10 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         "timeout": timeout,
         "max_tokens": max_tokens,
         "send_temperature": bool(saved.get("send_temperature", profile["send_temperature"])),
+        "retry_count": retry_count,
+        "fallback_model": str(saved.get("fallback_model") or ""),
+        "weights_path": str(saved.get("weights_path") or ""),
+        "model_version": str(saved.get("model_version") or ""),
     }
 
 
@@ -933,18 +1048,22 @@ def _credential_status(provider: str, endpoint: str) -> str:
 
 def _load_provider_settings(provider):
     settings = _connection_settings(provider)
+    model_choices = [settings["model"]] if settings["model"] else []
     return (
-        settings["endpoint"], settings["model"], settings["temperature"], settings["timeout"],
-        settings["max_tokens"], settings["send_temperature"],
+        settings["endpoint"], gr.update(choices=model_choices, value=settings["model"]), settings["fallback_model"],
+        settings["weights_path"], settings["model_version"], settings["temperature"], settings["timeout"],
+        settings["max_tokens"], settings["send_temperature"], settings["retry_count"],
         _credential_status(settings["provider"], settings["endpoint"]),
     )
 
 
 def _load_active_connection_settings():
     settings = _connection_settings()
+    model_choices = [settings["model"]] if settings["model"] else []
     return (
-        settings["provider"], settings["endpoint"], settings["model"], settings["temperature"],
-        settings["timeout"], settings["max_tokens"], settings["send_temperature"],
+        settings["provider"], settings["endpoint"], gr.update(choices=model_choices, value=settings["model"]),
+        settings["fallback_model"], settings["weights_path"], settings["model_version"], settings["temperature"],
+        settings["timeout"], settings["max_tokens"], settings["send_temperature"], settings["retry_count"],
         _credential_status(settings["provider"], settings["endpoint"]),
     )
 
@@ -1011,7 +1130,8 @@ def _save_record(record_id, prompt, negative, output_mode, base_model, score, ta
     if not str(prompt).strip():
         return "提示词不能为空", gr.update(), gr.update()
     saved_id = DB.save_prompt(
-        str(prompt).strip(), str(negative or ""), output_mode, base_model, float(score or 0),
+        str(prompt).strip(), str(negative or ""), _canonical_preset(output_mode),
+        _canonical_base_model(base_model), float(score or 0),
         str(tags or ""), parsed_id, source_kind="", source_ref="",
     )
     table, choices = _filtered_cache_updates(query, min_score, filter_output_mode, filter_base_model, [str(saved_id)])
@@ -1084,6 +1204,8 @@ def _bulk_cache(import_text, output_mode, base_model, default_score, query="", m
 
 
 def _parse_bulk_cache(import_text, output_mode, base_model, default_score):
+    output_mode = _canonical_preset(output_mode)
+    base_model = _canonical_base_model(base_model)
     records = []
     ignored = 0
     for line in str(import_text or "").splitlines():
@@ -1336,7 +1458,14 @@ def _build_inspiration_sources(
             )
             parsed = [prefix + "在此基础上完成本条创作要求：" + item for item in parsed]
         return parsed[:200], stats
-    count = max(1, min(200, int(generation_count or 8)))
+    # Gradio Number can submit an empty/non-finite value while its component
+    # is being refreshed. Normalize it here so a bad UI value cannot abort the
+    # batch generator before it acquires and clears its task state.
+    try:
+        requested_count = int(float(generation_count)) if generation_count is not None else 8
+    except (TypeError, ValueError, OverflowError):
+        requested_count = 8
+    count = max(1, min(200, requested_count))
     topics = [item.strip() for item in str(topic_pool or "").replace(",", "\n").splitlines() if item.strip()]
     topics = topics or list(_INSPIRATION_TOPIC_POOL)
     rng = random.SystemRandom()
@@ -1656,25 +1785,37 @@ def _search_wildcards(query):
     return gr.update(value=DB.wildcard_matches(query))
 
 
-def _save_llm_settings(provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
-    provider = str(provider or DEFAULT_LLM_SETTINGS["provider"])
+def _save_llm_settings(
+    provider, endpoint, model, api_key, fallback_model, weights_path, model_version,
+    temperature, timeout, max_tokens, send_temperature, retry_count,
+):
+    provider = _canonical_provider(provider or DEFAULT_LLM_SETTINGS["provider"])
     if provider not in PROVIDER_PROFILES:
-        return "保存失败：不支持的 Provider。", gr.update(), gr.update()
+        return "保存失败：不支持的 Provider。", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
     try:
         endpoint = validate_endpoint(endpoint)
         model = str(model or "").strip()
         if not model:
             raise ValueError("LLM model ID is required")
+        fallback_model = str(fallback_model or "").strip()
+        if fallback_model.casefold() == model.casefold():
+            fallback_model = ""
+        weights_path = str(weights_path or "").strip()
+        model_version = str(model_version or "").strip()
         settings = {
             "endpoint": endpoint,
             "model": model,
+            "fallback_model": fallback_model,
+            "weights_path": weights_path,
+            "model_version": model_version,
             "temperature": max(0.0, min(float(temperature), 2.0)),
             "timeout": max(5, min(int(timeout), 600)),
             "max_tokens": max(0, min(int(max_tokens), 262144)),
             "send_temperature": bool(send_temperature),
+            "retry_count": max(0, min(int(retry_count), 5)),
         }
     except (TypeError, ValueError) as error:
-        return f"保存失败：{_safe_error(error)}", gr.update(), gr.update()
+        return f"保存失败：{_safe_error(error)}", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
     store = _connection_store()
     providers = dict(store.get("providers", {}))
     providers[provider] = settings
@@ -1688,12 +1829,67 @@ def _save_llm_settings(provider, endpoint, model, api_key, temperature, timeout,
         message += " 尚未保存 API Key，调用前必须填写。"
     else:
         message += " 当前未保存 API Key。"
-    return message, gr.update(value=endpoint), gr.update(value=model)
+    if weights_path:
+        message += " 已登记本地模型权重路径；实际加载由本地 LLM 服务负责。"
+    if fallback_model:
+        message += f" 主模型失败时将回退到 {fallback_model}。"
+    return message, gr.update(value=endpoint), gr.update(value=model), gr.update(value=fallback_model), gr.update(value=weights_path), gr.update(value=model_version)
+
+
+def _load_model_file(file_path):
+    """Load a JSON model profile or register a local weight file path."""
+    path_text = str(file_path or "").strip()
+    if not path_text:
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), "未选择模型配置或权重文件。"
+    path = Path(path_text)
+    if not path.is_file():
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), f"加载失败：文件不存在：{path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return gr.update(value=str(path)), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), (
+            f"已登记权重文件路径：{path}。该文件不是 Prompt Studio 配置 JSON，实际加载请由 Ollama、LM Studio 或其他本地服务完成。"
+        )
+    if not isinstance(payload, dict):
+        return gr.update(value=str(path)), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), "加载失败：模型配置 JSON 必须是对象。"
+    model_payload = payload.get("model") if isinstance(payload.get("model"), dict) else payload
+    provider = _canonical_provider(model_payload.get("provider") or "")
+    endpoint = str(model_payload.get("endpoint") or model_payload.get("base_url") or "").strip()
+    model = str(model_payload.get("model_id") or model_payload.get("model_name") or (model_payload.get("model") if isinstance(model_payload.get("model"), str) else "") or "").strip()
+    fallback = str(model_payload.get("fallback_model") or model_payload.get("fallback") or "").strip()
+    weights = str(model_payload.get("weights_path") or model_payload.get("weight_path") or "").strip()
+    version = str(model_payload.get("model_version") or model_payload.get("version") or "").strip()
+    if provider not in PROVIDER_PROFILES:
+        provider = ""
+    if endpoint:
+        try:
+            endpoint = validate_endpoint(endpoint)
+        except ValueError as error:
+            return gr.update(value=weights), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), f"加载失败：{_safe_error(error)}"
+    choices = [model] if model else []
+    status = f"已加载模型配置：{path.name}。请检查字段后点击‘保存并应用’。"
+    return (
+        gr.update(value=weights), gr.update(value=provider) if provider else gr.update(), gr.update(value=endpoint),
+        gr.update(choices=choices, value=model) if model else gr.update(), gr.update(value=fallback),
+        gr.update(value=version), status,
+    )
+
+
+def _discover_models(provider, endpoint, api_key, timeout):
+    try:
+        settings = _connection_settings(provider)
+        resolved_key = CREDENTIALS.resolve(api_key, _canonical_provider(provider), endpoint)
+        models = discover_provider_models(_canonical_provider(provider), endpoint, resolved_key, max(5, min(int(timeout or 30), 120)))
+        selected = settings.get("model") if settings.get("model") in models else (models[0] if models else "")
+        return gr.update(choices=models, value=selected), f"已发现 {len(models)} 个模型，可直接选择或手动输入模型 ID。"
+    except Exception as error:
+        current = str(_connection_settings(provider).get("model") or "").strip()
+        return gr.update(choices=[current] if current else [], value=current), f"模型发现失败：{_safe_error(error)}；仍可手动填写模型 ID。"
 
 
 def _clear_llm_credentials(provider, endpoint):
     try:
-        cleared = CREDENTIALS.clear(provider, validate_endpoint(endpoint))
+        cleared = CREDENTIALS.clear(_canonical_provider(provider), validate_endpoint(endpoint))
     except ValueError as error:
         return f"清除失败：{_safe_error(error)}"
     return "已清除当前 Provider 与 URL 对应的 API Key。" if cleared else "当前连接没有已保存的 API Key。"
@@ -1703,6 +1899,8 @@ def _finalize_generated_prompt(
     result, preset, safety, remove_bad=True, remove_terms="", shuffle=False, spaces=False,
     max_tags=0, structured_mode="Plain Prompt", region_count=1,
 ):
+    preset = _canonical_preset(preset)
+    structured_mode = _canonical_output_mode(structured_mode)
     result = str(result or "").strip()
     if safety == "SFW" and not is_sfw_output(result):
         raise ValueError("SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。")
@@ -1717,6 +1915,7 @@ def _finalize_generated_prompt(
 
 
 def _processed_kind_for_preset(preset: str) -> str:
+    preset = _canonical_preset(preset)
     if preset in {"Natural Language", "Krea 2 Natural"}:
         return "natural"
     if preset == "Danbooru + Natural":
@@ -1725,13 +1924,13 @@ def _processed_kind_for_preset(preset: str) -> str:
 
 
 def _recommended_base_model_for_preset(preset: str):
-    return PRESET_BASE_MODEL_DEFAULTS.get(str(preset), "Auto / checkpoint default")
+    return PRESET_BASE_MODEL_DEFAULTS.get(_canonical_preset(preset), "Auto / checkpoint default")
 
 
 def _aligned_preset(preset: str, base_model: str) -> tuple[str, bool]:
     """Keep an explicit checkpoint and output profile on the same prompt protocol."""
-    current = str(preset or "Danbooru Tags").strip()
-    model = str(base_model or "Auto / checkpoint default").strip()
+    current = _canonical_preset(preset or "Danbooru Tags")
+    model = _canonical_base_model(base_model or "Auto / checkpoint default")
     expected = MODEL_PRESET_ALIGNMENT.get(model)
     if expected and current != expected:
         return expected, True
@@ -1781,8 +1980,16 @@ def _generate(
     cancel_event=None,
     batch_directive="", batch_history=None,
 ):
+    provider = _canonical_provider(provider)
+    base_model = _canonical_base_model(base_model)
+    structured_mode = _canonical_output_mode(structured_mode)
     preset, preset_aligned = _aligned_preset(preset, base_model)
-    source = str(source_tags or request or "").strip()
+    request_text = str(request or "").strip()
+    source_tags_text = str(source_tags or "").strip()
+    if source_tags_text and request_text:
+        source = f"SOURCE TAGS:\n{source_tags_text}\n\nCREATIVE REQUEST:\n{request_text}"
+    else:
+        source = source_tags_text or request_text
     if not source:
         return "", "", "请输入创作要求或源 Danbooru 标签。"
     examples = []
@@ -1835,7 +2042,8 @@ def _generate(
                 result = call_llm(
                     provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
                     min(2.0, request_temperature + 0.15 * attempt), int(timeout or 90), int(max_tokens or 0),
-                    bool(send_temperature), cancel_event=cancel_event,
+                    bool(send_temperature), max_retries=_connection_settings(provider)["retry_count"], cancel_event=cancel_event,
+                    fallback_model=_connection_settings(provider).get("fallback_model", ""),
                 )
             except RuntimeError as error:
                 if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
@@ -1899,6 +2107,9 @@ def _generate_auto_loop(
     structured_mode, region_count, cache_result=False,
 ):
     _AUTO_LOOP_CANCEL.clear()
+    provider = _canonical_provider(provider)
+    base_model = _canonical_base_model(base_model)
+    structured_mode = _canonical_output_mode(structured_mode)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     if cache_result:
         identity = {
@@ -1938,7 +2149,10 @@ def _expand_or_polish(
     cancel_event=None,
     batch_directive="", previous_outputs=None,
 ):
-    action_name = str(action)
+    action_name = _canonical_action(action)
+    provider = _canonical_provider(provider)
+    base_model = _canonical_base_model(base_model)
+    structured_mode = _canonical_output_mode(structured_mode)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     instruction = build_operation_instruction(action_name, base_model)
     static_tags = _static_prompt_reference(source)
@@ -1968,7 +2182,7 @@ def _expand_or_polish(
     def build_transform_system(active_directive: str) -> str:
         if not use_fixed_krea_polish:
             return build_system_prompt(
-                preset, base_model, safety, nsfw_injection, user_instruction, static_tags,
+                preset, base_model, safety, nsfw_injection, user_instruction, [], static_tags=static_tags,
                 system_override=system_override, batch_directive=active_directive,
                 operation_instruction=instruction,
             )
@@ -2018,7 +2232,9 @@ def _expand_or_polish(
                 result = call_llm(
                     provider, endpoint, model, resolved_key, attempt_system,
                     build_user_message(source), min(2.0, request_temperature + 0.15 * attempt),
-                    int(timeout or 90), int(max_tokens or 0), bool(send_temperature), cancel_event=cancel_event,
+                    int(timeout or 90), int(max_tokens or 0), bool(send_temperature),
+                    max_retries=_connection_settings(provider)["retry_count"], cancel_event=cancel_event,
+                    fallback_model=_connection_settings(provider).get("fallback_model", ""),
                 )
             except RuntimeError as error:
                 if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
@@ -2238,6 +2454,11 @@ def _png_batch_load(file_path):
         return gr.update(), [], 1, "", f"导入失败：{_safe_error(error)}", gr.update(choices=[], value=[])
 
 
+def _inline_png_batch_load(file_path):
+    """Drop the standalone panel's explicit record-selection update."""
+    return _png_batch_load(file_path)[:5]
+
+
 def _png_batch_table(payload):
     try:
         data = _normalize_png_batch_payload(payload or {})
@@ -2334,6 +2555,11 @@ def _png_batch_refresh(payload, selection=1):
     return table, selected, current, f"已载入 {len(table)} 条逐图 Prompt。", gr.update(choices=choices, value=values)
 
 
+def _inline_png_batch_refresh(payload, selection=1):
+    """Return exactly the four outputs rendered by the inline JSON panel."""
+    return _png_batch_refresh(payload, selection)[:4]
+
+
 def _png_batch_move(payload, selection, offset):
     selected, current = _png_batch_current(payload, int(selection or 1) + int(offset))
     return selected, current
@@ -2349,6 +2575,10 @@ def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="
     """Run JSON Prompt processing from the Forge txt2img inline panel."""
     workflow = _workflow_settings()
     connection = _connection_settings()
+    action = _canonical_action(action)
+    variation_mode = _canonical_variation_mode(variation_mode)
+    preset = _canonical_preset(preset)
+    base_model = _canonical_base_model(base_model)
     selected_preset = preset if preset in PRESETS else workflow["preset"]
     selected_base_model = base_model if base_model in BASE_MODEL_GUIDANCE else workflow["base_model"]
     selected_preset, _preset_aligned = _aligned_preset(selected_preset, selected_base_model)
@@ -2371,10 +2601,49 @@ def _cancel_auto_loop_generation():
     return "已请求取消当前 LLM 请求；已返回的结果不会写入队列。"
 
 
-def _cancel_inline_generation(slot):
-    event = _INLINE_CANCEL_EVENTS.get(str(slot or ""))
-    if event is not None:
-        event.set()
+def _prune_inline_cancelled_requests(now: float) -> None:
+    expired = [
+        key for key, cancelled_at in _INLINE_CANCELLED_REQUESTS.items()
+        if now - cancelled_at > _INLINE_CANCEL_TTL_SECONDS
+    ]
+    for key in expired:
+        _INLINE_CANCELLED_REQUESTS.pop(key, None)
+
+
+def _inline_request_event(slot: str, request_id: str) -> threading.Event:
+    key = (slot, request_id)
+    with _INLINE_REQUEST_CONTROL_LOCK:
+        _prune_inline_cancelled_requests(time.monotonic())
+        event = _INLINE_REQUEST_EVENTS.setdefault(key, threading.Event())
+        if key in _INLINE_CANCELLED_REQUESTS:
+            event.set()
+        return event
+
+
+def _release_inline_request(slot: str, request_id: str, event: threading.Event) -> None:
+    key = (slot, request_id)
+    with _INLINE_REQUEST_CONTROL_LOCK:
+        if _INLINE_REQUEST_EVENTS.get(key) is event:
+            _INLINE_REQUEST_EVENTS.pop(key, None)
+        _INLINE_CANCELLED_REQUESTS.pop(key, None)
+        if _INLINE_ACTIVE_REQUEST_IDS.get(slot) == request_id:
+            _INLINE_ACTIVE_REQUEST_IDS[slot] = ""
+
+
+def _cancel_inline_generation(slot, request_id=""):
+    normalized_slot = str(slot or "").strip()
+    normalized_request_id = str(request_id or "").strip()
+    if normalized_slot not in _INLINE_CANCEL_EVENTS:
+        return "没有可停止的 LLM 请求。"
+    with _INLINE_REQUEST_CONTROL_LOCK:
+        _prune_inline_cancelled_requests(time.monotonic())
+        if not normalized_request_id:
+            normalized_request_id = _INLINE_ACTIVE_REQUEST_IDS.get(normalized_slot, "")
+        if normalized_request_id:
+            key = (normalized_slot, normalized_request_id)
+            _INLINE_CANCELLED_REQUESTS[key] = time.monotonic()
+            _INLINE_REQUEST_EVENTS.setdefault(key, threading.Event()).set()
+        _INLINE_CANCEL_EVENTS[normalized_slot].set()
     return "已请求停止；LLM 等待已中断，迟到响应不会写入 Prompt。"
 
 
@@ -2386,6 +2655,10 @@ def _png_batch_run(
     variation_mode="faithful",
     cancel_id="",
 ):
+    action = _canonical_action(action)
+    preset = _canonical_preset(preset)
+    base_model = _canonical_base_model(base_model)
+    variation_mode = _canonical_variation_mode(variation_mode)
     try:
         data = _normalize_png_batch_payload(payload or {})
     except Exception as error:
@@ -2502,6 +2775,19 @@ def _png_batch_advance_after_append(payload, selection, succeeded):
     return _png_batch_json(data), next_selection, current, f"已写入第 {selected} 条，当前为第 {next_selection} 条。", gr.update(choices=choices, value=values)
 
 
+def _png_batch_mark_appended(payload, selection, selected_ids, scope, succeeded):
+    """Apply the single JSON write-back action to the chosen scope."""
+    if str(scope or "selected") == "current":
+        updated = _png_batch_advance_after_append(payload, selection, succeeded)
+        next_payload, next_selection, current, status, choices = updated
+        return next_payload, _png_batch_table(next_payload), next_selection, current, status, choices
+    return _png_batch_mark_selected_appended(payload, selected_ids, succeeded)
+
+
+def _template_request(template_name):
+    return KEMONOMIMI_LOLI_BATCH_TEMPLATE if str(template_name or "general") == "kemonimimi" else GENERAL_CREATIVE_REQUEST_TEMPLATE
+
+
 def _png_batch_export_file(payload):
     data = _normalize_png_batch_payload(payload or {})
     export_dir = Path(__file__).resolve().parents[1] / "user" / "exports"
@@ -2554,12 +2840,15 @@ def _ranbooru_handoff_to_png_batch(handoff_id):
     })
 
 
-def _test_connection(provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature):
+def _test_connection(provider, endpoint, model, api_key, fallback_model, temperature, timeout, max_tokens, send_temperature, retry_count):
     try:
+        provider = _canonical_provider(provider)
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
         output = call_llm(
             provider, endpoint, model, resolved_key, "Reply exactly: READY", "Connection test",
             float(temperature or 0), int(timeout or 30), max(16, min(int(max_tokens or 64), 64)), bool(send_temperature),
+            max_retries=max(0, min(int(retry_count or 0), 5)),
+            fallback_model=str(fallback_model or "").strip(),
         )
         return f"{provider} 连接成功：{output[:160]}"
     except Exception as error:
@@ -2570,39 +2859,31 @@ def _inline_generate(
     request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     remove_bad, remove_terms, shuffle, spaces, max_tags,
     structured_mode, region_count, save_score, cache_result,
-    slot="",
+    cancel_event=None,
 ):
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     saved_workflow = _workflow_settings()
     shared_updates = {"preset": preset, "base_model": base_model, "safety": safety}
     if any(saved_workflow[key] != value for key, value in shared_updates.items()):
         _save_workflow_values(shared_updates)
-    cancel_event = _INLINE_CANCEL_EVENTS.get(str(slot or ""))
-    if cancel_event is not None:
-        cancel_event.clear()
     connection = _connection_settings()
+    current_prompt = str(source_tags or "").strip()
+    variation_request = str(request or "").strip()
+    inline_source = current_prompt
+    if variation_request:
+        inline_source = (
+            f"{current_prompt}\n\nINLINE VARIATION REQUEST:\n{variation_request}"
+            if current_prompt else variation_request
+        )
     generated, system, status = _generate(
-        request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+        "", inline_source, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         connection["provider"], connection["endpoint"], connection["model"], "",
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         remove_bad, remove_terms, shuffle, spaces, max_tags,
         structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
-        _independent_creative_directive(),
+        INLINE_DELTA_DIRECTIVE + "\n\n" + _independent_creative_directive(),
     )
-    return generated, system, status, generated if generated else gr.update()
-
-
-def _inline_cached_prompt(cursor=0):
-    try:
-        records = [record for record in DB.list_prompts(limit=1000) if str(record.get("prompt") or "").strip()]
-        if not records:
-            return "", "缓存为空，请先生成或导入 Prompt。", int(cursor or 0)
-        position = int(cursor or 0) % len(records)
-        record = records[position]
-        next_cursor = position + 1
-        return str(record["prompt"]).strip(), f"已取出缓存第 {position + 1}/{len(records)} 条；下一次将继续向后读取。", next_cursor
-    except Exception as error:
-        return "", f"读取缓存失败：{_safe_error(error)}", int(cursor or 0)
+    return generated, system, status
 
 
 def _unwrap_component(component):
@@ -2695,7 +2976,7 @@ def _create_inline_json_batch_panel(slot):
         json_append_succeeded = gr.Checkbox(value=False, visible=False, elem_id=f"{prefix}_append_succeeded")
         json_cancel_id = gr.State(lambda: uuid.uuid4().hex)
         json_file.change(
-            _png_batch_load,
+            _inline_png_batch_load,
             inputs=json_file,
             outputs=[json_payload, json_table, json_selection, json_current, json_status],
         )
@@ -2715,7 +2996,7 @@ def _create_inline_json_batch_panel(slot):
             js=f"() => window.llmPromptStudioPngBatch.receiveCollectorBatch('{slot}')",
         )
         json_payload.input(
-            _png_batch_refresh,
+            _inline_png_batch_refresh,
             inputs=[json_payload, json_selection],
             outputs=[json_table, json_selection, json_current, json_status],
         )
@@ -2752,14 +3033,12 @@ def _create_inline_panel(slot, prompt_target):
             placeholder="例如：保持人物身份和画风不变，只变化动作、道具、场景、镜头和光线。",
             elem_id=f"llm_prompt_studio_{slot}_inline_variation",
         )
-        inline_creative_template_button = gr.Button(
-            "填入通用创作需求",
-            elem_id=f"llm_prompt_studio_{slot}_creative_template",
-        )
-        inline_kemonimimi_template_button = gr.Button(
-            "填入兽耳角色与环境模板",
-            elem_id=f"llm_prompt_studio_{slot}_kemonimimi_template",
-        )
+        with gr.Row(elem_classes=["lps-template-picker"]):
+            inline_template_choice = gr.Dropdown(
+                label="快速模板", choices=[("通用创作", "general"), ("兽耳角色批量", "kemonimimi")],
+                value="general", elem_id=f"llm_prompt_studio_{slot}_inline_template_choice",
+            )
+            inline_template_button = gr.Button("填入模板", elem_id=f"llm_prompt_studio_{slot}_inline_template_button")
         with gr.Row(elem_classes=["lps-form-row"]):
             inline_preset = gr.Dropdown(
                 label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"],
@@ -2778,61 +3057,55 @@ def _create_inline_panel(slot, prompt_target):
                 label="Prompt 来源", choices=[("LLM 自动生成", "llm"), ("缓存顺序读取", "cache")], value="llm",
                 elem_id=f"llm_prompt_studio_{slot}_inline_source",
             )
-            inline_cycles = gr.Number(
-                label="轮数（0 = 持续）", value=0, minimum=0, precision=0,
-                elem_id=f"llm_prompt_studio_{slot}_inline_cycles",
+        with gr.Row(elem_classes=["lps-form-row", "lps-infinite-controls"]):
+            inline_infinite = gr.Checkbox(
+                label="LLM 无限生成（勾选后，Forge 每轮生成前自动等待 LLM）", value=False,
+                elem_id=f"llm_prompt_studio_{slot}_inline_infinite",
+            )
+            inline_write_mode = gr.Dropdown(
+                label="本轮 LLM Prompt 合并位置",
+                choices=[
+                    ("追加到后面", "append_end"),
+                    ("追加到前面", "append_start"),
+                    ("替换当前 Prompt", "replace"),
+                    ("插入到标记位置", "marker"),
+                ],
+                value="append_end",
+                elem_id=f"llm_prompt_studio_{slot}_inline_write_mode",
+            )
+            inline_marker = gr.Textbox(
+                label="插入标记", value="{{LLM}}", max_lines=1,
+                placeholder="按固定 Prompt 中的标记定位；不会改写输入框，例如 {{LLM}}",
+                elem_id=f"llm_prompt_studio_{slot}_inline_marker",
             )
         with gr.Row():
             inline_once = gr.Button("生成并入队", elem_id=f"llm_prompt_studio_{slot}_inline_once")
-            inline_start = gr.Button("持续生成并入队", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
             inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
-        inline_loop_status = gr.HTML("尚未启动：生成后请在队列中勾选，再写入固定正面 Prompt。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
-        inline_generate = gr.Button("内嵌 LLM 生成", visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_generate")
-        inline_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_output")
-        inline_system_preview = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_system_preview")
-        inline_status = gr.Markdown(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_status")
-        inline_prompt_update = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_prompt_update")
-        inline_cache_button = gr.Button("读取下一条缓存", visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_fetch")
-        inline_cache_output = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_output")
-        inline_cache_status = gr.Textbox(visible=False, elem_id=f"llm_prompt_studio_{slot}_inline_cache_status")
-        inline_cache_cursor = gr.State(0)
+        inline_loop_status = gr.HTML("勾选后会预生成首条；点击 Forge 生成或启动 Forge 无限生成时使用，正面 Prompt 框保持不变。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
         if slot == "txt2img":
             _create_inline_json_batch_panel(slot)
-        inline_creative_template_button.click(
-            lambda: GENERAL_CREATIVE_REQUEST_TEMPLATE,
-            outputs=request,
-        )
-        inline_kemonimimi_template_button.click(
-            lambda: KEMONOMIMI_LOLI_BATCH_TEMPLATE,
-            outputs=request,
-        )
-        inline_generate.click(
-            _inline_generate,
-            inputs=[
-                request, prompt_target, inline_preset, gr.State(workflow["system_override"]),
-                inline_base_model, inline_safety, gr.State(workflow["nsfw_injection"]),
-                gr.State(workflow["user_instruction"]), gr.State(workflow["remove_bad"]),
-                gr.State(workflow["remove_terms"]), gr.State(workflow["shuffle"]),
-                gr.State(workflow["spaces"]), gr.State(workflow["max_tags"]),
-                gr.State(workflow["structured_mode"]), gr.State(workflow["region_count"]),
-                gr.State(workflow["save_score"]), gr.State(workflow["cache_result"]),
-                gr.State(slot),
-            ],
-            outputs=[inline_output, inline_system_preview, inline_status, inline_prompt_update],
-        )
-        inline_cache_button.click(_inline_cached_prompt, inputs=inline_cache_cursor, outputs=[inline_cache_output, inline_cache_status, inline_cache_cursor])
+        inline_template_button.click(_template_request, inputs=inline_template_choice, outputs=request)
         inline_once.click(
             fn=None,
-            inputs=[request, inline_variation, inline_source],
+            inputs=[request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety],
             outputs=inline_loop_status,
-            js=f"(request, variation, source) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, variation, source}})",
+            js=f"(request, variation, source, preset, baseModel, safety) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, variation, source, preset, baseModel, safety}})",
         )
-        inline_start.click(
+        inline_infinite.change(
             fn=None,
-            inputs=[request, inline_variation, inline_source, inline_cycles],
+            inputs=[inline_infinite, inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety],
             outputs=inline_loop_status,
-            js=f"(request, variation, source, cycles) => window.llmPromptStudioAutoLoop.inlineLoop({{slot: '{slot}', request, variation, source, cycles}})",
+            js=f"(enabled, writeMode, marker, request, variation, source, preset, baseModel, safety) => window.llmPromptStudioAutoLoop.setInfiniteMode({{slot: '{slot}', enabled, writeMode, marker, request, variation, source, preset, baseModel, safety}})",
+            queue=False,
         )
+        for component in (inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety):
+            component.change(
+                fn=None,
+                inputs=[inline_infinite, inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety],
+                outputs=inline_loop_status,
+                js=f"(enabled, writeMode, marker, request, variation, source, preset, baseModel, safety) => window.llmPromptStudioAutoLoop.setInfiniteMode({{slot: '{slot}', enabled, writeMode, marker, request, variation, source, preset, baseModel, safety}})",
+                queue=False,
+            )
         inline_cancel.click(
             fn=_cancel_inline_generation, inputs=gr.State(slot), outputs=inline_loop_status,
             js=f"(slot) => {{ window.llmPromptStudioAutoLoop.cancelInline('{slot}'); return [slot]; }}", queue=False,
@@ -2880,6 +3153,11 @@ def _api_generate(payload: dict[str, Any]):
         "nsfw_injection": "", "user_instruction": "", "source_tags": "",
     }
     payload = dict(payload or {})
+    payload["preset"] = _canonical_preset(payload.get("preset", defaults["preset"]))
+    payload["base_model"] = _canonical_base_model(payload.get("base_model", defaults["base_model"]))
+    payload["structured_mode"] = _canonical_output_mode(payload.get("structured_mode", defaults["structured_mode"]))
+    if "provider" in payload:
+        payload["provider"] = _canonical_provider(payload["provider"])
     allowed_fields = set(defaults) | {"request"}
     unknown_fields = sorted(set(payload) - allowed_fields)
     if unknown_fields:
@@ -2903,12 +3181,134 @@ def _api_generate(payload: dict[str, Any]):
         raise ValueError("API Provider must match the active connection saved in the plugin UI")
     if "endpoint" in payload and validate_endpoint(payload["endpoint"]) != validate_endpoint(saved_connection["endpoint"]):
         raise ValueError("API endpoint must match the connection saved in the plugin UI")
-    values = {**defaults, **(payload or {})}
-    generated, system, status = _generate(values.get("request", ""), *[values[key] for key in [
-        "source_tags", "preset", "system_override", "base_model", "safety", "nsfw_injection", "user_instruction", "provider", "endpoint", "model", "api_key", "temperature", "timeout", "max_tokens", "send_temperature"
-    ]], 0, 0, *[values[key] for key in [
-        "remove_bad", "remove_terms", "shuffle", "spaces", "max_tags", "structured_mode", "region_count", "save_score", "cache_result"
-    ]])
+    values = {**defaults, **payload}
+    generated, system, status = _generate(
+        request=values.get("request", ""),
+        source_tags=values["source_tags"],
+        preset=values["preset"],
+        system_override=values["system_override"],
+        base_model=values["base_model"],
+        safety=values["safety"],
+        nsfw_injection=values["nsfw_injection"],
+        user_instruction=values["user_instruction"],
+        provider=values["provider"],
+        endpoint=values["endpoint"],
+        model=values["model"],
+        api_key=values["api_key"],
+        temperature=values["temperature"],
+        timeout=values["timeout"],
+        max_tokens=values["max_tokens"],
+        send_temperature=values["send_temperature"],
+        remove_bad=values["remove_bad"],
+        remove_terms=values["remove_terms"],
+        shuffle=values["shuffle"],
+        spaces=values["spaces"],
+        max_tags=values["max_tags"],
+        structured_mode=values["structured_mode"],
+        region_count=values["region_count"],
+        save_score=values["save_score"],
+        cache_result=values["cache_result"],
+    )
+    if not generated:
+        raise ValueError(status)
+    return {"prompt": generated, "system_prompt": system, "status": status}
+
+
+def _api_inline_generate(payload: dict[str, Any]):
+    payload = dict(payload or {})
+    if "preset" in payload:
+        payload["preset"] = _canonical_preset(payload["preset"])
+    if "base_model" in payload:
+        payload["base_model"] = _canonical_base_model(payload["base_model"])
+    allowed_fields = {"request", "source_tags", "variation", "preset", "base_model", "safety", "slot", "request_id"}
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    if unknown_fields:
+        raise ValueError(f"Inline API request contains unsupported fields: {', '.join(unknown_fields)}")
+    workflow = _workflow_settings()
+    connection = _connection_settings()
+    preset = _canonical_preset(payload.get("preset", workflow["preset"]))
+    base_model = _canonical_base_model(payload.get("base_model", workflow["base_model"]))
+    safety = payload.get("safety", workflow["safety"])
+    if preset not in PRESETS:
+        raise ValueError(f"Unsupported prompt preset: {preset}")
+    if base_model not in BASE_MODEL_GUIDANCE:
+        raise ValueError(f"Unsupported base model profile: {base_model}")
+    if safety not in {"SFW", "NSFW"}:
+        raise ValueError(f"Unsupported safety mode: {safety}")
+    slot = str(payload.get("slot") or "").strip()
+    if slot not in _INLINE_CANCEL_EVENTS:
+        raise ValueError(f"Unsupported inline slot: {slot}")
+    request_id = str(payload.get("request_id") or uuid.uuid4().hex).strip()
+    if not request_id or len(request_id) > 128:
+        raise ValueError("Inline request_id must contain 1 to 128 characters")
+    request = str(payload.get("request") or "").strip()
+    variation = str(payload.get("variation") or "").strip()
+    if variation:
+        request = f"{request}\n\nBATCH VARIATION SCOPE:\n{variation}" if request else variation
+    cancel_event = _inline_request_event(slot, request_id)
+    with _INLINE_REQUEST_LOCKS[slot]:
+        try:
+            if cancel_event.is_set():
+                raise ValueError("Inline request cancelled")
+            with _INLINE_REQUEST_CONTROL_LOCK:
+                _INLINE_ACTIVE_REQUEST_IDS[slot] = request_id
+                _INLINE_CANCEL_EVENTS[slot].clear()
+            generated, system, status = _inline_generate(
+                request, payload.get("source_tags", ""), preset,
+                workflow["system_override"], base_model, safety, workflow["nsfw_injection"],
+                workflow["user_instruction"], workflow["remove_bad"], workflow["remove_terms"],
+                workflow["shuffle"], workflow["spaces"], workflow["max_tags"],
+                workflow["structured_mode"], workflow["region_count"], workflow["save_score"],
+                workflow["cache_result"], cancel_event,
+            )
+        finally:
+            _release_inline_request(slot, request_id, cancel_event)
+    if not generated:
+        raise ValueError(status)
+    return {"prompt": generated, "system_prompt": system, "status": status}
+
+
+def _api_inline_cancel(payload: dict[str, Any]):
+    payload = dict(payload or {})
+    unknown_fields = sorted(set(payload) - {"slot", "request_id"})
+    if unknown_fields:
+        raise ValueError(f"Inline cancel request contains unsupported fields: {', '.join(unknown_fields)}")
+    slot = str(payload.get("slot") or "").strip()
+    if slot not in _INLINE_CANCEL_EVENTS:
+        raise ValueError(f"Unsupported inline slot: {slot}")
+    request_id = str(payload.get("request_id") or "").strip()
+    if len(request_id) > 128:
+        raise ValueError("Inline request_id must contain at most 128 characters")
+    _cancel_inline_generation(slot, request_id)
+    return {"cancelled": True, "slot": slot, "request_id": request_id}
+
+
+def _api_auto_loop_generate(payload: dict[str, Any]):
+    payload = dict(payload or {})
+    allowed_fields = {"request", "preset", "base_model", "safety", "cache_result"}
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    if unknown_fields:
+        raise ValueError(f"Auto loop API request contains unsupported fields: {', '.join(unknown_fields)}")
+    workflow = _workflow_settings()
+    connection = _connection_settings()
+    preset = _canonical_preset(payload.get("preset", workflow["preset"]))
+    base_model = _canonical_base_model(payload.get("base_model", workflow["base_model"]))
+    safety = payload.get("safety", workflow["safety"])
+    if preset not in PRESETS:
+        raise ValueError(f"Unsupported prompt preset: {preset}")
+    if base_model not in BASE_MODEL_GUIDANCE:
+        raise ValueError(f"Unsupported base model profile: {base_model}")
+    if safety not in {"SFW", "NSFW"}:
+        raise ValueError(f"Unsupported safety mode: {safety}")
+    generated, system, status = _generate_auto_loop(
+        payload.get("request", ""), preset, workflow["system_override"], base_model, safety,
+        workflow["nsfw_injection"], workflow["user_instruction"], connection["provider"],
+        connection["endpoint"], connection["model"], "", connection["temperature"],
+        connection["timeout"], connection["max_tokens"], connection["send_temperature"],
+        workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"],
+        workflow["spaces"], workflow["max_tags"], workflow["structured_mode"],
+        workflow["region_count"], bool(payload.get("cache_result", workflow["cache_result"])),
+    )
     if not generated:
         raise ValueError(status)
     return {"prompt": generated, "system_prompt": system, "status": status}
@@ -3211,18 +3611,6 @@ def _clear_finished_handoffs():
 
 
 def on_app_started(_, app):
-    _ensure_server_queue_worker()
-    recovered_handoffs = DB.recover_stale_handoffs()
-    if recovered_handoffs:
-        LOGGER.warning("recovered %s stale Ranbooru handoff claims", recovered_handoffs)
-    saved_workflow = DB.get_setting("workflow_settings_v1", {}) or {}
-    wildcard_source = Path(saved_workflow.get("wildcard_path") or DEFAULT_WILDCARDS) if isinstance(saved_workflow, dict) else DEFAULT_WILDCARDS
-    if wildcard_source.is_dir():
-        try:
-            files, terms = DB.index_wildcards(wildcard_source)
-            LOGGER.info("wildcard library ready: %s updated files, %s terms", files, terms)
-        except Exception as error:
-            LOGGER.warning("wildcard indexing skipped: %s", error)
     try:
         from fastapi import Depends, HTTPException
         from fastapi.security import HTTPBasic
@@ -3257,6 +3645,27 @@ def on_app_started(_, app):
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
 
+        @app.post("/llm-prompt-studio/v1/inline-generate", dependencies=api_dependencies)
+        def prompt_studio_inline_generate(payload: dict[str, Any]):
+            try:
+                return _api_inline_generate(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.post("/llm-prompt-studio/v1/inline-cancel", dependencies=api_dependencies)
+        def prompt_studio_inline_cancel(payload: dict[str, Any]):
+            try:
+                return _api_inline_cancel(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.post("/llm-prompt-studio/v1/auto-loop-generate", dependencies=api_dependencies)
+        def prompt_studio_auto_loop_generate(payload: dict[str, Any]):
+            try:
+                return _api_auto_loop_generate(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
         @app.get("/llm-prompt-studio/v1/cache", dependencies=api_dependencies)
         def prompt_studio_cache(query: str = "", limit: int = 100):
             return {"records": DB.list_prompts(query, limit)}
@@ -3274,10 +3683,9 @@ def on_app_started(_, app):
 
         @app.post("/llm-prompt-studio/v1/queue/{batch_id}/cancel", dependencies=api_dependencies)
         def prompt_studio_queue_cancel(batch_id: str):
-            with _SERVER_QUEUE_CANCEL_LOCK:
-                _SERVER_QUEUE_CANCEL_BATCHES.add(str(batch_id))
-            _SERVER_QUEUE_CANCEL.set()
+            _server_queue_cancel_event(batch_id).set()
             cancelled = DB.cancel_server_queue(batch_id)
+            _release_server_queue_cancel_event(batch_id)
             _SERVER_QUEUE_WAKE.set()
             return _server_queue_snapshot(batch_id) | {"cancelled_now": cancelled}
 
@@ -3300,6 +3708,13 @@ def on_app_started(_, app):
             return {"records": DB.list_handoffs(limit)}
     except Exception as error:
         LOGGER.exception("API registration failed: %s", error)
+    _ensure_server_queue_worker()
+    try:
+        recovered_handoffs = DB.recover_stale_handoffs()
+        if recovered_handoffs:
+            LOGGER.warning("recovered %s stale Ranbooru handoff claims", recovered_handoffs)
+    except Exception as error:
+        LOGGER.warning("handoff recovery skipped: %s", error)
 
 
 def on_ui_tabs():
@@ -3309,9 +3724,8 @@ def on_ui_tabs():
     initial_records = DB.list_prompts()
     initial_handoff_table, initial_handoff_choices, initial_handoff_status = _handoff_views()
     with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio") as ui:
-        gr.Markdown("## LLM 提示词工作室\n本地静态词库、提示词缓存与 Forge 扩展集成。")
-        gr.Markdown("核心流程：生成单条 Prompt；批处理多条任务；缓存与联动负责筛选、评分、导入导出和 Ranbooru。连接设置只需首次配置，工具按需使用。")
-        gr.Markdown("**模板状态**：生成、转换、扩写、润色会按所选目标底模自动采用对应模板；Flux/Krea 2 使用自然语言约束，Pony/NoobAI/Anima 使用标签规则。", elem_id="llm_prompt_studio_template_notice", elem_classes=["lps-template-notice"])
+        gr.Markdown("## LLM 提示词工作室\n生成、批处理、缓存和 Forge 联动。", elem_classes=["lps-heading"])
+        gr.Markdown("模板会根据目标底模自动匹配。", elem_id="llm_prompt_studio_template_notice", elem_classes=["lps-template-notice"])
         with gr.Tabs(elem_id="llm_prompt_studio_main_tabs"):
             with gr.Tab("生成", elem_id="llm_prompt_studio_generate_tab"):
                 with gr.Row():
@@ -3327,14 +3741,12 @@ def on_ui_tabs():
                             lines=3,
                             elem_id="llm_prompt_studio_source_tags",
                         )
-                        creative_template_button = gr.Button(
-                            "填入通用创作需求",
-                            elem_id="llm_prompt_studio_creative_template",
-                        )
-                        kemonimimi_template_button = gr.Button(
-                            "填入兽耳角色与环境模板",
-                            elem_id="llm_prompt_studio_kemonimimi_template",
-                        )
+                        with gr.Row(elem_classes=["lps-template-picker"]):
+                            template_choice = gr.Dropdown(
+                                label="快速模板", choices=[("通用创作", "general"), ("兽耳角色批量", "kemonimimi")],
+                                value="general", elem_id="llm_prompt_studio_template_choice",
+                            )
+                            template_button = gr.Button("套用模板", elem_id="llm_prompt_studio_template_button")
                         preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
                         base_model = gr.Dropdown(label="目标底模（自动匹配模板）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
@@ -3354,10 +3766,12 @@ def on_ui_tabs():
                         with gr.Accordion("缓存", open=False):
                             save_score = gr.Slider(label="缓存评分", minimum=0, maximum=10, value=workflow["save_score"], step=0.5)
                             cache_result = gr.Checkbox(label="在本地缓存本次结果", value=workflow["cache_result"], elem_id="llm_prompt_studio_cache_result")
-                with gr.Row():
-                    generate = gr.Button("生成提示词", variant="primary", elem_id="llm_prompt_studio_generate_button")
-                    save_workflow = gr.Button("保存全部工作参数")
-                    reset_workflow = gr.Button("恢复默认工作参数")
+                with gr.Row(elem_classes=["lps-primary-actions"]):
+                    generate = gr.Button("生成提示词", variant="primary", elem_id="llm_prompt_studio_generate_button", elem_classes=["lps-primary"])
+                with gr.Accordion("工作参数", open=False, elem_classes=["lps-secondary-panel"]):
+                    with gr.Row(elem_classes=["lps-secondary-actions"]):
+                        save_workflow = gr.Button("保存当前参数")
+                        reset_workflow = gr.Button("恢复默认")
                 output = gr.Textbox(label="生成的提示词", lines=8, elem_id="llm_prompt_studio_output", elem_classes=["lps-output"])
                 system_preview = gr.Textbox(visible=False, elem_id="llm_prompt_studio_system_preview")
                 status = gr.Markdown(elem_id="llm_prompt_studio_status", elem_classes=["lps-status"])
@@ -3378,7 +3792,7 @@ def on_ui_tabs():
                         elem_id="llm_prompt_studio_batch_safety",
                     )
                 with gr.Tabs():
-                    with gr.Tab("灵感探索（批量 Prompt）"):
+                    with gr.Tab("批量生成"):
                         gr.Markdown(
                             "可留空创作要求，按数量从多种题材和静态词库分类中随机抽样；也可提供角色 Tag，让 LLM 保留主体并补全动作、道具、环境、构图和光线。"
                         )
@@ -3419,11 +3833,12 @@ def on_ui_tabs():
                             )
                             batch_skip_failed = gr.Checkbox(label="单条失败后跳过并继续", value=workflow["batch_skip_failed"])
                         gr.Markdown("批量结果统一保存为未评分，可稍后在缓存编辑器中手动调整评分。格式转换、扩写和润色仍在 PNG / Ranbooru 批处理链路中保留。")
-                        with gr.Row():
-                            batch_preview_button = gr.Button("预览生成队列")
-                            batch_generate = gr.Button("开始生成并缓存", variant="primary")
-                            batch_cancel = gr.Button("取消批量任务", variant="stop")
-                            save_batch_workflow = gr.Button("保存批量与工作参数")
+                        with gr.Row(elem_classes=["lps-primary-actions"]):
+                            batch_preview_button = gr.Button("预览任务", elem_classes=["lps-secondary"])
+                            batch_generate = gr.Button("开始批量生成", variant="primary", elem_classes=["lps-primary"])
+                            batch_cancel = gr.Button("停止批量", variant="stop", elem_classes=["lps-danger"])
+                        with gr.Accordion("批量高级设置", open=False, elem_classes=["lps-secondary-panel"]):
+                            save_batch_workflow = gr.Button("保存批量参数", elem_classes=["lps-secondary"])
                         batch_preview_status = gr.Markdown()
                         batch_queue = gr.Dataframe(
                             value=[], headers=["序号", "输入", "生成结果", "状态"],
@@ -3444,7 +3859,7 @@ def on_ui_tabs():
                             batch_clear_issue_selection = gr.Button("清空选择")
                             batch_retry_selected = gr.Button("重新提交所选（每条一次）", variant="primary")
                         with gr.Accordion("另一条路径：浏览器生图队列（可选）", open=False, elem_id="llm_prompt_studio_auto_loop_tab"):
-                            gr.Markdown("这里会重新调用 LLM 建立浏览器队列；创作要求可留空以随机探索。结果不会自动改写 Prompt，需先勾选队列项目，再写入固定 txt2img 正面 Prompt 或生图。")
+                            gr.Markdown("浏览器队列用于逐条写回或生图；服务端队列可在页面关闭后继续。")
                             with gr.Row(elem_classes=["lps-form-row"]):
                                 auto_loop_target = gr.Radio(
                                     label="写入目标", choices=[("正面 Prompt", "txt2img")],
@@ -3467,18 +3882,20 @@ def on_ui_tabs():
                                     elem_id="llm_prompt_studio_auto_loop_prompt_only",
                                 )
                                 auto_loop_cycles = gr.Number(
-                                    label="循环轮数（0 表示持续到取消）", value=1, minimum=0, precision=0,
+                                    label="循环轮数（1-100）", value=1, minimum=1, maximum=100, precision=0,
                                     elem_id="llm_prompt_studio_auto_loop_cycles",
                                 )
-                            with gr.Row():
+                            with gr.Row(elem_classes=["lps-primary-actions"]):
                                 auto_loop_start = gr.Button("生成并入队", variant="primary", elem_id="llm_prompt_studio_auto_loop_start")
-                                auto_loop_generate_run = gr.Button("持续生成并入队", variant="primary", elem_id="llm_prompt_studio_auto_loop_generate_run")
-                                auto_loop_run = gr.Button("使用所选并生图", elem_id="llm_prompt_studio_auto_loop_run")
-                                auto_loop_write_selected = gr.Button("写入所选到正面 Prompt", elem_id="llm_prompt_studio_auto_loop_write_selected")
-                                auto_loop_select_all = gr.Button("全选", elem_id="llm_prompt_studio_auto_loop_select_all")
-                                auto_loop_clear_selected = gr.Button("清空选择", elem_id="llm_prompt_studio_auto_loop_clear_selected")
-                                auto_loop_clear = gr.Button("清空队列", elem_id="llm_prompt_studio_auto_loop_clear")
-                                auto_loop_cancel = gr.Button("取消当前阶段", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
+                                auto_loop_generate_run = gr.Button("持续生成并生图", variant="secondary", elem_id="llm_prompt_studio_auto_loop_generate_run", elem_classes=["lps-secondary"])
+                                auto_loop_cancel = gr.Button("停止", variant="stop", elem_id="llm_prompt_studio_auto_loop_cancel")
+                            with gr.Accordion("队列操作", open=False, elem_classes=["lps-secondary-panel"]):
+                                with gr.Row():
+                                    auto_loop_run = gr.Button("使用所选并生图", elem_id="llm_prompt_studio_auto_loop_run")
+                                    auto_loop_write_selected = gr.Button("写入所选到正面 Prompt", elem_id="llm_prompt_studio_auto_loop_write_selected")
+                                    auto_loop_select_all = gr.Button("全选", elem_id="llm_prompt_studio_auto_loop_select_all")
+                                    auto_loop_clear_selected = gr.Button("清空选择", elem_id="llm_prompt_studio_auto_loop_clear_selected")
+                                    auto_loop_clear = gr.Button("清空队列", elem_id="llm_prompt_studio_auto_loop_clear")
                             auto_loop_dispatch = gr.Button(
                                 "自动队列单次生成",
                                 elem_id="llm_prompt_studio_auto_loop_dispatch",
@@ -3489,8 +3906,8 @@ def on_ui_tabs():
                                 elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
                             )
                             gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
-                            gr.Markdown("### 服务端队列（页面关闭后仍继续）")
-                            gr.Markdown("服务端线程负责逐条调用 LLM 并保存结果。此处日志和已生成 Prompt 来自 SQLite，不依赖浏览器保持连接。")
+                            gr.Markdown("### 服务端队列")
+                            gr.Markdown("关闭页面后任务仍会继续，结果保存在本地缓存。")
                             server_queue_target = gr.Radio(
                                 label="服务端模式", choices=[("只生成 Prompt", "none")],
                                 value="none", elem_id="llm_prompt_studio_server_queue_target",
@@ -3502,7 +3919,7 @@ def on_ui_tabs():
                             server_queue_id = gr.Textbox(label="服务端任务 ID", interactive=False, elem_id="llm_prompt_studio_server_queue_id")
                             server_queue_status = gr.HTML("尚未提交服务端任务。", elem_id="llm_prompt_studio_server_queue_status", elem_classes=["lps-status"])
                             server_queue_log = gr.HTML("", elem_id="llm_prompt_studio_server_queue_log", elem_classes=["lps-auto-loop-log"])
-                    with gr.Tab("JSON Prompt 批量处理", visible=True, elem_id="llm_prompt_studio_png_batch_tab"):
+                    with gr.Tab("JSON 转换", visible=True, elem_id="llm_prompt_studio_png_batch_tab"):
                         png_batch_file = gr.File(label="导入 Prompt JSON", file_types=[".json"], type="filepath", elem_id="llm_prompt_studio_png_batch_file")
                         with gr.Accordion("批次 JSON", open=False):
                             png_batch_payload = gr.Textbox(
@@ -3518,15 +3935,19 @@ def on_ui_tabs():
                             png_batch_previous = gr.Button("上一条", elem_id="llm_prompt_studio_png_batch_previous")
                             png_batch_next = gr.Button("下一条", elem_id="llm_prompt_studio_png_batch_next")
                         png_batch_target = gr.Radio(label="写入目标", choices=[("正面 Prompt（txt2img）", "txt2img")], value="txt2img", elem_id="llm_prompt_studio_png_batch_target")
-                        png_batch_append = gr.Radio(label="写入方式", choices=[("追加", "append"), ("覆盖", "replace")], value="append", elem_id="llm_prompt_studio_png_batch_append")
-                        with gr.Row():
-                            png_batch_run = gr.Button("开始处理", variant="primary", elem_id="llm_prompt_studio_png_batch_run")
-                            png_batch_cancel = gr.Button("取消", variant="stop", elem_id="llm_prompt_studio_png_batch_cancel")
-                            png_batch_append_button = gr.Button("写入当前到正面 Prompt", variant="primary", elem_id="llm_prompt_studio_png_batch_append_button")
-                            png_batch_append_all = gr.Button("写入所选到正面 Prompt", elem_id="llm_prompt_studio_png_batch_append_all")
+                        with gr.Row(elem_classes=["lps-primary-actions"]):
+                            png_batch_run = gr.Button("开始转换", variant="primary", elem_id="llm_prompt_studio_png_batch_run", elem_classes=["lps-primary"])
+                            png_batch_cancel = gr.Button("停止转换", variant="stop", elem_id="llm_prompt_studio_png_batch_cancel", elem_classes=["lps-danger"])
+                        with gr.Row(elem_classes=["lps-secondary-actions"]):
+                            png_batch_write_scope = gr.Radio(
+                                label="写回范围", choices=[("当前结果", "current"), ("已选结果", "selected")],
+                                value="current", elem_id="llm_prompt_studio_png_batch_write_scope",
+                            )
+                            png_batch_append = gr.Radio(label="写入方式", choices=[("追加", "append"), ("覆盖", "replace")], value="append", elem_id="llm_prompt_studio_png_batch_append")
+                            png_batch_append_button = gr.Button("写入结果", variant="secondary", elem_id="llm_prompt_studio_png_batch_append_button")
                             png_batch_export = gr.DownloadButton("导出结果", elem_id="llm_prompt_studio_png_batch_export")
                         png_batch_selected = gr.CheckboxGroup(
-                            label="选择要写入的结果（仅写入 txt2img 正面 Prompt）",
+                            label="选择结果（写回范围为“已选结果”时生效）",
                             choices=[], value=[], elem_id="llm_prompt_studio_png_batch_selected",
                         )
                         png_batch_table = gr.Dataframe(headers=["序号", "文件", "原始正向 Prompt", "状态", "LLM 结果", "错误"], datatype=["number", "str", "str", "str", "str", "str"], interactive=False, wrap=True, elem_id="llm_prompt_studio_png_batch_table", elem_classes=["lps-table"])
@@ -3540,7 +3961,7 @@ def on_ui_tabs():
                             outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
                         )
 
-                    with gr.Tab("直接批量导入"):
+                    with gr.Tab("直接导入"):
                         bulk_import = gr.Textbox(label="每行一条 Prompt，可使用“评分<TAB>Prompt”格式", lines=12)
                         with gr.Row():
                             bulk_output_mode = gr.Dropdown(label="缓存格式", choices=PRESET_UI_CHOICES, value=workflow["preset"])
@@ -3552,16 +3973,16 @@ def on_ui_tabs():
                         bulk_import_status = gr.Markdown()
                         bulk_preview = gr.Dataframe(headers=["序号", "评分", "Prompt"], datatype=["number", "number", "str"], interactive=False, wrap=True, label="导入预览")
 
-            with gr.Tab("缓存与联动", elem_id="llm_prompt_studio_library_tab"):
+            with gr.Tab("缓存", elem_id="llm_prompt_studio_library_tab"):
                 with gr.Row():
                     cache_query = gr.Textbox(label="搜索 Prompt、负面词、源标签或外部来源", scale=4)
                     cache_min_score = gr.Slider(label="最低评分", minimum=0, maximum=10, value=0, step=0.5, scale=2)
                     cache_output_filter = gr.Dropdown(label="格式", choices=["全部"] + PRESET_UI_CHOICES, value="全部", scale=2)
                     cache_model_filter = gr.Dropdown(label="目标模型", choices=["全部"] + MODEL_UI_CHOICES, value="全部", scale=2)
                 with gr.Row():
-                    refresh = gr.Button("应用筛选", variant="primary")
-                    clear_filters = gr.Button("清除筛选")
-                    undo_delete = gr.Button("撤销上次删除")
+                    refresh = gr.Button("应用筛选", variant="primary", elem_classes=["lps-primary"])
+                    clear_filters = gr.Button("清除筛选", elem_classes=["lps-secondary"])
+                    undo_delete = gr.Button("撤销删除", elem_classes=["lps-secondary"])
                 cache_status = gr.Markdown(f"本地缓存共 {len(initial_records)} 条记录。点击表格任意单元格可载入该行。", elem_id="llm_prompt_studio_cache_status", elem_classes=["lps-status"])
                 selected_records = gr.Dropdown(label="选择缓存记录（支持多选）", choices=_cache_choices(initial_records), value=[], multiselect=True)
                 delete_preview_state = gr.State([])
@@ -3676,25 +4097,58 @@ def on_ui_tabs():
                         export_button = gr.Button("导出全部缓存")
                     export_file = gr.File(label="导出文件", interactive=False)
 
-            with gr.Tab("连接设置", elem_id="llm_prompt_studio_connection_tab"):
-                provider = gr.Dropdown(label="Provider", choices=PROVIDER_UI_CHOICES, value=llm_settings["provider"])
-                endpoint = gr.Textbox(label="接口地址", value=llm_settings["endpoint"])
-                model = gr.Textbox(label="模型 ID", value=llm_settings["model"], placeholder="填写服务端暴露的模型名称", elem_id="llm_prompt_studio_model_id")
+            with gr.Tab("设置", elem_id="llm_prompt_studio_connection_tab"):
+                gr.Markdown("### LLM 模型设置", elem_classes=["lps-heading"])
+                with gr.Row(elem_classes=["lps-model-settings-row"]):
+                    provider = gr.Dropdown(label="服务提供方", choices=PROVIDER_UI_CHOICES, value=llm_settings["provider"], scale=1)
+                    endpoint = gr.Textbox(label="模型服务地址", value=llm_settings["endpoint"], scale=2)
+                with gr.Row(elem_classes=["lps-model-settings-row"]):
+                    model = gr.Dropdown(
+                        label="预训练模型 / 模型 ID", choices=[llm_settings["model"]] if llm_settings["model"] else [],
+                        value=llm_settings["model"], allow_custom_value=True,
+                        elem_id="llm_prompt_studio_model_id", scale=3,
+                    )
+                    discover_models = gr.Button("发现模型", elem_id="llm_prompt_studio_discover_models", scale=1)
                 api_key = gr.Textbox(label="API Key（留空则使用已保存凭据）", type="password")
-                temperature = gr.Slider(label="温度", minimum=0, maximum=2, value=llm_settings["temperature"], step=0.05)
-                timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=llm_settings["timeout"], step=5)
-                max_tokens = gr.Number(label="最大输出 Token（默认 8096）", value=llm_settings["max_tokens"], precision=0)
-                send_temperature = gr.Checkbox(label="发送温度参数（推理模型不支持时关闭）", value=llm_settings["send_temperature"])
-                test = gr.Button("测试 API", elem_id="llm_prompt_studio_test_connection")
-                with gr.Row():
-                    save_connection = gr.Button("保存全部 LLM 设置", variant="primary")
+                with gr.Accordion("高级模型选项", open=False, elem_classes=["lps-model-advanced"]):
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        model_file = gr.File(
+                            label="加载模型配置 / 权重文件",
+                            file_types=[".json", ".yaml", ".yml", ".safetensors", ".gguf", ".bin"],
+                            type="filepath", scale=2,
+                        )
+                        load_model_file = gr.Button("加载文件", scale=1)
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        fallback_model = gr.Textbox(
+                            label="权重版本回退模型", value=llm_settings["fallback_model"],
+                            placeholder="主模型失败时使用的备用模型 ID",
+                        )
+                        model_version = gr.Textbox(
+                            label="权重 / 模型版本", value=llm_settings["model_version"],
+                            placeholder="例如 2026-08 或 v1.2",
+                        )
+                    weights_path = gr.Textbox(
+                        label="本地权重路径", value=llm_settings["weights_path"],
+                        placeholder="仅供本地 LLM 服务读取；远程 API 使用模型 ID",
+                    )
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        temperature = gr.Slider(label="温度", minimum=0, maximum=2, value=llm_settings["temperature"], step=0.05)
+                        timeout = gr.Slider(label="超时秒数", minimum=5, maximum=600, value=llm_settings["timeout"], step=5)
+                        max_tokens = gr.Number(label="最大输出 Token", value=llm_settings["max_tokens"], precision=0)
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        send_temperature = gr.Checkbox(label="发送温度参数", value=llm_settings["send_temperature"])
+                        retry_count = gr.Slider(label="网络重试次数（0-5）", minimum=0, maximum=5, value=llm_settings["retry_count"], step=1)
+                with gr.Row(elem_classes=["lps-primary-actions"]):
+                    test = gr.Button("测试连接", elem_id="llm_prompt_studio_test_connection")
+                    save_connection = gr.Button("保存并应用", variant="primary")
                     clear_credentials = gr.Button("清除已保存的 API Key")
                 test_status = gr.Markdown(
-                    _credential_status(llm_settings["provider"], llm_settings["endpoint"]),
+                    _credential_status(llm_settings["provider"], llm_settings["endpoint"])
+                    + (f" 当前回退模型：{llm_settings['fallback_model']}。" if llm_settings["fallback_model"] else ""),
                     elem_id="llm_prompt_studio_connection_status",
                     elem_classes=["lps-status"],
                 )
-            with gr.Tab("工具", elem_id="llm_prompt_studio_tools_tab"):
+            with gr.Tab("更多", elem_id="llm_prompt_studio_tools_tab"):
                 with gr.Tabs(elem_id="llm_prompt_studio_tools_tabs"):
                     with gr.Tab("静态词库", elem_id="llm_prompt_studio_wildcards_tab"):
                         wildcard_path = gr.Textbox(label="静态词库目录", value=workflow["wildcard_path"], elem_id="llm_prompt_studio_wildcard_path")
@@ -3717,6 +4171,23 @@ def on_ui_tabs():
                         transform = gr.Button("使用 LLM 扩写 / 润色", variant="primary")
                         transform_output = gr.Textbox(label="LLM 处理结果", lines=8)
 
+        gr.HTML(
+            """
+            <nav class="lps-footer-nav" aria-label="工作流导航">
+              <span class="lps-footer-label">工作流</span>
+              <button type="button" data-lps-tab="llm_prompt_studio_generate_tab" onclick="this.parentElement.querySelectorAll('[data-lps-tab]').forEach(function(b){b.classList.remove('is-active');b.removeAttribute('aria-current')});this.classList.add('is-active');this.setAttribute('aria-current','true');window.llmPromptStudioAutoLoop?.navigate?.('llm_prompt_studio_generate_tab') || document.getElementById('llm_prompt_studio_generate_tab-button')?.click()"><b>1</b><span>生成</span></button>
+              <span class="lps-footer-arrow" aria-hidden="true">›</span>
+              <button type="button" data-lps-tab="llm_prompt_studio_batch_tab" onclick="this.parentElement.querySelectorAll('[data-lps-tab]').forEach(function(b){b.classList.remove('is-active');b.removeAttribute('aria-current')});this.classList.add('is-active');this.setAttribute('aria-current','true');window.llmPromptStudioAutoLoop?.navigate?.('llm_prompt_studio_batch_tab') || document.getElementById('llm_prompt_studio_batch_tab-button')?.click()"><b>2</b><span>批处理</span></button>
+              <span class="lps-footer-arrow" aria-hidden="true">›</span>
+              <button type="button" data-lps-tab="llm_prompt_studio_library_tab" onclick="this.parentElement.querySelectorAll('[data-lps-tab]').forEach(function(b){b.classList.remove('is-active');b.removeAttribute('aria-current')});this.classList.add('is-active');this.setAttribute('aria-current','true');window.llmPromptStudioAutoLoop?.navigate?.('llm_prompt_studio_library_tab') || document.getElementById('llm_prompt_studio_library_tab-button')?.click()"><b>3</b><span>缓存</span></button>
+              <span class="lps-footer-spacer"></span>
+              <button type="button" class="lps-footer-secondary" data-lps-tab="llm_prompt_studio_connection_tab" onclick="this.parentElement.querySelectorAll('[data-lps-tab]').forEach(function(b){b.classList.remove('is-active');b.removeAttribute('aria-current')});this.classList.add('is-active');this.setAttribute('aria-current','true');window.llmPromptStudioAutoLoop?.navigate?.('llm_prompt_studio_connection_tab') || document.getElementById('llm_prompt_studio_connection_tab-button')?.click()">设置</button>
+              <button type="button" class="lps-footer-secondary" data-lps-tab="llm_prompt_studio_tools_tab" onclick="this.parentElement.querySelectorAll('[data-lps-tab]').forEach(function(b){b.classList.remove('is-active');b.removeAttribute('aria-current')});this.classList.add('is-active');this.setAttribute('aria-current','true');window.llmPromptStudioAutoLoop?.navigate?.('llm_prompt_studio_tools_tab') || document.getElementById('llm_prompt_studio_tools_tab-button')?.click()">更多</button>
+            </nav>
+            """,
+            elem_id="llm_prompt_studio_footer_nav",
+        )
+
         workflow_inputs = [
             preset, system_override, base_model, safety, nsfw_injection, user_instruction,
             structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
@@ -3731,8 +4202,7 @@ def on_ui_tabs():
             batch_skip_existing, batch_skip_failed,
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
-        creative_template_button.click(lambda: GENERAL_CREATIVE_REQUEST_TEMPLATE, outputs=request)
-        kemonimimi_template_button.click(lambda: KEMONOMIMI_LOLI_BATCH_TEMPLATE, outputs=request)
+        template_button.click(_template_request, inputs=template_choice, outputs=request)
         generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
         auto_loop_dispatch.click(
             _generate_auto_loop,
@@ -3782,13 +4252,31 @@ def on_ui_tabs():
         batch_preset.change(
             _preset_base_model_update, inputs=batch_preset, outputs=all_base_model_components, queue=False,
         )
-        provider.change(_load_provider_settings, inputs=provider, outputs=[endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status])
-        test.click(_test_connection, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=test_status)
-        save_connection.click(_save_llm_settings, inputs=[provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[test_status, endpoint, model])
+        provider.change(
+            _load_provider_settings, inputs=provider,
+            outputs=[endpoint, model, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, test_status],
+        )
+        discover_models.click(
+            _discover_models, inputs=[provider, endpoint, api_key, timeout], outputs=[model, test_status],
+        )
+        load_model_file.click(
+            _load_model_file, inputs=model_file,
+            outputs=[weights_path, provider, endpoint, model, fallback_model, model_version, test_status],
+        )
+        test.click(
+            _test_connection,
+            inputs=[provider, endpoint, model, api_key, fallback_model, temperature, timeout, max_tokens, send_temperature, retry_count],
+            outputs=test_status,
+        )
+        save_connection.click(
+            _save_llm_settings,
+            inputs=[provider, endpoint, model, api_key, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count],
+            outputs=[test_status, endpoint, model, fallback_model, weights_path, model_version],
+        )
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
         ui.load(
             _load_active_connection_settings,
-            outputs=[provider, endpoint, model, temperature, timeout, max_tokens, send_temperature, test_status],
+            outputs=[provider, endpoint, model, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, test_status],
         )
         ui.load(
             _index_wildcards,
@@ -3806,40 +4294,28 @@ def on_ui_tabs():
         png_batch_selection.change(_png_batch_current, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_selection, png_batch_current])
         png_batch_run.click(
             _png_batch_run,
-            inputs=[png_batch_payload, png_batch_action, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, png_batch_cancel_id],
+            inputs=[png_batch_payload, png_batch_action, batch_preset, system_override, batch_base_model, batch_safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, gr.State("faithful"), png_batch_cancel_id],
             outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
         )
         png_batch_cancel.click(_cancel_png_batch, inputs=png_batch_cancel_id, outputs=png_batch_status, queue=False)
         png_batch_export.click(_png_batch_export_file, inputs=png_batch_payload, outputs=png_batch_export)
-        png_append_selected_event = png_batch_append_all.click(
-            fn=None,
-            inputs=[png_batch_payload, png_batch_selected, png_batch_append],
-            outputs=[png_batch_status, png_batch_append_succeeded],
-            js="(payload, selected, mode) => window.llmPromptStudioPngBatch.appendSelectedToPrompt(payload, selected, mode)",
-        )
-        png_append_selected_event.then(
-            _png_batch_mark_selected_appended,
-            inputs=[png_batch_payload, png_batch_selected, png_batch_append_succeeded],
-            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
-            queue=False,
-        )
         png_append_event = png_batch_append_button.click(
             fn=None,
-            inputs=[png_batch_current, png_batch_target, png_batch_append],
+            inputs=[png_batch_payload, png_batch_current, png_batch_selected, png_batch_write_scope, png_batch_target, png_batch_append],
             outputs=[png_batch_status, png_batch_append_succeeded],
-            js="(prompt, target, mode) => window.llmPromptStudioPngBatch.appendToPrompt(prompt, target, mode)",
+            js="(payload, current, selected, scope, target, mode) => window.llmPromptStudioPngBatch.appendScopedToPrompt(payload, current, selected, scope, target, mode)",
         )
         png_append_event.then(
-            _png_batch_advance_after_append,
-            inputs=[png_batch_payload, png_batch_selection, png_batch_append_succeeded],
-            outputs=[png_batch_payload, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
+            _png_batch_mark_appended,
+            inputs=[png_batch_payload, png_batch_selection, png_batch_selected, png_batch_write_scope, png_batch_append_succeeded],
+            outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
             queue=False,
         )
         auto_loop_start.click(
             fn=None,
-            inputs=auto_loop_request,
+            inputs=[auto_loop_request, batch_preset, batch_base_model, batch_safety, auto_loop_cache_result],
             outputs=auto_loop_status,
-            js="(request) => window.llmPromptStudioAutoLoop.generateBatch({request})",
+            js="(request, preset, baseModel, safety, cacheResult) => window.llmPromptStudioAutoLoop.generateBatch({request, preset, baseModel, safety, cacheResult})",
         )
         auto_loop_run.click(
             fn=None,
@@ -3861,9 +4337,9 @@ def on_ui_tabs():
         )
         auto_loop_generate_run.click(
             fn=None,
-            inputs=[auto_loop_request, auto_loop_target, auto_loop_write_mode, auto_loop_continuous, auto_loop_cycles, auto_loop_prompt_only],
+            inputs=[auto_loop_request, auto_loop_target, auto_loop_write_mode, auto_loop_continuous, auto_loop_cycles, auto_loop_prompt_only, batch_preset, batch_base_model, batch_safety, auto_loop_cache_result],
             outputs=auto_loop_status,
-            js="(request, target, writeMode, continuous, cycles, promptOnly) => window.llmPromptStudioAutoLoop.generateAndRun({request, target, writeMode, continuous, cycles, promptOnly})",
+            js="(request, target, writeMode, continuous, cycles, promptOnly, preset, baseModel, safety, cacheResult) => window.llmPromptStudioAutoLoop.generateAndRun({request, target, writeMode, continuous, cycles, promptOnly, preset, baseModel, safety, cacheResult})",
         )
         auto_loop_cancel.click(
             fn=_cancel_auto_loop_generation,

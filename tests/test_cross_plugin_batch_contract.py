@@ -1,8 +1,20 @@
 from pathlib import Path
+import sys
+import types
 import unittest
 
 
 ROOT = Path(__file__).parents[1]
+COLLECTOR_ROOT = ROOT.parent / "sd-webui-png-prompt-collector"
+if str(COLLECTOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(COLLECTOR_ROOT))
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+sys.modules.setdefault("gradio", types.ModuleType("gradio"))
+
+from png_prompt_collector.service import import_prompt_batch
+import prompt_studio_ui as ui
 
 
 class CrossPluginBatchContractTests(unittest.TestCase):
@@ -40,8 +52,47 @@ class CrossPluginBatchContractTests(unittest.TestCase):
         self.assertIn("only clear the explicit selection", js)
         self.assertNotIn("持续自动生图已完成", js)
         self.assertIn("_png_batch_selection_choices", ui)
-        self.assertIn('label="选择要写入的结果（仅写入 txt2img 正面 Prompt）"', ui)
+        self.assertIn('label="选择结果（写回范围为“已选结果”时生效）"', ui)
         self.assertIn("appendSelectedToPrompt", png_js)
+
+    def test_png_collector_bridge_targets_nested_textbox_inputs(self):
+        source = (ROOT / "javascript" / "llm_prompt_studio_png_batch.js").read_text(encoding="utf-8")
+        self.assertIn("function componentInput(id)", source)
+        self.assertIn('host.querySelector("textarea, input")', source)
+        self.assertIn('componentInput("llm_prompt_studio_png_batch_payload")', source)
+
+    def test_standalone_json_batch_binds_variation_mode_before_cancel_id(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        binding_start = source.index("png_batch_run.click(")
+        binding_end = source.index("png_batch_cancel.click", binding_start)
+        binding = source[binding_start:binding_end]
+        self.assertIn('gr.State("faithful"), png_batch_cancel_id', binding)
+
+    def test_processed_target_metadata_survives_collector_round_trip(self):
+        payload = {
+            "schema_version": "prompt_batch.v1",
+            "producer": {"name": "LLM Prompt Studio"},
+            "records": [{
+                "record_id": "record-1",
+                "image": {"filename": "one.png", "sha256": ""},
+                "prompt": {
+                    "positive": "1girl",
+                    "processed": "A portrait of a girl.",
+                    "processed_kind": "converted",
+                    "output_kind": "positive_prompt",
+                    "processed_preset": "Krea 2 Natural",
+                    "processed_base_model": "Krea 2",
+                },
+            }],
+        }
+        collector_record = import_prompt_batch(payload)["records"][0]
+        studio_record = ui._normalize_png_batch_payload({
+            "schema_version": "prompt_batch.v1",
+            "producer": {"name": "PNG Prompt Collector"},
+            "records": [collector_record],
+        })["records"][0]
+        self.assertEqual(studio_record["prompt"]["processed_preset"], "Krea 2 Natural")
+        self.assertEqual(studio_record["prompt"]["processed_base_model"], "Krea 2")
 
 
 if __name__ == "__main__":

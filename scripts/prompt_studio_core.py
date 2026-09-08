@@ -1777,6 +1777,78 @@ def _request_json(
     return result["value"]
 
 
+def discover_provider_models(
+    provider: str,
+    endpoint: str,
+    api_key: str = "",
+    timeout: int = 30,
+) -> list[str]:
+    """Discover model IDs without changing the active connection settings."""
+    provider = str(provider or "").strip()
+    profile = get_provider_profile(provider)
+    normalized_endpoint = validate_endpoint(endpoint)
+    protocol = profile["protocol"]
+    parsed = urllib.parse.urlsplit(normalized_endpoint)
+    path = parsed.path.rstrip("/")
+    for suffix in ("/responses", "/chat/completions", "/messages", "/generatecontent", "/api/chat", "/chat"):
+        if path.lower().endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            break
+    if protocol == "ollama_chat":
+        if path.lower().endswith("/api"):
+            path = path[:-4].rstrip("/")
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, (path or "") + "/api/tags", "", ""))
+    elif protocol == "gemini_generate_content":
+        query = urllib.parse.urlencode({"key": str(api_key or "").strip()}) if api_key else ""
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, (path or "") + "/models", query, ""))
+    else:
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, (path or "") + "/models", "", ""))
+    headers = {"Accept": "application/json", "Connection": "close", "User-Agent": "llm-prompt-studio/1.0"}
+    if api_key and protocol != "gemini_generate_content":
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        request_context = UNVERIFIED_SSL_CONTEXT if url.lower().startswith("https://") else None
+        with urllib.request.urlopen(request, timeout=max(1, int(timeout)), context=request_context) as response:
+            body = response.read(2 * 1024 * 1024 + 1)
+        if len(body) > 2 * 1024 * 1024:
+            raise RuntimeError("Model list exceeds 2 MiB")
+        data = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = _extract_error_message(error.read(64 * 1024))
+        raise LLMRequestError(
+            f"Model discovery HTTP {error.code}{': ' + detail if detail else ''}",
+            retryable=error.code in LLM_RETRYABLE_STATUS_CODES,
+            status_code=error.code,
+        ) from error
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LLMRequestError(f"Model discovery failed: {error}", retryable=True) from error
+    if not isinstance(data, dict):
+        raise RuntimeError("Model discovery returned a non-object JSON response")
+    candidates = data.get("data") or data.get("models") or []
+    if isinstance(candidates, dict):
+        candidates = candidates.get("data") or candidates.get("models") or []
+    result, seen = [], set()
+    for item in candidates if isinstance(candidates, list) else []:
+        if isinstance(item, str):
+            model_id = item.strip()
+        elif isinstance(item, dict):
+            model_id = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+            if protocol == "gemini_generate_content" and item.get("supportedGenerationMethods"):
+                if "generateContent" not in item.get("supportedGenerationMethods", []):
+                    continue
+        else:
+            model_id = ""
+        if model_id.startswith("models/"):
+            model_id = model_id.removeprefix("models/")
+        if model_id and model_id.casefold() not in seen:
+            seen.add(model_id.casefold())
+            result.append(model_id)
+    if not result:
+        raise RuntimeError(f"{provider} 返回的模型列表为空")
+    return result
+
+
 def extract_provider_text(provider: str, data: dict[str, Any]) -> str:
     if data.get("error"):
         error = data["error"]
@@ -1799,11 +1871,20 @@ def extract_provider_text(provider: str, data: dict[str, Any]) -> str:
                         return text
         return ""
     if protocol == "openai_responses":
+        # The Responses API normally exposes output text in message content,
+        # but several OpenAI-compatible gateways only return the convenience
+        # top-level field (or a response item with output_text directly).
         for item in data.get("output", []):
-            if isinstance(item, dict) and item.get("type") == "message":
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
                 for content in item.get("content", []):
-                    if isinstance(content, dict) and content.get("type") == "output_text":
-                        chunks.append(str(content.get("text") or ""))
+                    if isinstance(content, dict) and content.get("type") in {"output_text", "text"}:
+                        chunks.append(content_text(content.get("text") or content.get("content")))
+            elif item.get("type") == "output_text":
+                chunks.append(content_text(item.get("text") or item.get("content")))
+        if not any(chunks):
+            chunks.append(content_text(data.get("output_text")))
     elif protocol == "openai_chat":
         for choice in data.get("choices") or []:
             if not isinstance(choice, dict):
@@ -1856,43 +1937,58 @@ def call_llm(
     send_temperature: bool = True,
     max_retries: int = LLM_MAX_RETRIES,
     cancel_event: threading.Event | None = None,
+    fallback_model: str = "",
 ) -> str:
-    url, payload, headers = build_provider_request(provider, endpoint, model, api_key, system, user, temperature, max_tokens, send_temperature)
-    retries = max(0, min(int(max_retries), 5))
-    fallback_attempted = False
-    for attempt in range(retries + 1):
-        if cancel_event is not None and cancel_event.is_set():
-            raise LLMRequestError("LLM request cancelled", retryable=False)
+    def request_with_retries(active_model: str) -> str:
+        url, payload, headers = build_provider_request(provider, endpoint, active_model, api_key, system, user, temperature, max_tokens, send_temperature)
+        retries = max(0, min(int(max_retries), 5))
+        for attempt in range(retries + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise LLMRequestError("LLM request cancelled", retryable=False)
+            try:
+                return extract_provider_text(provider, _request_json(url, payload, headers=headers, timeout=timeout, cancel_event=cancel_event))
+            except LLMRequestError as error:
+                if not error.retryable or attempt >= retries:
+                    if error.retryable and retries:
+                        raise LLMRequestError(
+                            f"{error}（已重试 {attempt} 次）",
+                            retryable=True,
+                            status_code=error.status_code,
+                            retry_after=error.retry_after,
+                        ) from error
+                    raise
+                delay = error.retry_after if error.retry_after is not None else LLM_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                delay = max(0.0, min(float(delay), 30.0))
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        raise LLMRequestError("LLM request cancelled", retryable=False) from error
+                else:
+                    time.sleep(delay)
+            except RuntimeError as error:
+                if "response did not contain assistant text" not in str(error).lower() or attempt >= retries:
+                    raise
+                delay = LLM_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        raise LLMRequestError("LLM request cancelled", retryable=False) from error
+                else:
+                    time.sleep(delay)
+
+    primary_model = str(model or "").strip()
+    backup_model = str(fallback_model or "").strip()
+    try:
+        return request_with_retries(primary_model)
+    except Exception as primary_error:
+        if isinstance(primary_error, LLMRequestError) and str(primary_error) == "LLM request cancelled":
+            raise
+        if not backup_model or backup_model.casefold() == primary_model.casefold():
+            raise
         try:
-            return extract_provider_text(provider, _request_json(url, payload, headers=headers, timeout=timeout, cancel_event=cancel_event))
-        except LLMRequestError as error:
-            if (
-                not fallback_attempted
-                and url.lower().startswith("https://")
-                and error.retryable
-            ):
-                fallback_attempted = True
-                http_url = "http://" + url[len("https://"):]
-                try:
-                    return extract_provider_text(provider, _request_json(http_url, payload, headers=headers, timeout=timeout, cancel_event=cancel_event))
-                except LLMRequestError:
-                    pass
-            if not error.retryable or attempt >= retries:
-                if error.retryable and retries:
-                    raise LLMRequestError(
-                        f"{error}（已重试 {attempt} 次）",
-                        retryable=True,
-                        status_code=error.status_code,
-                        retry_after=error.retry_after,
-                    ) from error
-                raise
-            delay = error.retry_after if error.retry_after is not None else LLM_RETRY_BACKOFF_SECONDS * (2 ** attempt)
-            delay = max(0.0, min(float(delay), 30.0))
-            if cancel_event is not None:
-                if cancel_event.wait(delay):
-                    raise LLMRequestError("LLM request cancelled", retryable=False) from error
-            else:
-                time.sleep(delay)
+            return request_with_retries(backup_model)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"主模型 {primary_model} 失败，回退模型 {backup_model} 也失败：{fallback_error}"
+            ) from fallback_error
 
 
 def regional_format(prompt: str, mode: str, regions: int) -> str:
