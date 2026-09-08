@@ -110,7 +110,7 @@ Krea2/Anima 细节增强角色会输出固定的英文结构：`PART ONE: TAG AN
 
 默认词库目录为 `assets/wildcards/`。插件在启动、打开页面或修改词库目录时自动增量索引。词库条目会以惰性参考的形式注入 System Prompt，用于提供兼容的发型、服装、道具、环境、镜头和材质词；模型必须按画面需要选择，不能机械复制无关条目。词库中的文本被视为数据，不会覆盖系统规则。
 
-## Ranbooru 与 PNG 联动
+## Ranbooru 与 PNG 的独立入口
 
 ### Ranbooru
 
@@ -118,7 +118,7 @@ Krea2/Anima 细节增强角色会输出固定的英文结构：`PART ONE: TAG AN
 
 ### PNG Prompt Collector
 
-在内嵌 JSON 面板点击“接收 PNG Prompt Collector 当前批次”即可导入共享的 `prompt_batch.v1` 数据。处理后的 `processed`、输出类型、预设和目标底模会保留在每条图片记录中，可导出后再交给其他插件。
+在内嵌 JSON 面板点击“接收 PNG Prompt Collector 当前批次”即可导入共享的 `prompt_batch.v1` 数据。处理后的 `processed`、输出类型、预设和目标底模会保留在每条图片记录中。PNG Collector 和 Ranbooru 都只把数据交给 LLM Prompt Studio，彼此不直接交换数据。
 
 ## 缓存、队列与 API
 
