@@ -43,16 +43,29 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn("interceptForgeGenerate", linked_source)
         self.assertIn("event.stopImmediatePropagation()", linked_source)
         self.assertIn("await ensureLinkedPrompt(run)", linked_source)
-        self.assertIn("setValue(`${slot}_prompt`, original)", linked_source)
+        self.assertIn("setValue(`${slot}_prompt`, original, { emitChange: false })", linked_source)
         self.assertNotIn("inlineLoop", self.browser_source)
+
+    def test_enabling_infinite_mode_does_not_block_gradio_with_prefetch(self):
+        start = self.browser_source.index("function setInfiniteMode")
+        end = self.browser_source.index("function scheduleNextLinkedPrompt", start)
+        handler = self.browser_source[start:end]
+        self.assertIn("点击 Forge 生成后再准备本轮 Prompt", handler)
+        self.assertNotIn("ensureLinkedPrompt(run).catch", handler)
+
+    def test_forge_start_has_short_watchdog_and_prompt_restore_does_not_emit_change(self):
+        self.assertIn("const launchBudget = createTimeoutBudget(10000)", self.browser_source)
+        self.assertIn("Forge 未启动生图任务", self.browser_source)
+        self.assertIn('setValue(`${slot}_prompt`, original, { emitChange: false })', self.browser_source)
+        self.assertIn('setValue(`${slot}_prompt`, override, { emitChange: false })', self.browser_source)
 
     def test_forge_submission_is_owned_by_the_extension(self):
         self.assertNotIn("forgeConsumePromptOverride", self.browser_source)
         self.assertNotIn("forgeInfiniteBeforeGenerate", self.browser_source)
         self.assertIn("async function submitLinkedForgeGeneration", self.browser_source)
         self.assertIn("startLinkedGenerationLoop(run)", self.browser_source)
-        self.assertIn("setValue(`${slot}_prompt`, override)", self.browser_source)
-        self.assertIn("setValue(`${slot}_prompt`, original)", self.browser_source)
+        self.assertIn("setValue(`${slot}_prompt`, override, { emitChange: false })", self.browser_source)
+        self.assertIn("setValue(`${slot}_prompt`, original, { emitChange: false })", self.browser_source)
         self.assertIn("source_tags: promptValue(slot)", self.browser_source)
         self.assertIn("removePromptOverlap", self.browser_source)
 

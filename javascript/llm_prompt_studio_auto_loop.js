@@ -89,7 +89,7 @@
         return response;
     }
 
-    function setValue(id, value) {
+    function setValue(id, value, options = {}) {
         const element = input(id);
         if (!element) throw new Error(`未找到控件: ${id}`);
         const prototype = element instanceof HTMLTextAreaElement
@@ -99,7 +99,7 @@
         if (setter) setter.call(element, String(value ?? ""));
         else element.value = String(value ?? "");
         element.dispatchEvent(new Event("input", { bubbles: true }));
-        element.dispatchEvent(new Event("change", { bubbles: true }));
+        if (options.emitChange !== false) element.dispatchEvent(new Event("change", { bubbles: true }));
     }
 
     function createBackgroundTimer() {
@@ -448,6 +448,7 @@
         const generate = findButton(`${tab}_generate`);
         let sawBusy = Boolean(taskId);
         const budget = createTimeoutBudget(timeoutMs);
+        const launchBudget = createTimeoutBudget(10000);
         while (true) {
             assertActive(run);
             const currentTaskId = currentForgeTaskId(tab);
@@ -459,6 +460,9 @@
             const statusCompleted = currentStatus !== beforeStatus && SUCCESS_PATTERN.test(currentStatus);
             if (taskReplaced) {
                 throw new Error(`${tab} generation task ownership changed; prompt returned to pending`);
+            }
+            if (!sawBusy && !taskId && !statusCompleted && launchBudget.expired()) {
+                throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
             }
             if (!busy && (sawBusy || statusCompleted)) {
                 if (FAILURE_PATTERN.test(currentStatus)) throw new Error(currentStatus);
@@ -796,12 +800,14 @@
             .some((key) => previousConfig[key] !== nextConfig[key]);
         if (configChanged) stopLinkedRun(slot);
         infiniteModes[slot] = nextConfig;
-        const run = startLinkedRun(infiniteModes[slot]);
-        renderInline(slot, "warning", "LLM 无限生成正在准备首条 Prompt", "准备完成前点击 Forge 生成会自动等待");
-        ensureLinkedPrompt(run).catch((error) => {
-            if (infiniteModes[slot]?.enabled && linkedRuns[slot] === run) failLinkedRun(slot, error);
-        });
-        return "LLM 无限生成已启用，正在准备首条 Prompt";
+        startLinkedRun(infiniteModes[slot]);
+        // Do not start an LLM request from the checkbox change handler.  The
+        // request can take several seconds (or hit the provider timeout), and
+        // Gradio may keep the originating change event pending while that
+        // request is in flight.  The Forge generate interceptor prepares the
+        // prompt immediately before the actual generation instead.
+        renderInline(slot, "success", "LLM 无限生成已启用", "点击 Forge 生成后再准备本轮 Prompt");
+        return "LLM 无限生成已启用，点击 Forge 生成后准备 Prompt";
     }
 
     function scheduleNextLinkedPrompt(run) {
@@ -842,10 +848,10 @@
         const restore = () => {
             if (restored) return;
             restored = true;
-            setValue(`${slot}_prompt`, original);
+            setValue(`${slot}_prompt`, original, { emitChange: false });
             scheduleNextLinkedPrompt(run);
         };
-        setValue(`${slot}_prompt`, override);
+        setValue(`${slot}_prompt`, override, { emitChange: false });
         generateClickBypass[slot] = true;
         try {
             await runForgeGeneration(slot, run, generate, restore);
