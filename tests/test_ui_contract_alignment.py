@@ -57,6 +57,12 @@ class ChoiceContractTests(unittest.TestCase):
         self.assertEqual(ui._template_request("general"), ui.GENERAL_CREATIVE_REQUEST_TEMPLATE)
         self.assertEqual(ui._template_request("kemonimimi"), ui.KEMONOMIMI_LOLI_BATCH_TEMPLATE)
 
+    def test_kemonimimi_template_enforces_reference_scene_contract(self):
+        template = ui.KEMONOMIMI_LOLI_BATCH_TEMPLATE
+        for phrase in ("参考图共同方向", "前景/中景/背景", "批次规划", "至少三类高层因素", "LoRA 或触发词", "单个可见", "完整得体"):
+            self.assertIn(phrase, template)
+        self.assertIn("禁止输出分镜、拼图、多面板", template)
+
     def test_prompt_quality_gate_rejects_meta_and_scene_conflicts(self):
         with self.assertRaises(ValueError):
             ui._finalize_generated_prompt("Let me restart inspection of the prompt", "Natural Language", "SFW")

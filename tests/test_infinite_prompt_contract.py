@@ -148,6 +148,10 @@ if (typeof window.llmPromptStudioAutoLoop?.startInlineLoop !== "function") proce
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
+    def test_non_english_quality_error_is_retryable(self):
+        self.assertIn("输出包含非英文", self.browser_source)
+        self.assertIn("输出为空", self.browser_source)
+
     def test_replace_mode_keeps_complete_generated_prompt(self):
         compose_start = self.browser_source.index("function composePrompt")
         compose_end = self.browser_source.index("async function readInlineCache", compose_start)

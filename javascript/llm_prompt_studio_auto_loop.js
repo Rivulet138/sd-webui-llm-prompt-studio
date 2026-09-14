@@ -15,7 +15,7 @@
     function isRejectedPrompt(value) {
         const message = String(value?.message || value || "");
         return isContentBlocked(message)
-            || /LLM\s*输出不是英文|assistant text|finish_reason\s*[=:]\s*length|LLM 未返回可用 Prompt/i.test(message);
+            || /LLM\s*输出(?:不是英文|包含非英文内容)|输出包含非英文|assistant text|finish_reason\s*[=:]\s*length|LLM 未返回可用 Prompt|输出为空/i.test(message);
     }
 
     function promptRetryDelay(attempt) {
