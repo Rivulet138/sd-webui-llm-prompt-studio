@@ -25,9 +25,82 @@ def literal_assignment(path: Path, name: str):
 
 
 class ChoiceContractTests(unittest.TestCase):
+    def test_css_scope_does_not_restyle_forge_page(self):
+        source = (ROOT / "style.css").read_text(encoding="utf-8")
+        self.assertNotIn("body:has(#llm_prompt_studio_main_tabs)", source)
+        self.assertIn("#llm_prompt_studio button:not(:disabled)", source)
+
+    def test_shared_workflow_controls_are_independent(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        ui_block = source[source.index("save_workflow.click"):source.index("provider.change(")]
+        self.assertNotIn("_bind_workflow_sync(", ui_block)
+        self.assertNotIn("shared_workflow_fields", ui_block)
+        self.assertNotIn("downstream_preset_components", ui_block)
+        self.assertNotIn("downstream_base_model_components", ui_block)
+
+    def test_preset_and_base_model_have_no_cross_panel_alignment(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        ui_block = source[source.index("save_workflow.click"):source.index("provider.change(")]
+        self.assertNotIn("_preset_alignment_update", ui_block)
+        self.assertNotIn("_preset_base_model_update", ui_block)
+        self.assertNotIn("batch_base_model.change(", ui_block)
+        self.assertNotIn("batch_preset.change(", ui_block)
+
+    def test_json_payload_refresh_ignores_backend_writeback(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        self.assertIn("json_payload.input(", source)
+        self.assertIn("png_batch_payload.input(", source)
+        self.assertNotIn("json_payload.change(", source)
+        self.assertNotIn("png_batch_payload.change(", source)
+
     def test_template_picker_returns_the_selected_template(self):
         self.assertEqual(ui._template_request("general"), ui.GENERAL_CREATIVE_REQUEST_TEMPLATE)
         self.assertEqual(ui._template_request("kemonimimi"), ui.KEMONOMIMI_LOLI_BATCH_TEMPLATE)
+
+    def test_prompt_quality_gate_rejects_meta_and_scene_conflicts(self):
+        with self.assertRaises(ValueError):
+            ui._finalize_generated_prompt("Let me restart inspection of the prompt", "Natural Language", "SFW")
+        with self.assertRaises(ValueError):
+            ui._finalize_generated_prompt("a person outdoors in daylight under midnight moonlight", "Natural Language", "SFW")
+
+    def test_immutable_technical_tokens_are_extracted_without_interpretation(self):
+        source = "<lora:style_x:0.75> char_trigger red coat"
+        tokens = ui._immutable_technical_tokens(source)
+        self.assertIn("<lora:style_x:0.75>", tokens)
+        self.assertIn("char_trigger", tokens)
+        self.assertTrue(ui._preserves_immutable_technical_tokens(source, source + ", standing in a studio"))
+        self.assertFalse(ui._preserves_immutable_technical_tokens(source, "red coat, standing in a studio"))
+
+    def test_inline_empty_source_has_autonomous_generation_fallback(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        self.assertIn("Create one original, directly usable English image-generation prompt", source)
+        self.assertIn("TECHNICAL TOKENS (verbatim, excluded from semantic expansion)", source)
+
+    def test_custom_templates_are_persistent_and_callable(self):
+        stored = {}
+        with mock.patch.object(ui.gr, "update", side_effect=lambda **kwargs: kwargs, create=True), \
+             mock.patch.object(ui.DB, "get_setting", side_effect=lambda key, default=None: stored.get(key, default)), \
+             mock.patch.object(ui.DB, "set_setting", side_effect=lambda key, value: stored.__setitem__(key, value)):
+            status, update = ui._save_custom_template("夜景", "cinematic night scene")
+            self.assertIn("已保存", status)
+            self.assertIn("cinematic night scene", ui._template_request("custom:夜景"))
+            status, _ = ui._save_custom_template("夜景", "updated scene")
+            self.assertIn("已保存", status)
+            self.assertIn("updated scene", ui._template_request("custom:夜景"))
+            status, _ = ui._save_custom_template("general", "bad")
+            self.assertIn("内置模板", status)
+            status, _ = ui._delete_custom_template("custom:夜景")
+            self.assertIn("已删除", status)
+            self.assertEqual(ui._template_request("custom:夜景"), "")
+
+    def test_custom_template_controls_are_on_generate_panel(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        generate_panel = source[source.index('with gr.Tab("生成"'):source.index('with gr.Tab("批处理"')]
+        self.assertIn('elem_id="llm_prompt_studio_template_name"', generate_panel)
+        self.assertIn('elem_id="llm_prompt_studio_template_save"', generate_panel)
+        self.assertIn('elem_id="llm_prompt_studio_template_delete"', generate_panel)
+        self.assertIn('elem_id="llm_prompt_studio_template_default"', generate_panel)
+        self.assertIn('CUSTOM_TEMPLATES_SETTING = "prompt_templates_v1"', source)
 
     def test_json_writeback_scope_keeps_component_output_arity(self):
         payload = {"schema_version": ui.PNG_BATCH_SCHEMA, "producer": {}, "records": []}
@@ -82,7 +155,10 @@ class ChoiceContractTests(unittest.TestCase):
         preset_choices = literal_assignment(path, "PRESET_UI_CHOICES")
         model_choices = literal_assignment(path, "MODEL_UI_CHOICES")
         action_choices = literal_assignment(path, "ACTION_UI_CHOICES")
-        self.assertEqual({value for _, value in preset_choices}, set(core.PRESETS))
+        preset_values = {value for _, value in preset_choices}
+        self.assertTrue(set(core.PRESETS).issubset(preset_values))
+        self.assertIn("Pony / Illustrious Tags", preset_values)
+        self.assertIn("Flux Natural", preset_values)
         self.assertEqual({value for _, value in model_choices}, set(core.BASE_MODEL_GUIDANCE))
         self.assertEqual({value for _, value in action_choices}, {"Convert", "Expand", "Polish"})
 
@@ -99,6 +175,11 @@ class ChoiceContractTests(unittest.TestCase):
             self.assertEqual(ui._canonical_action(label), value)
         for label, value in ui.JSON_VARIATION_MODE_CHOICES:
             self.assertEqual(ui._canonical_variation_mode(label), value)
+
+    def test_combined_presets_resolve_their_model_profile(self):
+        self.assertEqual(ui._resolve_preset_model("Pony / Illustrious Tags", "Auto / checkpoint default"), ("Danbooru Tags", "Pony / Illustrious"))
+        self.assertEqual(ui._resolve_preset_model("Flux Natural", "Auto / checkpoint default"), ("Natural Language", "Flux"))
+        self.assertEqual(ui._resolve_preset_model("Krea 2 Natural", "Auto / checkpoint default"), ("Krea 2 Natural", "Krea 2"))
 
     def test_generate_api_forwards_fields_by_name(self):
         connection = {

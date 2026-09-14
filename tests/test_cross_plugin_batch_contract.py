@@ -48,7 +48,7 @@ class CrossPluginBatchContractTests(unittest.TestCase):
         self.assertIn("writeSelectedToPositive", ui)
         self.assertIn("selectAllRows", js)
         self.assertIn("请先勾选待使用的 Prompt", js)
-        self.assertIn('const target = "txt2img";', js)
+        self.assertIn('const target = config?.target === "img2img" ? "img2img" : "txt2img";', js)
         self.assertIn("only clear the explicit selection", js)
         self.assertNotIn("持续自动生图已完成", js)
         self.assertIn("_png_batch_selection_choices", ui)

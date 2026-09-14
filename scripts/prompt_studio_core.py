@@ -1546,7 +1546,7 @@ def validate_endpoint(endpoint: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", ""))
 
 
-def build_provider_request(provider: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 1.0, max_tokens: int = 8096, send_temperature: bool = True) -> tuple[str, dict[str, Any], dict[str, str]]:
+def build_provider_request(provider: str, endpoint: str, model: str, api_key: str, system: str, user: str, temperature: float = 1.0, max_tokens: int = 8096, send_temperature: bool = True, thinking_enabled: bool | None = None, thinking_budget: int = 0, reasoning_effort: str = "") -> tuple[str, dict[str, Any], dict[str, str]]:
     profile = get_provider_profile(provider)
     protocol = profile["protocol"]
     endpoint = validate_endpoint(endpoint)
@@ -1566,6 +1566,8 @@ def build_provider_request(provider: str, endpoint: str, model: str, api_key: st
             url = endpoint + ("/v1/responses" if not urllib.parse.urlsplit(endpoint).path else "/responses")
         headers["Authorization"] = f"Bearer {api_key}"
         payload = {"model": model, "instructions": system, "input": user}
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": str(reasoning_effort)}
         if limit:
             payload["max_output_tokens"] = limit
         if send_temperature:
@@ -1584,10 +1586,14 @@ def build_provider_request(provider: str, endpoint: str, model: str, api_key: st
         if provider == "OpenRouter":
             headers["X-OpenRouter-Title"] = "LLM Prompt Studio"
         payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        if reasoning_effort:
+            payload["reasoning_effort"] = str(reasoning_effort)
         model_name = model.casefold()
         if "deepseek" in model_name and not any(marker in model_name for marker in ("reasoner", "deepseek-r1", "-r1")):
             # DeepSeek-compatible endpoints otherwise spend most of the budget on hidden reasoning.
-            payload["thinking"] = {"type": "disabled"}
+            payload["thinking"] = {"type": "disabled" if thinking_enabled is False else "enabled"}
+            if thinking_enabled and thinking_budget:
+                payload["thinking"]["budget_tokens"] = max(1, int(thinking_budget))
         if limit:
             payload[profile.get("token_parameter", "max_tokens")] = limit
         if send_temperature:
@@ -1938,9 +1944,10 @@ def call_llm(
     max_retries: int = LLM_MAX_RETRIES,
     cancel_event: threading.Event | None = None,
     fallback_model: str = "",
+    thinking_enabled: bool | None = None, thinking_budget: int = 0, reasoning_effort: str = "",
 ) -> str:
     def request_with_retries(active_model: str) -> str:
-        url, payload, headers = build_provider_request(provider, endpoint, active_model, api_key, system, user, temperature, max_tokens, send_temperature)
+        url, payload, headers = build_provider_request(provider, endpoint, active_model, api_key, system, user, temperature, max_tokens, send_temperature, thinking_enabled, thinking_budget, reasoning_effort)
         retries = max(0, min(int(max_retries), 5))
         for attempt in range(retries + 1):
             if cancel_event is not None and cancel_event.is_set():

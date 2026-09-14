@@ -42,6 +42,9 @@ DEFAULT_LLM_SETTINGS = {
     "timeout": 90,
     "max_tokens": 8096,
     "send_temperature": True,
+    "thinking_enabled": False,
+    "thinking_budget": 0,
+    "reasoning_effort": "",
     "retry_count": 2,
     "fallback_model": "",
     "weights_path": "",
@@ -127,13 +130,15 @@ Use long but clear English sentences to confirm the subject's appearance, clothi
 
 MASTER DESCRIPTION
 Write one high-density natural-language paragraph that recombines all important details. Emphasize layered decoration, movement, camera, light, material texture, color relationships, depth, and the small story implied by the frame. Do not make it a short summary."""
-INLINE_DELTA_DIRECTIVE = """INLINE PROMPT UPDATE MODE:
-The current fixed positive Prompt is supplied as the source. Read it carefully and preserve its identity, LoRA, weights, safety limits, and explicit visual anchors. The caller will merge your answer back into that same Prompt before the next image.
-Return one complete, directly usable Prompt in the selected output format, but avoid repeating source fragments that are already present. Change only the requested visual dimensions and add concrete visible detail that is compatible with the source. Never echo the source Prompt twice, never mention this instruction, and never output multiple alternatives."""
+INLINE_DELTA_DIRECTIVE = """INLINE PROMPT CONTRACT:
+Never echo the source Prompt twice.
+When FIXED PROMPT is non-empty, it is immutable source text. Return ONLY one concise English expansion to append after it, never a rewritten or repeated source prompt. Do not alter, interpret, translate, duplicate, or include any LoRA tag (<lora:...>) or trigger token from the fixed prompt in your expansion; those technical tokens are excluded from semantic variation. Add concrete, visible, spatially compatible details and vary action, environment, camera, composition, lighting, atmosphere, or materials without contradicting fixed text. When FIXED PROMPT is empty, return one complete directly usable English image prompt that follows the user's request. In both cases output only the prompt text, with no title, explanation, analysis, alternatives, or meta commentary."""
 PRESET_UI_CHOICES = [
     ("Danbooru 标签", "Danbooru Tags"),
+    ("Pony / Illustrious 标签", "Pony / Illustrious Tags"),
     ("Danbooru 标签 + 自然语言", "Danbooru + Natural"),
     ("自然语言", "Natural Language"),
+    ("Flux 自然语言", "Flux Natural"),
     ("NoobAI 标签", "NoobAI Tags"),
     ("Anima 标签", "Anima Tags"),
     ("Krea 2 自然语言", "Krea 2 Natural"),
@@ -148,6 +153,13 @@ MODEL_UI_CHOICES = [
 ]
 PRESET_VALUE_ALIASES = {label: value for label, value in PRESET_UI_CHOICES}
 BASE_MODEL_VALUE_ALIASES = {label: value for label, value in MODEL_UI_CHOICES}
+PRESET_MODEL_OVERRIDES = {
+    "Pony / Illustrious Tags": ("Danbooru Tags", "Pony / Illustrious"),
+    "Flux Natural": ("Natural Language", "Flux"),
+    "NoobAI Tags": ("NoobAI Tags", "NoobAI"),
+    "Anima Tags": ("Anima Tags", "Anima"),
+    "Krea 2 Natural": ("Krea 2 Natural", "Krea 2"),
+}
 
 
 def _canonical_preset(value: Any) -> str:
@@ -159,6 +171,15 @@ def _canonical_preset(value: Any) -> str:
 def _canonical_base_model(value: Any) -> str:
     text = str(value or "").strip()
     return BASE_MODEL_VALUE_ALIASES.get(text, text)
+
+
+def _resolve_preset_model(preset: Any, base_model: Any) -> tuple[str, str]:
+    """Resolve the single user-facing preset into its output profile and model rules."""
+    canonical_preset = _canonical_preset(preset)
+    override = PRESET_MODEL_OVERRIDES.get(canonical_preset)
+    if override:
+        return override
+    return canonical_preset, _canonical_base_model(base_model)
 
 
 OUTPUT_UI_CHOICES = [
@@ -874,28 +895,6 @@ def _save_workflow_values(updates: dict[str, Any]) -> str:
     return "工作参数已保存。下次打开完整页和内嵌面板时会自动填入。"
 
 
-def _sync_value(value):
-    return value
-
-
-def _sync_value_pair(value):
-    return value, value
-
-
-def _sync_value_triplet(value):
-    return value, value, value
-
-
-def _bind_workflow_sync(source, outputs, event="input"):
-    if not outputs:
-        return
-    callbacks = {1: _sync_value, 2: _sync_value_pair, 3: _sync_value_triplet}
-    callback = callbacks.get(len(outputs))
-    if callback is None:
-        raise ValueError(f"Unsupported workflow synchronization target count: {len(outputs)}")
-    getattr(source, event)(callback, inputs=source, outputs=outputs, queue=False)
-
-
 def _save_workflow_settings(
     preset, system_override, base_model, safety, nsfw_injection, user_instruction,
     structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
@@ -962,7 +961,7 @@ def _connection_store() -> dict[str, Any]:
         migrated = {
             key: legacy[key]
             for key in (
-                "endpoint", "model", "temperature", "timeout", "max_tokens", "send_temperature", "retry_count",
+                "endpoint", "model", "temperature", "timeout", "max_tokens", "send_temperature", "retry_count", "thinking_enabled", "thinking_budget", "reasoning_effort",
                 "fallback_model", "weights_path", "model_version",
             )
             if key in legacy
@@ -1014,6 +1013,12 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         retry_count = max(0, min(int(saved.get("retry_count", DEFAULT_LLM_SETTINGS["retry_count"])), 5))
     except (TypeError, ValueError):
         retry_count = DEFAULT_LLM_SETTINGS["retry_count"]
+    thinking_enabled = bool(saved.get("thinking_enabled", DEFAULT_LLM_SETTINGS["thinking_enabled"]))
+    try:
+        thinking_budget = max(0, min(int(saved.get("thinking_budget", DEFAULT_LLM_SETTINGS["thinking_budget"])), 262144))
+    except (TypeError, ValueError):
+        thinking_budget = DEFAULT_LLM_SETTINGS["thinking_budget"]
+    reasoning_effort = str(saved.get("reasoning_effort") or "").strip()
     if migrated_max_tokens:
         providers = dict(store.get("providers", {}))
         migrated = dict(saved)
@@ -1032,6 +1037,9 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         "max_tokens": max_tokens,
         "send_temperature": bool(saved.get("send_temperature", profile["send_temperature"])),
         "retry_count": retry_count,
+        "thinking_enabled": thinking_enabled,
+        "thinking_budget": thinking_budget,
+        "reasoning_effort": reasoning_effort,
         "fallback_model": str(saved.get("fallback_model") or ""),
         "weights_path": str(saved.get("weights_path") or ""),
         "model_version": str(saved.get("model_version") or ""),
@@ -1052,7 +1060,7 @@ def _load_provider_settings(provider):
     return (
         settings["endpoint"], gr.update(choices=model_choices, value=settings["model"]), settings["fallback_model"],
         settings["weights_path"], settings["model_version"], settings["temperature"], settings["timeout"],
-        settings["max_tokens"], settings["send_temperature"], settings["retry_count"],
+        settings["max_tokens"], settings["send_temperature"], settings["retry_count"], settings["thinking_enabled"], settings["thinking_budget"], settings["reasoning_effort"],
         _credential_status(settings["provider"], settings["endpoint"]),
     )
 
@@ -1063,7 +1071,7 @@ def _load_active_connection_settings():
     return (
         settings["provider"], settings["endpoint"], gr.update(choices=model_choices, value=settings["model"]),
         settings["fallback_model"], settings["weights_path"], settings["model_version"], settings["temperature"],
-        settings["timeout"], settings["max_tokens"], settings["send_temperature"], settings["retry_count"],
+        settings["timeout"], settings["max_tokens"], settings["send_temperature"], settings["retry_count"], settings["thinking_enabled"], settings["thinking_budget"], settings["reasoning_effort"],
         _credential_status(settings["provider"], settings["endpoint"]),
     )
 
@@ -1567,6 +1575,7 @@ def _batch_generate(
     sources, _parse_stats = _build_inspiration_sources(
         source_text, generation_count, topic_pool, base_prompt, lock_known, sample_static,
     )
+    preset, base_model = _resolve_preset_model(preset, base_model)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     if not sources:
         yield _batch_output("没有可生成的批量任务。", gr.update(), gr.update(), existing_issues or [])
@@ -1787,7 +1796,7 @@ def _search_wildcards(query):
 
 def _save_llm_settings(
     provider, endpoint, model, api_key, fallback_model, weights_path, model_version,
-    temperature, timeout, max_tokens, send_temperature, retry_count,
+    temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled=False, thinking_budget=0, reasoning_effort="",
 ):
     provider = _canonical_provider(provider or DEFAULT_LLM_SETTINGS["provider"])
     if provider not in PROVIDER_PROFILES:
@@ -1813,6 +1822,9 @@ def _save_llm_settings(
             "max_tokens": max(0, min(int(max_tokens), 262144)),
             "send_temperature": bool(send_temperature),
             "retry_count": max(0, min(int(retry_count), 5)),
+            "thinking_enabled": bool(thinking_enabled),
+            "thinking_budget": max(0, min(int(thinking_budget or 0), 262144)),
+            "reasoning_effort": str(reasoning_effort or "").strip(),
         }
     except (TypeError, ValueError) as error:
         return f"保存失败：{_safe_error(error)}", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
@@ -1895,6 +1907,25 @@ def _clear_llm_credentials(provider, endpoint):
     return "已清除当前 Provider 与 URL 对应的 API Key。" if cleared else "当前连接没有已保存的 API Key。"
 
 
+_LORA_TOKEN_RE = re.compile(r"<lora:[^>]+>", re.IGNORECASE)
+
+
+def _immutable_technical_tokens(prompt: str) -> list[str]:
+    """Extract LoRA tags and standalone trigger tokens without interpreting them."""
+    text = str(prompt or "")
+    loras = _LORA_TOKEN_RE.findall(text)
+    # Natural-language words remain ordinary fixed prompt context. Compact
+    # activation tokens are conventionally marked by an underscore, digit, or
+    # technical separator; preserve those verbatim without semantic expansion.
+    words = re.findall(r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", text)
+    return list(dict.fromkeys([*loras, *words]))
+
+
+def _preserves_immutable_technical_tokens(source: str, candidate: str) -> bool:
+    candidate_text = str(candidate or "")
+    return all(token in candidate_text for token in _immutable_technical_tokens(source))
+
+
 def _finalize_generated_prompt(
     result, preset, safety, remove_bad=True, remove_terms="", shuffle=False, spaces=False,
     max_tags=0, structured_mode="Plain Prompt", region_count=1,
@@ -1902,6 +1933,16 @@ def _finalize_generated_prompt(
     preset = _canonical_preset(preset)
     structured_mode = _canonical_output_mode(structured_mode)
     result = str(result or "").strip()
+    if not is_english_prompt(result):
+        raise ValueError("LLM 输出包含非英文内容。")
+    lowered = result.casefold()
+    meta_markers = ("let me ", "here is", "as an ai", "writing prompt", "i will ", "restart inspection", "corrected prompt")
+    if any(marker in lowered for marker in meta_markers):
+        raise ValueError("Prompt 包含解释或自我审阅内容。")
+    if "daylight" in lowered and any(term in lowered for term in ("midnight", "moonlit", "nighttime")):
+        raise ValueError("Prompt 包含白天与夜晚冲突。")
+    if "indoors" in lowered and "outdoors" in lowered:
+        raise ValueError("Prompt 包含室内与室外冲突。")
     if safety == "SFW" and not is_sfw_output(result):
         raise ValueError("SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。")
     if preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
@@ -1930,6 +1971,11 @@ def _recommended_base_model_for_preset(preset: str):
 def _aligned_preset(preset: str, base_model: str) -> tuple[str, bool]:
     """Keep an explicit checkpoint and output profile on the same prompt protocol."""
     current = _canonical_preset(preset or "Danbooru Tags")
+    combined = PRESET_MODEL_OVERRIDES.get(current)
+    if combined:
+        current = combined[0]
+        if not base_model or _canonical_base_model(base_model) in {"", "Auto / checkpoint default", combined[1]}:
+            base_model = combined[1]
     model = _canonical_base_model(base_model or "Auto / checkpoint default")
     expected = MODEL_PRESET_ALIGNMENT.get(model)
     if expected and current != expected:
@@ -1981,7 +2027,7 @@ def _generate(
     batch_directive="", batch_history=None,
 ):
     provider = _canonical_provider(provider)
-    base_model = _canonical_base_model(base_model)
+    preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)
     preset, preset_aligned = _aligned_preset(preset, base_model)
     request_text = str(request or "").strip()
@@ -2035,7 +2081,7 @@ def _generate(
                 attempt_system = build_system_prompt(
                     preset, base_model, safety, nsfw_injection, user_instruction, examples,
                     static_tags, system_override,
-                    effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; keep the model free to choose and return one complete single-image prompt. LANGUAGE RETRY: output English only and translate any source-language descriptions into English. RESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise complete prompt directly and do not spend output on analysis or reasoning.",
+                    effective_batch_directive + "\nDIVERSITY RETRY: favor a fresh compatible interpretation of the scene, action, environment, camera, time/weather, or prop relationship; follow the required output contract and return one directly usable result. LANGUAGE RETRY: output English only and translate any source-language descriptions into English. RESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise result directly and do not spend output on analysis or reasoning.",
                     operation_instruction,
                 )
             try:
@@ -2043,7 +2089,7 @@ def _generate(
                     provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
                     min(2.0, request_temperature + 0.15 * attempt), int(timeout or 90), int(max_tokens or 0),
                     bool(send_temperature), max_retries=_connection_settings(provider)["retry_count"], cancel_event=cancel_event,
-                    fallback_model=_connection_settings(provider).get("fallback_model", ""),
+                    fallback_model=_connection_settings(provider).get("fallback_model", ""), thinking_enabled=_connection_settings(provider).get("thinking_enabled"), thinking_budget=_connection_settings(provider).get("thinking_budget", 0), reasoning_effort=_connection_settings(provider).get("reasoning_effort", ""),
                 )
             except RuntimeError as error:
                 if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
@@ -2063,12 +2109,14 @@ def _generate(
             accepted = not effective_batch_directive or (
                 not context_duplicate and _remember_diverse_output(source, candidate)
             )
-            if accepted or attempt == _MAX_DIVERSITY_RETRIES:
-                if effective_batch_directive and not accepted:
-                    _remember_diverse_output(source, candidate, force=True)
+            if accepted:
                 result = candidate
                 system = attempt_system
                 break
+            if attempt == _MAX_DIVERSITY_RETRIES:
+                # Do not poison history/cache with a known duplicate. The caller's
+                # infinite loop treats this as a failed item and advances.
+                raise ValueError("候选 Prompt 与近期结果重复，已跳过并继续生成下一条。")
     except LLMRequestError as error:
         if str(error) == "LLM request cancelled":
             return "", system, "已取消"
@@ -2108,7 +2156,7 @@ def _generate_auto_loop(
 ):
     _AUTO_LOOP_CANCEL.clear()
     provider = _canonical_provider(provider)
-    base_model = _canonical_base_model(base_model)
+    preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     if cache_result:
@@ -2151,7 +2199,7 @@ def _expand_or_polish(
 ):
     action_name = _canonical_action(action)
     provider = _canonical_provider(provider)
-    base_model = _canonical_base_model(base_model)
+    preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     instruction = build_operation_instruction(action_name, base_model)
@@ -2220,12 +2268,12 @@ def _expand_or_polish(
                     retry_directive = (
                         f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate was too similar to an existing item. "
                         "Favor a different compatible combination of setting, action, prop relationship, spatial layout, camera angle, "
-                        "time/weather, or visible daily-life context, while leaving the model free to choose; return exactly one complete single-image prompt."
+                        "time/weather, or visible daily-life context, while leaving the model free to choose; follow the required output contract and return exactly one result."
                     )
                 retry_directive += (
                     "\nLANGUAGE RETRY: the previous candidate was not English. Translate all visible prompt content into English "
                     "and return English only, with no Chinese, Japanese, Korean, Cyrillic, Arabic, or other non-Latin script. "
-                    "RESPONSE RETRY: return one concise complete prompt directly and do not spend output on analysis or reasoning."
+                    "RESPONSE RETRY: return one concise result directly and do not spend output on analysis or reasoning."
                 )
                 attempt_system = build_transform_system(retry_directive)
             try:
@@ -2234,7 +2282,7 @@ def _expand_or_polish(
                     build_user_message(source), min(2.0, request_temperature + 0.15 * attempt),
                     int(timeout or 90), int(max_tokens or 0), bool(send_temperature),
                     max_retries=_connection_settings(provider)["retry_count"], cancel_event=cancel_event,
-                    fallback_model=_connection_settings(provider).get("fallback_model", ""),
+                    fallback_model=_connection_settings(provider).get("fallback_model", ""), thinking_enabled=_connection_settings(provider).get("thinking_enabled"), thinking_budget=_connection_settings(provider).get("thinking_budget", 0), reasoning_effort=_connection_settings(provider).get("reasoning_effort", ""),
                 )
             except RuntimeError as error:
                 if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
@@ -2784,8 +2832,150 @@ def _png_batch_mark_appended(payload, selection, selected_ids, scope, succeeded)
     return _png_batch_mark_selected_appended(payload, selected_ids, succeeded)
 
 
+BUILTIN_TEMPLATE_CHOICES = [
+    ("通用创作", "general"),
+    ("兽耳角色批量", "kemonimimi"),
+]
+CUSTOM_TEMPLATES_SETTING = "prompt_templates_v1"
+DEFAULT_TEMPLATE_SETTING = "prompt_templates_default_v1"
+_INLINE_TEMPLATE_COMPONENTS: dict[str, Any] = {}
+
+
+def _custom_templates() -> dict[str, dict[str, Any]]:
+    """Return normalized structured templates, accepting legacy text-only values."""
+    stored = DB.get_setting(CUSTOM_TEMPLATES_SETTING, {}) or {}
+    if not isinstance(stored, dict):
+        return {}
+    result = {}
+    for name, value in stored.items():
+        clean_name = str(name).strip()
+        record = value if isinstance(value, dict) else {"content": value}
+        clean_value = str(record.get("content", "") or "").strip()
+        if 1 <= len(clean_name) <= 64 and 1 <= len(clean_value) <= 12000:
+            dimensions = record.get("variation_dimensions", [])
+            if isinstance(dimensions, str):
+                dimensions = [item.strip() for item in dimensions.split(",") if item.strip()]
+            result[clean_name] = {
+                "content": clean_value,
+                "preserve_fixed_prompt": bool(record.get("preserve_fixed_prompt", True)),
+                "obey_user_prompt": bool(record.get("obey_user_prompt", True)),
+                "variation_dimensions": [str(item) for item in dimensions if str(item).strip()],
+                "style_rules": str(record.get("style_rules", "") or "").strip(),
+                "forbidden_content": str(record.get("forbidden_content", "") or "").strip(),
+                "conflict_policy": str(record.get("conflict_policy", "reject_and_retry") or "reject_and_retry"),
+                "duplicate_policy": str(record.get("duplicate_policy", "skip_and_continue") or "skip_and_continue"),
+            }
+    return result
+
+
+def _template_choices():
+    return [*BUILTIN_TEMPLATE_CHOICES, *[(name, f"custom:{name}") for name in _custom_templates()]]
+
+
 def _template_request(template_name):
-    return KEMONOMIMI_LOLI_BATCH_TEMPLATE if str(template_name or "general") == "kemonimimi" else GENERAL_CREATIVE_REQUEST_TEMPLATE
+    key = str(template_name or "general")
+    if key == "kemonimimi":
+        return KEMONOMIMI_LOLI_BATCH_TEMPLATE
+    if key.startswith("custom:"):
+        record = _custom_templates().get(key[7:], {})
+        content = str(record.get("content", "")).strip()
+        if not content:
+            return ""
+        rules = [
+            f"Variation dimensions: {', '.join(record.get('variation_dimensions', []))}.",
+            f"Style rules: {record.get('style_rules')}.",
+            f"Forbidden content: {record.get('forbidden_content')}." ,
+            "Preserve the fixed Prompt verbatim." if record.get("preserve_fixed_prompt", True) else "",
+            "Follow the user's prompt as a semantic hard constraint." if record.get("obey_user_prompt", True) else "",
+            f"Conflict policy: {record.get('conflict_policy', 'reject_and_retry')}; duplicate policy: {record.get('duplicate_policy', 'skip_and_continue')}.",
+        ]
+        rendered = [item for item in rules if item and not item.endswith(": .")]
+        defaults = {"action", "environment_detail", "camera", "composition", "lighting", "atmosphere"}
+        if (set(record.get("variation_dimensions", [])) == defaults
+                and not record.get("style_rules") and not record.get("forbidden_content")
+                and record.get("preserve_fixed_prompt", True) and record.get("obey_user_prompt", True)
+                and record.get("conflict_policy") == "reject_and_retry"
+                and record.get("duplicate_policy") == "skip_and_continue"):
+            return content
+        return content + "\n\nTEMPLATE RULES:\n" + "\n".join(rendered)
+    return GENERAL_CREATIVE_REQUEST_TEMPLATE
+
+
+def _set_default_template(template_name):
+    key = str(template_name or "general").strip()
+    valid = {value for _, value in BUILTIN_TEMPLATE_CHOICES} | {f"custom:{name}" for name in _custom_templates()}
+    if key not in valid:
+        key = "general"
+    DB.set_setting(DEFAULT_TEMPLATE_SETTING, key)
+    return f"默认模板已设为：{key}"
+
+
+def _default_template_choice():
+    key = str(DB.get_setting(DEFAULT_TEMPLATE_SETTING, "general") or "general")
+    valid = {value for _, value in BUILTIN_TEMPLATE_CHOICES} | {f"custom:{name}" for name in _custom_templates()}
+    return key if key in valid else "general"
+
+
+def _save_custom_template(name, content, preserve_fixed_prompt=True, obey_user_prompt=True,
+                          variation_dimensions="", style_rules="", forbidden_content="",
+                          conflict_policy="reject_and_retry", duplicate_policy="skip_and_continue"):
+    name = str(name or "").strip()
+    content = str(content or "").strip()
+    if not name or len(name) > 64 or any(ord(char) < 32 for char in name):
+        return ("模板名称不能为空且不能超过 64 个字符。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+    if not content or len(content) > 12000:
+        return ("模板内容不能为空且不能超过 12000 个字符。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+    if name.startswith("custom:") or name in {label for label, _ in BUILTIN_TEMPLATE_CHOICES} or name in {"general", "kemonimimi"}:
+        return ("该名称保留给内置模板，请换一个名称。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+    templates = _custom_templates()
+    # Store a structured record so future editor fields can evolve without
+    # breaking existing text-only templates or callers.
+    dimensions = variation_dimensions if isinstance(variation_dimensions, list) else str(variation_dimensions or "").split(",")
+    dimensions = [item.strip() for item in dimensions if str(item).strip()]
+    templates[name] = {
+        "content": content,
+        "preserve_fixed_prompt": bool(preserve_fixed_prompt),
+        "obey_user_prompt": bool(obey_user_prompt),
+        "variation_dimensions": dimensions or ["action", "environment_detail", "camera", "composition", "lighting", "atmosphere"],
+        "style_rules": str(style_rules or "").strip(),
+        "forbidden_content": str(forbidden_content or "").strip(),
+        "conflict_policy": str(conflict_policy or "reject_and_retry"),
+        "duplicate_policy": str(duplicate_policy or "skip_and_continue"),
+    }
+    DB.set_setting(CUSTOM_TEMPLATES_SETTING, templates)
+    return (f"模板“{name}”已保存。", *(_template_dropdown_update(value=f"custom:{name}") for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+
+
+def _delete_custom_template(template_name):
+    key = str(template_name or "")
+    if not key.startswith("custom:"):
+        return ("内置模板不能删除。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+    name = key[7:]
+    templates = _custom_templates()
+    if name not in templates:
+        return ("找不到要删除的自定义模板。", *(_template_dropdown_update(value="general") for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+    del templates[name]
+    DB.set_setting(CUSTOM_TEMPLATES_SETTING, templates)
+    return (f"模板“{name}”已删除。", *(_template_dropdown_update(value="general") for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+
+
+def _template_dropdown_update(value=None):
+    updates = {"choices": _template_choices()}
+    if value is not None:
+        updates["value"] = value
+    return gr.update(**updates)
+
+
+def _load_custom_template_editor(template_name):
+    key = str(template_name or "")
+    if not key.startswith("custom:"):
+        return "", "", True, True, "", "", "", "reject_and_retry", "skip_and_continue"
+    name = key[7:]
+    record = _custom_templates().get(name, {})
+    return (name, record.get("content", ""), record.get("preserve_fixed_prompt", True),
+            record.get("obey_user_prompt", True), ", ".join(record.get("variation_dimensions", [])),
+            record.get("style_rules", ""), record.get("forbidden_content", ""),
+            record.get("conflict_policy", "reject_and_retry"), record.get("duplicate_policy", "skip_and_continue"))
 
 
 def _png_batch_export_file(payload):
@@ -2840,7 +3030,7 @@ def _ranbooru_handoff_to_png_batch(handoff_id):
     })
 
 
-def _test_connection(provider, endpoint, model, api_key, fallback_model, temperature, timeout, max_tokens, send_temperature, retry_count):
+def _test_connection(provider, endpoint, model, api_key, fallback_model, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled=False, thinking_budget=0, reasoning_effort=""):
     try:
         provider = _canonical_provider(provider)
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
@@ -2849,6 +3039,7 @@ def _test_connection(provider, endpoint, model, api_key, fallback_model, tempera
             float(temperature or 0), int(timeout or 30), max(16, min(int(max_tokens or 64), 64)), bool(send_temperature),
             max_retries=max(0, min(int(retry_count or 0), 5)),
             fallback_model=str(fallback_model or "").strip(),
+            thinking_enabled=bool(thinking_enabled), thinking_budget=int(thinking_budget or 0), reasoning_effort=str(reasoning_effort or ""),
         )
         return f"{provider} 连接成功：{output[:160]}"
     except Exception as error:
@@ -2861,20 +3052,38 @@ def _inline_generate(
     structured_mode, region_count, save_score, cache_result,
     cancel_event=None,
 ):
+    preset_key = _canonical_preset(preset)
+    preset, base_model = _resolve_preset_model(preset_key, base_model)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     saved_workflow = _workflow_settings()
-    shared_updates = {"preset": preset, "base_model": base_model, "safety": safety}
+    shared_updates = {"preset": preset_key, "base_model": base_model, "safety": safety}
     if any(saved_workflow[key] != value for key, value in shared_updates.items()):
         _save_workflow_values(shared_updates)
     connection = _connection_settings()
     current_prompt = str(source_tags or "").strip()
     variation_request = str(request or "").strip()
+    if not current_prompt and not variation_request:
+        variation_request = (
+            "Create one original, directly usable English image-generation prompt for a single coherent scene. "
+            "Choose a clear subject, action, setting, camera, lighting, and atmosphere; output only the prompt text."
+        )
     inline_source = current_prompt
     if variation_request:
         inline_source = (
-            f"{current_prompt}\n\nINLINE VARIATION REQUEST:\n{variation_request}"
+            f"FIXED PROMPT (IMMUTABLE):\n{current_prompt}\n\nINLINE VARIATION REQUEST:\n{variation_request}"
             if current_prompt else variation_request
         )
+    elif current_prompt:
+        inline_source = f"FIXED PROMPT (IMMUTABLE):\n{current_prompt}"
+    if current_prompt:
+        technical_tokens = _immutable_technical_tokens(current_prompt)
+        inline_source += (
+            "\n\nTECHNICAL TOKENS (verbatim, excluded from semantic expansion): "
+            + ", ".join(technical_tokens)
+            + ". Preserve each token exactly and do not generate replacements."
+        )
+    else:
+        inline_source = f"USER REQUEST (FOLLOW STRICTLY):\n{inline_source}" if inline_source else ""
     generated, system, status = _generate(
         "", inline_source, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         connection["provider"], connection["endpoint"], connection["model"], "",
@@ -2894,8 +3103,16 @@ def capture_prompt_component(component, **kwargs):
     """Capture native prompt textboxes so the inline panel can write to them."""
     elem_id = kwargs.get("elem_id")
     if elem_id in {"txt2img_prompt", "img2img_prompt"}:
+        slot = elem_id.split("_", 1)[0]
+        captured = _unwrap_component(component)
         with _INLINE_LOCK:
-            _PROMPT_TARGETS[elem_id.split("_", 1)[0]] = _unwrap_component(component)
+            # A rebuilt UI (Forge's "重启 UI" path re-runs create_ui()) creates brand new prompt
+            # components. Forget the previously injected slot for those, otherwise _INLINE_SLOTS
+            # suppresses the inline panel on the new layout while _PROMPT_TARGETS still points at
+            # the new component, so the panel silently disappears from the page.
+            if _PROMPT_TARGETS.get(slot) is not captured:
+                _INLINE_SLOTS.discard(slot)
+            _PROMPT_TARGETS[slot] = captured
 
 
 def inject_inline_before_negative(component, **kwargs):
@@ -2950,6 +3167,7 @@ def _create_inline_json_batch_panel(slot):
                 label="转换目标底模",
                 choices=MODEL_UI_CHOICES,
                 value="Krea 2",
+                visible=False,
                 elem_id=f"{prefix}_base_model",
             )
         with gr.Row(elem_classes=["lps-form-row"]):
@@ -3023,7 +3241,7 @@ def _create_inline_json_batch_panel(slot):
 def _create_inline_panel(slot, prompt_target):
     workflow = _workflow_settings()
     with gr.Accordion("灵感批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline"):
-        gr.Markdown("用于连续生图时换 Prompt；生成预设、目标底模和内容模式与独立面板使用同一组选项。")
+        gr.Markdown("连续生图")
         request = gr.Textbox(
             label="本轮创作要求", lines=2, placeholder="例如：复杂二次元场景，不要只生成风格词",
             elem_id=f"llm_prompt_studio_{slot}_inline_request",
@@ -3035,17 +3253,18 @@ def _create_inline_panel(slot, prompt_target):
         )
         with gr.Row(elem_classes=["lps-template-picker"]):
             inline_template_choice = gr.Dropdown(
-                label="快速模板", choices=[("通用创作", "general"), ("兽耳角色批量", "kemonimimi")],
-                value="general", elem_id=f"llm_prompt_studio_{slot}_inline_template_choice",
+                label="快速模板", choices=_template_choices(),
+                value=_default_template_choice(), elem_id=f"llm_prompt_studio_{slot}_inline_template_choice",
             )
             inline_template_button = gr.Button("填入模板", elem_id=f"llm_prompt_studio_{slot}_inline_template_button")
+            _INLINE_TEMPLATE_COMPONENTS[slot] = inline_template_choice
         with gr.Row(elem_classes=["lps-form-row"]):
             inline_preset = gr.Dropdown(
                 label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"],
                 elem_id=f"llm_prompt_studio_{slot}_inline_preset",
             )
             inline_base_model = gr.Dropdown(
-                label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"],
+                label="目标底模（由预设决定）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], visible=False,
                 elem_id=f"llm_prompt_studio_{slot}_inline_base_model",
             )
             inline_safety = gr.Radio(
@@ -3058,10 +3277,6 @@ def _create_inline_panel(slot, prompt_target):
                 elem_id=f"llm_prompt_studio_{slot}_inline_source",
             )
         with gr.Row(elem_classes=["lps-form-row", "lps-infinite-controls"]):
-            inline_infinite = gr.Checkbox(
-                label="LLM 无限生成（勾选后，Forge 每轮生成前自动等待 LLM）", value=False,
-                elem_id=f"llm_prompt_studio_{slot}_inline_infinite",
-            )
             inline_write_mode = gr.Dropdown(
                 label="本轮 LLM Prompt 合并位置",
                 choices=[
@@ -3079,9 +3294,10 @@ def _create_inline_panel(slot, prompt_target):
                 elem_id=f"llm_prompt_studio_{slot}_inline_marker",
             )
         with gr.Row():
+            inline_start = gr.Button("开始无限生成", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_start")
             inline_once = gr.Button("生成并入队", elem_id=f"llm_prompt_studio_{slot}_inline_once")
             inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
-        inline_loop_status = gr.HTML("勾选后会预生成首条；点击 Forge 生成或启动 Forge 无限生成时使用，正面 Prompt 框保持不变。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+        inline_loop_status = gr.HTML("等待开始。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
         if slot == "txt2img":
             _create_inline_json_batch_panel(slot)
         inline_template_button.click(_template_request, inputs=inline_template_choice, outputs=request)
@@ -3091,24 +3307,16 @@ def _create_inline_panel(slot, prompt_target):
             outputs=inline_loop_status,
             js=f"(request, variation, source, preset, baseModel, safety) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', request, variation, source, preset, baseModel, safety}})",
         )
-        inline_infinite.change(
+        inline_start.click(
             fn=None,
-            inputs=[inline_infinite, inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety],
+            inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety],
             outputs=inline_loop_status,
-            js=f"(enabled, writeMode, marker, request, variation, source, preset, baseModel, safety) => window.llmPromptStudioAutoLoop.setInfiniteMode({{slot: '{slot}', enabled, writeMode, marker, request, variation, source, preset, baseModel, safety}})",
+            js=f"(writeMode, marker, request, variation, source, preset, baseModel, safety) => window.llmPromptStudioAutoLoop.startInlineLoop({{slot: '{slot}', writeMode, marker, request, variation, source, preset, baseModel, safety}})",
             queue=False,
         )
-        for component in (inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety):
-            component.change(
-                fn=None,
-                inputs=[inline_infinite, inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_preset, inline_base_model, inline_safety],
-                outputs=inline_loop_status,
-                js=f"(enabled, writeMode, marker, request, variation, source, preset, baseModel, safety) => window.llmPromptStudioAutoLoop.setInfiniteMode({{slot: '{slot}', enabled, writeMode, marker, request, variation, source, preset, baseModel, safety}})",
-                queue=False,
-            )
         inline_cancel.click(
-            fn=_cancel_inline_generation, inputs=gr.State(slot), outputs=inline_loop_status,
-            js=f"(slot) => {{ window.llmPromptStudioAutoLoop.cancelInline('{slot}'); return [slot]; }}", queue=False,
+            fn=None, outputs=inline_loop_status,
+            js=f"() => window.llmPromptStudioAutoLoop.cancelInline('{slot}')", queue=False,
         )
         with _INLINE_LOCK:
             _INLINE_WORKFLOW_COMPONENTS[slot] = {
@@ -3155,6 +3363,7 @@ def _api_generate(payload: dict[str, Any]):
     payload = dict(payload or {})
     payload["preset"] = _canonical_preset(payload.get("preset", defaults["preset"]))
     payload["base_model"] = _canonical_base_model(payload.get("base_model", defaults["base_model"]))
+    payload["preset"], payload["base_model"] = _resolve_preset_model(payload["preset"], payload["base_model"])
     payload["structured_mode"] = _canonical_output_mode(payload.get("structured_mode", defaults["structured_mode"]))
     if "provider" in payload:
         payload["provider"] = _canonical_provider(payload["provider"])
@@ -3220,14 +3429,15 @@ def _api_inline_generate(payload: dict[str, Any]):
         payload["preset"] = _canonical_preset(payload["preset"])
     if "base_model" in payload:
         payload["base_model"] = _canonical_base_model(payload["base_model"])
-    allowed_fields = {"request", "source_tags", "variation", "preset", "base_model", "safety", "slot", "request_id"}
+    allowed_fields = {"request", "source_tags", "variation", "template", "preset", "base_model", "safety", "slot", "request_id"}
     unknown_fields = sorted(set(payload) - allowed_fields)
     if unknown_fields:
         raise ValueError(f"Inline API request contains unsupported fields: {', '.join(unknown_fields)}")
     workflow = _workflow_settings()
     connection = _connection_settings()
-    preset = _canonical_preset(payload.get("preset", workflow["preset"]))
-    base_model = _canonical_base_model(payload.get("base_model", workflow["base_model"]))
+    preset, base_model = _resolve_preset_model(
+        payload.get("preset", workflow["preset"]), payload.get("base_model", workflow["base_model"])
+    )
     safety = payload.get("safety", workflow["safety"])
     if preset not in PRESETS:
         raise ValueError(f"Unsupported prompt preset: {preset}")
@@ -3242,6 +3452,11 @@ def _api_inline_generate(payload: dict[str, Any]):
     if not request_id or len(request_id) > 128:
         raise ValueError("Inline request_id must contain 1 to 128 characters")
     request = str(payload.get("request") or "").strip()
+    template_key = str(payload.get("template") or "").strip()
+    if template_key:
+        template_request = _template_request(template_key)
+        if template_request and template_request not in request:
+            request = f"{request}\n\n{template_request}".strip()
     variation = str(payload.get("variation") or "").strip()
     if variation:
         request = f"{request}\n\nBATCH VARIATION SCOPE:\n{variation}" if request else variation
@@ -3291,8 +3506,9 @@ def _api_auto_loop_generate(payload: dict[str, Any]):
         raise ValueError(f"Auto loop API request contains unsupported fields: {', '.join(unknown_fields)}")
     workflow = _workflow_settings()
     connection = _connection_settings()
-    preset = _canonical_preset(payload.get("preset", workflow["preset"]))
-    base_model = _canonical_base_model(payload.get("base_model", workflow["base_model"]))
+    preset, base_model = _resolve_preset_model(
+        payload.get("preset", workflow["preset"]), payload.get("base_model", workflow["base_model"])
+    )
     safety = payload.get("safety", workflow["safety"])
     if preset not in PRESETS:
         raise ValueError(f"Unsupported prompt preset: {preset}")
@@ -3724,37 +3940,64 @@ def on_ui_tabs():
     initial_records = DB.list_prompts()
     initial_handoff_table, initial_handoff_choices, initial_handoff_status = _handoff_views()
     with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio") as ui:
-        gr.Markdown("## LLM 提示词工作室\n生成、批处理、缓存和 Forge 联动。", elem_classes=["lps-heading"])
-        gr.Markdown("模板会根据目标底模自动匹配。", elem_id="llm_prompt_studio_template_notice", elem_classes=["lps-template-notice"])
+        gr.Markdown("## LLM 提示词工作室", elem_classes=["lps-heading"])
         with gr.Tabs(elem_id="llm_prompt_studio_main_tabs"):
             with gr.Tab("生成", elem_id="llm_prompt_studio_generate_tab"):
-                with gr.Row():
-                    with gr.Column(scale=3):
+                with gr.Row(elem_classes=["lps-main-workbench"]):
+                    with gr.Column(scale=3, elem_classes=["lps-source-column"]):
                         request = gr.Textbox(
                             label="创作要求",
+                            value=_template_request(_default_template_choice()),
                             lines=4,
-                            placeholder="描述希望生成的画面，或粘贴已有提示词",
+                            placeholder="输入画面要求",
                             elem_id="llm_prompt_studio_request",
                         )
                         source_tags = gr.Textbox(
-                            label="源标签（PNG Tag 汇总可导入，优先使用）",
+                            label="固定 Prompt",
                             lines=3,
                             elem_id="llm_prompt_studio_source_tags",
                         )
                         with gr.Row(elem_classes=["lps-template-picker"]):
                             template_choice = gr.Dropdown(
-                                label="快速模板", choices=[("通用创作", "general"), ("兽耳角色批量", "kemonimimi")],
-                                value="general", elem_id="llm_prompt_studio_template_choice",
+                                label="快速模板", choices=_template_choices(),
+                                value=_default_template_choice(), elem_id="llm_prompt_studio_template_choice",
                             )
                             template_button = gr.Button("套用模板", elem_id="llm_prompt_studio_template_button")
+                        with gr.Accordion("自定义快速模板", open=False, elem_classes=["lps-template-editor"]):
+                            template_name = gr.Textbox(
+                                label="模板名称", max_lines=1, placeholder="例如：电影感夜景",
+                                elem_id="llm_prompt_studio_template_name",
+                            )
+                            template_content = gr.Textbox(
+                                label="模板内容", lines=5,
+                                placeholder="填写会反复调用的创作要求、固定风格或输出约束",
+                                elem_id="llm_prompt_studio_template_content",
+                            )
+                            with gr.Row():
+                                template_preserve_fixed = gr.Checkbox(label="固定 Prompt 完全保留", value=True)
+                                template_obey_user = gr.Checkbox(label="严格遵从用户提示词", value=True)
+                            template_variation_dimensions = gr.Textbox(
+                                label="变化维度（逗号分隔）", value="action, environment_detail, camera, composition, lighting, atmosphere",
+                                lines=2, elem_id="llm_prompt_studio_template_variation_dimensions",
+                            )
+                            template_style_rules = gr.Textbox(label="风格规则（可选）", lines=2)
+                            template_forbidden_content = gr.Textbox(label="禁止内容（可选）", lines=2)
+                            with gr.Row():
+                                template_conflict_policy = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value="reject_and_retry")
+                                template_duplicate_policy = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value="skip_and_continue")
+                            with gr.Row():
+                                template_save = gr.Button("保存模板", variant="primary", elem_id="llm_prompt_studio_template_save")
+                                template_default = gr.Button("设为默认模板", elem_id="llm_prompt_studio_template_default")
+                                template_delete = gr.Button("删除所选自定义模板", variant="stop", elem_id="llm_prompt_studio_template_delete")
+                            template_status = gr.Markdown("模板保存在本地，重启后仍可调用。", elem_id="llm_prompt_studio_template_status")
                         preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
-                        base_model = gr.Dropdown(label="目标底模（自动匹配模板）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
+                        base_model = gr.Dropdown(label="目标底模（由预设决定）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], visible=False, elem_id="llm_prompt_studio_base_model")
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
                         with gr.Accordion("高级 Prompt 约束", open=False):
                             system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=6, value=workflow["system_override"], placeholder="留空则使用所选预设。安全策略、用户要求和静态词库会自动追加。")
                             nsfw_injection = gr.Textbox(label="NSFW System Prompt 注入", lines=2, value=workflow["nsfw_injection"], placeholder="仅在 NSFW 模式下生效")
                             user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"], placeholder="例如：只返回最多 35 个标签，不使用权重")
-                    with gr.Column(scale=2):
+                    with gr.Column(scale=2, elem_classes=["lps-rules-column"]):
                         structured_mode = gr.Radio(label="输出格式", choices=OUTPUT_UI_CHOICES, value=workflow["structured_mode"])
                         region_count = gr.Slider(label="区域数量", minimum=1, maximum=8, value=workflow["region_count"], step=1)
                         with gr.Accordion("标签后处理", open=False):
@@ -3784,7 +4027,7 @@ def on_ui_tabs():
                         elem_id="llm_prompt_studio_batch_preset",
                     )
                     batch_base_model = gr.Dropdown(
-                        label="目标底模", choices=MODEL_UI_CHOICES, value=workflow["base_model"],
+                        label="目标底模（由预设决定）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], visible=False,
                         elem_id="llm_prompt_studio_batch_base_model",
                     )
                     batch_safety = gr.Radio(
@@ -3793,9 +4036,6 @@ def on_ui_tabs():
                     )
                 with gr.Tabs():
                     with gr.Tab("批量生成"):
-                        gr.Markdown(
-                            "可留空创作要求，按数量从多种题材和静态词库分类中随机抽样；也可提供角色 Tag，让 LLM 保留主体并补全动作、道具、环境、构图和光线。"
-                        )
                         batch_sources = gr.Textbox(
                             label="已有创作要求（可留空；每行一条）", lines=8,
                             placeholder="留空将自动生成多种题材；或逐行填写创作要求",
@@ -3832,7 +4072,6 @@ def on_ui_tabs():
                                 value=workflow["batch_skip_existing"],
                             )
                             batch_skip_failed = gr.Checkbox(label="单条失败后跳过并继续", value=workflow["batch_skip_failed"])
-                        gr.Markdown("批量结果统一保存为未评分，可稍后在缓存编辑器中手动调整评分。格式转换、扩写和润色仍在 PNG / Ranbooru 批处理链路中保留。")
                         with gr.Row(elem_classes=["lps-primary-actions"]):
                             batch_preview_button = gr.Button("预览任务", elem_classes=["lps-secondary"])
                             batch_generate = gr.Button("开始批量生成", variant="primary", elem_classes=["lps-primary"])
@@ -3859,10 +4098,9 @@ def on_ui_tabs():
                             batch_clear_issue_selection = gr.Button("清空选择")
                             batch_retry_selected = gr.Button("重新提交所选（每条一次）", variant="primary")
                         with gr.Accordion("另一条路径：浏览器生图队列（可选）", open=False, elem_id="llm_prompt_studio_auto_loop_tab"):
-                            gr.Markdown("浏览器队列用于逐条写回或生图；服务端队列可在页面关闭后继续。")
                             with gr.Row(elem_classes=["lps-form-row"]):
                                 auto_loop_target = gr.Radio(
-                                    label="写入目标", choices=[("正面 Prompt", "txt2img")],
+                                    label="写入目标", choices=[("txt2img 正面 Prompt", "txt2img"), ("img2img Prompt", "img2img")],
                                     value="txt2img", elem_id="llm_prompt_studio_auto_loop_target",
                                 )
                                 auto_loop_write_mode = gr.Radio(
@@ -3882,7 +4120,7 @@ def on_ui_tabs():
                                     elem_id="llm_prompt_studio_auto_loop_prompt_only",
                                 )
                                 auto_loop_cycles = gr.Number(
-                                    label="循环轮数（1-100）", value=1, minimum=1, maximum=100, precision=0,
+                                    label="循环轮数（留空或 0 = 一直运行）", value=0, minimum=0, maximum=100, precision=0,
                                     elem_id="llm_prompt_studio_auto_loop_cycles",
                                 )
                             with gr.Row(elem_classes=["lps-primary-actions"]):
@@ -3906,8 +4144,6 @@ def on_ui_tabs():
                                 elem_id="llm_prompt_studio_auto_loop_status", elem_classes=["lps-status"],
                             )
                             gr.HTML("", elem_id="llm_prompt_studio_auto_loop_log", elem_classes=["lps-auto-loop-log"])
-                            gr.Markdown("### 服务端队列")
-                            gr.Markdown("关闭页面后任务仍会继续，结果保存在本地缓存。")
                             server_queue_target = gr.Radio(
                                 label="服务端模式", choices=[("只生成 Prompt", "none")],
                                 value="none", elem_id="llm_prompt_studio_server_queue_target",
@@ -4138,6 +4374,9 @@ def on_ui_tabs():
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
                         send_temperature = gr.Checkbox(label="发送温度参数", value=llm_settings["send_temperature"])
                         retry_count = gr.Slider(label="网络重试次数（0-5）", minimum=0, maximum=5, value=llm_settings["retry_count"], step=1)
+                        thinking_enabled = gr.Checkbox(label="启用思考 / Thinking", value=llm_settings["thinking_enabled"])
+                        thinking_budget = gr.Number(label="思考预算 Token（0=默认）", value=llm_settings["thinking_budget"], minimum=0, maximum=262144, precision=0)
+                        reasoning_effort = gr.Dropdown(label="推理强度", choices=[("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high")], value=llm_settings["reasoning_effort"])
                 with gr.Row(elem_classes=["lps-primary-actions"]):
                     test = gr.Button("测试连接", elem_id="llm_prompt_studio_test_connection")
                     save_connection = gr.Button("保存并应用", variant="primary")
@@ -4152,8 +4391,9 @@ def on_ui_tabs():
                 with gr.Tabs(elem_id="llm_prompt_studio_tools_tabs"):
                     with gr.Tab("静态词库", elem_id="llm_prompt_studio_wildcards_tab"):
                         wildcard_path = gr.Textbox(label="静态词库目录", value=workflow["wildcard_path"], elem_id="llm_prompt_studio_wildcard_path")
+                        wildcard_index = gr.Button("索引静态词库", elem_id="llm_prompt_studio_wildcard_index")
                         wildcard_status = gr.Markdown(
-                            "索引会在插件启动、页面加载和目录变更时自动增量刷新。",
+                            "点击“索引静态词库”后读取目录；页面加载和输入路径不会自动扫描。",
                             elem_id="llm_prompt_studio_wildcard_status",
                             elem_classes=["lps-status"],
                         )
@@ -4203,6 +4443,27 @@ def on_ui_tabs():
             wd_endpoint, wd_model, wd_threshold, wildcard_path,
         ]
         template_button.click(_template_request, inputs=template_choice, outputs=request)
+        template_choice.change(
+            _load_custom_template_editor,
+            inputs=template_choice,
+            outputs=[template_name, template_content, template_preserve_fixed, template_obey_user,
+                     template_variation_dimensions, template_style_rules, template_forbidden_content,
+                     template_conflict_policy, template_duplicate_policy],
+            queue=False,
+        )
+        template_save.click(
+            _save_custom_template,
+            inputs=[template_name, template_content, template_preserve_fixed, template_obey_user,
+                    template_variation_dimensions, template_style_rules, template_forbidden_content,
+                    template_conflict_policy, template_duplicate_policy],
+            outputs=[template_status, template_choice, *_INLINE_TEMPLATE_COMPONENTS.values()],
+        )
+        template_default.click(_set_default_template, inputs=template_choice, outputs=template_status)
+        template_delete.click(
+            _delete_custom_template,
+            inputs=template_choice,
+            outputs=[template_status, template_choice, *_INLINE_TEMPLATE_COMPONENTS.values()],
+        )
         generate.click(_generate, inputs=[request, source_tags, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, save_score, cache_result], outputs=[output, system_preview, status])
         auto_loop_dispatch.click(
             _generate_auto_loop,
@@ -4212,49 +4473,12 @@ def on_ui_tabs():
         save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
         save_batch_workflow.click(_save_workflow_settings, inputs=batch_workflow_inputs, outputs=batch_status)
         reset_workflow.click(_reset_workflow_settings, outputs=[*workflow_inputs, workflow_status])
-        with _INLINE_LOCK:
-            inline_workflows = list(_INLINE_WORKFLOW_COMPONENTS.values())
-        shared_workflow_fields = {
-            "preset": (preset, batch_preset),
-            "base_model": (base_model, batch_base_model),
-            "safety": (safety, batch_safety),
-        }
-        for field, (generate_component, batch_component) in shared_workflow_fields.items():
-            inline_components = [components[field] for components in inline_workflows]
-            _bind_workflow_sync(generate_component, [batch_component, *inline_components], event="change")
-            _bind_workflow_sync(batch_component, [generate_component, *inline_components])
-            for current in inline_components:
-                other_inline = [component for component in inline_components if component is not current]
-                _bind_workflow_sync(current, [generate_component, batch_component, *other_inline])
-        all_preset_components = [preset, batch_preset, *[components["preset"] for components in inline_workflows]]
-        all_base_model_components = [base_model, batch_base_model, *[components["base_model"] for components in inline_workflows]]
-
-        def _preset_alignment_update(base_model_value, current_preset):
-            aligned, _changed = _aligned_preset(current_preset, base_model_value)
-            return tuple(aligned for _ in all_preset_components)
-
-        base_model.change(
-            _preset_alignment_update, inputs=[base_model, preset], outputs=all_preset_components, queue=False,
-        )
-        batch_base_model.change(
-            _preset_alignment_update, inputs=[batch_base_model, batch_preset], outputs=all_preset_components, queue=False,
-        )
-
-        def _preset_base_model_update(preset_value):
-            recommended = _recommended_base_model_for_preset(preset_value)
-            return tuple(recommended for _ in all_base_model_components)
-
-        # Selecting an output template also selects its compatible checkpoint
-        # protocol across the standalone, batch, and inline prompt panels.
-        preset.change(
-            _preset_base_model_update, inputs=preset, outputs=all_base_model_components, queue=False,
-        )
-        batch_preset.change(
-            _preset_base_model_update, inputs=batch_preset, outputs=all_base_model_components, queue=False,
-        )
+        # Preset and base-model controls are intentionally independent.  Do not register
+        # cross-panel synchronization or preset/base-model alignment callbacks here: updating one
+        # Dropdown must never write to another panel or create a Gradio event feedback loop.
         provider.change(
             _load_provider_settings, inputs=provider,
-            outputs=[endpoint, model, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, test_status],
+            outputs=[endpoint, model, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort, test_status],
         )
         discover_models.click(
             _discover_models, inputs=[provider, endpoint, api_key, timeout], outputs=[model, test_status],
@@ -4265,23 +4489,18 @@ def on_ui_tabs():
         )
         test.click(
             _test_connection,
-            inputs=[provider, endpoint, model, api_key, fallback_model, temperature, timeout, max_tokens, send_temperature, retry_count],
+            inputs=[provider, endpoint, model, api_key, fallback_model, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort],
             outputs=test_status,
         )
         save_connection.click(
             _save_llm_settings,
-            inputs=[provider, endpoint, model, api_key, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count],
+            inputs=[provider, endpoint, model, api_key, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort],
             outputs=[test_status, endpoint, model, fallback_model, weights_path, model_version],
         )
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
         ui.load(
             _load_active_connection_settings,
-            outputs=[provider, endpoint, model, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, test_status],
-        )
-        ui.load(
-            _index_wildcards,
-            inputs=wildcard_path,
-            outputs=[wildcard_status, wildcard_results],
+            outputs=[provider, endpoint, model, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort, test_status],
         )
         png_batch_payload.input(_png_batch_refresh, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected])
         png_batch_selected.change(
@@ -4355,7 +4574,7 @@ def on_ui_tabs():
             js="() => window.llmPromptStudioAutoLoop.clearQueue()",
             queue=False,
         )
-        wildcard_path.change(
+        wildcard_index.click(
             _index_wildcards,
             inputs=wildcard_path,
             outputs=[wildcard_status, wildcard_results],
@@ -4469,3 +4688,4 @@ def on_ui_tabs():
         export_selected.click(_export_selected, inputs=[selected_records, export_format], outputs=[cache_status, export_file])
         export_button.click(_export_cache, inputs=export_format, outputs=[cache_status, export_file])
     return [(ui, "LLM 提示词工作室", "llm_prompt_studio")]
+

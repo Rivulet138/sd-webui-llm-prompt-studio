@@ -13,12 +13,14 @@ class InfinitePromptContractTests(unittest.TestCase):
         cls.ui_source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
         cls.entry_source = (ROOT / "scripts" / "llm_prompt_studio.py").read_text(encoding="utf-8")
 
-    def test_inline_panel_exposes_checkbox_and_temporary_merge_positions(self):
-        self.assertIn('label="LLM 无限生成（勾选后，Forge 每轮生成前自动等待 LLM）"', self.ui_source)
+    def test_inline_panel_exposes_start_stop_buttons_and_merge_positions(self):
+        self.assertIn('inline_start = gr.Button("开始无限生成"', self.ui_source)
+        self.assertIn('inline_cancel = gr.Button("停止"', self.ui_source)
+        self.assertNotIn("inline_infinite", self.ui_source)
         self.assertIn('label="本轮 LLM Prompt 合并位置"', self.ui_source)
         for value in ("append_end", "append_start", "replace", "marker"):
             self.assertIn(f'"{value}"', self.ui_source)
-        self.assertIn("正面 Prompt 框保持不变", self.ui_source)
+        self.assertIn("正面 Prompt 框保持不变", self.browser_source)
 
     def test_hidden_gradio_generation_bridge_is_removed(self):
         panel_start = self.ui_source.index("def _create_inline_panel")
@@ -35,23 +37,31 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertNotIn("持续生成并入队", panel_source)
         self.assertNotIn("轮数（0 = 持续）", panel_source)
 
-    def test_forge_click_waits_for_a_prepared_llm_prompt(self):
-        linked_start = self.browser_source.index("const infiniteModes")
+    def test_explicit_loop_waits_for_a_prepared_llm_prompt(self):
+        linked_start = self.browser_source.index("function inlineConfig")
         linked_end = self.browser_source.index("async function inlineOnce", linked_start)
         linked_source = self.browser_source[linked_start:linked_end]
         self.assertIn("preparedPrompt", linked_source)
-        self.assertIn("interceptForgeGenerate", linked_source)
-        self.assertIn("event.stopImmediatePropagation()", linked_source)
+        self.assertIn("startInlineLoop", linked_source)
+        self.assertNotIn("interceptForgeGenerate", self.browser_source)
         self.assertIn("await ensureLinkedPrompt(run)", linked_source)
         self.assertIn("setValue(`${slot}_prompt`, original, { emitChange: false })", linked_source)
-        self.assertNotIn("inlineLoop", self.browser_source)
 
-    def test_enabling_infinite_mode_does_not_block_gradio_with_prefetch(self):
-        start = self.browser_source.index("function setInfiniteMode")
+    def test_start_button_releases_gradio_before_running_the_loop(self):
+        start = self.browser_source.index("function startInlineLoop")
         end = self.browser_source.index("function scheduleNextLinkedPrompt", start)
         handler = self.browser_source[start:end]
-        self.assertIn("点击 Forge 生成后再准备本轮 Prompt", handler)
+        self.assertIn("window.setTimeout", handler)
+        self.assertIn("startLinkedGenerationLoop(run)", handler)
+        self.assertNotIn("async function startInlineLoop", self.browser_source)
         self.assertNotIn("ensureLinkedPrompt(run).catch", handler)
+        binding_start = self.ui_source.index("inline_start.click(")
+        binding_end = self.ui_source.index("with _INLINE_LOCK:", binding_start)
+        bindings = self.ui_source[binding_start:binding_end]
+        self.assertIn("startInlineLoop", bindings)
+        self.assertIn("cancelInline", bindings)
+        self.assertNotIn(".change(", bindings)
+        self.assertNotIn("fn=_cancel_inline_generation", bindings)
 
     def test_forge_start_has_short_watchdog_and_prompt_restore_does_not_emit_change(self):
         self.assertIn("const launchBudget = createTimeoutBudget(10000)", self.browser_source)
@@ -68,6 +78,8 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn("setValue(`${slot}_prompt`, original, { emitChange: false })", self.browser_source)
         self.assertIn("source_tags: promptValue(slot)", self.browser_source)
         self.assertIn("removePromptOverlap", self.browser_source)
+        self.assertIn("preservesImmutableTechnicalTokens", self.browser_source)
+        self.assertIn("固定 Prompt 完整性校验失败", self.browser_source)
 
     def test_inline_requests_are_serialized_and_cancellable_by_request_id(self):
         self.assertIn("_INLINE_REQUEST_LOCKS", self.ui_source)
@@ -85,7 +97,7 @@ class InfinitePromptContractTests(unittest.TestCase):
             self.assertIn(f'"{host}"', self.entry_source)
 
     def test_extension_infinite_scheduler_waits_for_each_forge_generation(self):
-        self.assertIn("while (infiniteModes[run.slot]?.enabled", self.browser_source)
+        self.assertIn("while (linkedRuns[run.slot] === run)", self.browser_source)
         self.assertIn("await submitLinkedForgeGeneration(run)", self.browser_source)
         self.assertIn("await runForgeGeneration(slot, run, generate, restore)", self.browser_source)
         self.assertIn("interrupt.addEventListener", self.browser_source)
@@ -102,13 +114,15 @@ class InfinitePromptContractTests(unittest.TestCase):
         for field in ("preset", "baseModel", "safety"):
             self.assertIn(field, self.browser_source)
         self.assertIn("inline_preset, inline_base_model, inline_safety", self.ui_source)
+        self.assertIn('"template"', self.ui_source)
+        self.assertIn('template:', self.browser_source)
         self.assertIn("preset, baseModel, safety, cacheResult", self.ui_source)
 
-    def test_browser_batch_rounds_are_explicitly_bounded(self):
-        self.assertIn('label="循环轮数（1-100）"', self.ui_source)
-        self.assertIn("minimum=1, maximum=100", self.ui_source)
-        self.assertIn("Math.min(100, Math.max(1", self.browser_source)
-        self.assertNotIn("0 表示持续到取消", self.ui_source)
+    def test_browser_batch_supports_bounded_and_unbounded_rounds(self):
+        self.assertIn('label="循环轮数（留空或 0 = 一直运行）"', self.ui_source)
+        self.assertIn("minimum=0, maximum=100", self.ui_source)
+        self.assertIn("cycleLimit === null || completedCycles < cycleLimit", self.browser_source)
+        self.assertIn("点击停止结束", self.browser_source)
 
     def test_browser_script_loads_without_runtime_reference_errors(self):
         harness = r'''
@@ -123,7 +137,7 @@ global.window = {
     localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
 };
 vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"), { filename: process.argv[1] });
-if (typeof window.llmPromptStudioAutoLoop?.setInfiniteMode !== "function") process.exit(2);
+if (typeof window.llmPromptStudioAutoLoop?.startInlineLoop !== "function") process.exit(2);
 '''
         result = subprocess.run(
             ["node", "-e", harness, str(ROOT / "javascript" / "llm_prompt_studio_auto_loop.js")],
