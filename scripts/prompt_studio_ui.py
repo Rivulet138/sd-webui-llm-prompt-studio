@@ -56,21 +56,13 @@ GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创
 保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
 
 本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
-KEMONOMIMI_LOLI_BATCH_TEMPLATE = """请围绕原始 Prompt 的核心主体，批量创作一组彼此完全不同的、可直接用于扩散模型的二次元可爱小萝莉单图 Prompt。
+KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 生成一组可直接用于扩散模型的兽耳幼态可爱角色单图 Prompt。
 
-参考图共同方向：单个可见的可爱幼态兽耳角色，头身比例自然，精致大眼和柔和表情，清楚可辨的兽耳、蓬松尾巴、完整得体的服装与小配饰。画面像一张已经发生的生活化瞬间：角色和道具、地面、建筑或自然环境有明确关系，颜色和材质相互协调，细节服务于主体，不用无意义的装饰填满画面。
+每条只包含一个可见角色和一个完整瞬间。保持自然头身比例、精致大眼、柔和表情、清晰兽耳、蓬松尾巴、完整得体的服装与配饰。明确描写角色外观、服装、动作、表情、地点、关键道具及互动、空间层次、镜头、时间或天气、光照和主色彩；动作、姿态、手脚、耳朵、尾巴、视线、道具和环境必须相互协调，背景只服务于主体和空间感。
 
-每条结果只描写一个角色和一个连续瞬间，并写清楚角色外观（毛色、发色、瞳色、耳型、尾巴）、服装与配饰、正在发生的动作、具体表情、地点、一个关键道具及其使用或接触关系、前景/中景/背景层次、景别与视角、时间或天气、现场光照和主色彩。姿态必须自然，手脚和视线要有明确去向。
+批次中的每条至少改变三项高层因素（地点、动作、服装、道具、时间/天气、镜头或色彩），形成不同的生活化事件；避免只改颜色、耳型、地点名或同义词，避免重复构图和道具组合。静态词库仅在符合画面时选用。
 
-批次规划：不同条目必须同时改变至少三类高层因素，例如地点、动作、服装轮廓、道具用途、天气/时间、镜头视角或主色彩；不要只替换发色、耳型、一个地点名或同义词。相邻条目避免重复相同的构图、姿态、道具和光线组合。先确定“角色正在这里做什么”的清晰画面，再补充少量支持该画面的细节。静态词库只能选择彼此兼容且确实可见的元素，不能机械拼接。
-
-禁止输出分镜、拼图、多面板、连续镜头、角色设定表或多个候选方案。
-
-固定内容保护：原始 Prompt 中已有的角色身份、用户明确指定的外观、内容限制、LoRA、触发词、权重和其他技术 token 由 Forge 自动保留。不要复述、翻译、改写、拆分、解释或重新排列这些固定内容；不要把 LoRA 或触发词当作角色细节扩写。固定 Prompt 非空时只生成新增的场景扩写，固定 Prompt 为空时遵从用户提示词；仅当用户提示也为空，才自行补足主体。
-
-不要新增画师名、工作室名、作品名、艺术风格词、渲染媒介词、美学标签或质量宣传词，不要输出负面 Prompt 或元话语。避免性化、暴露或不适合幼态角色的内容，服装保持完整得体。
-
-只返回一条完整的正向内容 Prompt，不要解释、标题、Markdown、负面 Prompt 或备选方案。输出语言、标签或自然语言格式、字段顺序和结构由当前选中的 System Prompt 预设决定。"""
+固定 Prompt、用户要求和安全限制优先，新增内容不得覆盖或改变它们。"""
 KREA_ANIMA_POLISH_ROLE = """Role: Krea2 & Anima extreme-detail expansion prompt engineer for Japanese light-novel illustrations.
 
 Task: From the user's text, tags, or reference image description, produce one complete full-English image prompt. Detail is the highest priority. Actively decompose every useful visible element instead of giving a short summary.
@@ -1970,6 +1962,11 @@ def _processed_kind_for_preset(preset: str) -> str:
 
 def _recommended_base_model_for_preset(preset: str):
     return PRESET_BASE_MODEL_DEFAULTS.get(_canonical_preset(preset), "Auto / checkpoint default")
+
+
+def _preset_text(preset: str):
+    """Return the selected output preset text for the UI editor."""
+    return PRESETS.get(_canonical_preset(preset), "")
 
 
 def _aligned_preset(preset: str, base_model: str) -> tuple[str, bool]:
@@ -3995,7 +3992,13 @@ def on_ui_tabs():
                                 template_delete = gr.Button("删除所选自定义模板", variant="stop", elem_id="llm_prompt_studio_template_delete")
                             template_status = gr.Markdown("模板保存在本地，重启后仍可调用。", elem_id="llm_prompt_studio_template_status")
                         preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
-                        base_model = gr.Dropdown(label="目标底模（由预设决定）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], visible=False, elem_id="llm_prompt_studio_base_model")
+                        with gr.Accordion("查看 / 编辑预设", open=False, elem_classes=["lps-preset-editor"]):
+                            preset_editor = gr.Textbox(
+                                label="所选预设内容", lines=8, value=PRESETS.get(workflow["preset"], ""),
+                                elem_id="llm_prompt_studio_preset_editor",
+                            )
+                            preset_editor_apply = gr.Button("应用到当前 System Prompt", elem_id="llm_prompt_studio_preset_editor_apply")
+                        base_model = gr.Dropdown(label="模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"])
                         with gr.Accordion("高级 Prompt 约束", open=False):
                             system_override = gr.Textbox(label="自定义 System Prompt（可选）", lines=6, value=workflow["system_override"], placeholder="留空则使用所选预设。安全策略、用户要求和静态词库会自动追加。")
@@ -4031,7 +4034,7 @@ def on_ui_tabs():
                         elem_id="llm_prompt_studio_batch_preset",
                     )
                     batch_base_model = gr.Dropdown(
-                        label="目标底模（由预设决定）", choices=MODEL_UI_CHOICES, value=workflow["base_model"], visible=False,
+                        label="模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"],
                         elem_id="llm_prompt_studio_batch_base_model",
                     )
                     batch_safety = gr.Radio(
@@ -4477,6 +4480,8 @@ def on_ui_tabs():
         save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
         save_batch_workflow.click(_save_workflow_settings, inputs=batch_workflow_inputs, outputs=batch_status)
         reset_workflow.click(_reset_workflow_settings, outputs=[*workflow_inputs, workflow_status])
+        preset.change(_preset_text, inputs=preset, outputs=preset_editor, queue=False)
+        preset_editor_apply.click(lambda text: str(text or ""), inputs=preset_editor, outputs=system_override, queue=False)
         # Preset and base-model controls are intentionally independent.  Do not register
         # cross-panel synchronization or preset/base-model alignment callbacks here: updating one
         # Dropdown must never write to another panel or create a Gradio event feedback loop.
