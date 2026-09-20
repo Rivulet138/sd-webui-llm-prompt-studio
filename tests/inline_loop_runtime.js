@@ -517,6 +517,73 @@ test("deferred Gradio submission captures the generated prompt before restoratio
     assert.deepEqual(h.interrupts, ["txt2img"]);
 });
 
+for (const slot of ["txt2img", "img2img"]) {
+    test(`${slot} idle native LoRA edits do not invoke Studio`, async () => {
+        const h = harness();
+        const field = h.nodes.get(`${slot}_prompt`).child;
+        let writes = 0;
+        let value = field.value;
+        Object.defineProperty(field, "value", {
+            get: () => value,
+            set: next => { writes += 1; value = next; },
+        });
+        for (const edited of ["subject, <lora:sample:1>", "subject"]) {
+            field.value = edited;
+            const manualWrites = writes;
+            field.dispatchEvent(new Event("input"));
+            field.dispatchEvent(new Event("change"));
+            await h.advance(1000);
+            assert.equal(writes, manualWrites, "Studio must not write on native edits");
+            assert.equal(h.prompt(slot), edited);
+        }
+        assert.equal(h.requests.length, 0);
+        assert.equal(h.submissions.length, 0);
+    });
+
+    for (const removeLora of [false, true]) {
+        test(`${slot} preserves LoRA ${removeLora ? "removal" : "addition"} during delayed Forge launch`, async () => {
+            const h = harness({ submitDelay: 200 });
+            const field = h.nodes.get(`${slot}_prompt`).child;
+            field.value = "fixed subject, <lora:original:1>";
+            h.api.startInlineLoop({ ...config, slot });
+            await h.advance();
+            h.requests[0].resolve("new scenery");
+            await h.advance(50);
+            const edited = removeLora ? "  fixed subject, new scenery\n" : `${field.value}, <lora:added:0.5>  \n`;
+            field.value = edited;
+            field.dispatchEvent(new Event("input"));
+            await h.advance(200);
+            assert.equal(h.prompt(slot), edited, "restoration must preserve the exact manual edit");
+            assert.deepEqual(h.submissions, [{ slot, prompt: edited }]);
+            assert.equal(h.requests.length, 2);
+            assert.equal(h.requests[1].body.source_tags, edited.trim(), "prefetch must use the new source");
+            h.api.cancelInline(slot);
+        });
+    }
+
+    for (const submitDelay of [200, null]) {
+        for (const cancel of [false, true]) {
+            test(`${slot} preserves edits on ${submitDelay === null ? "launch timeout" : "launch completion"}${cancel ? " after cancellation" : ""}`, async () => {
+                const h = harness({ submitDelay });
+                h.api.startInlineLoop({ ...config, slot });
+                await h.advance();
+                h.requests[0].resolve("startup scenery");
+                await h.advance(50);
+                const edited = "  manually edited, <lora:replacement:0.8>\n";
+                h.nodes.get(`${slot}_prompt`).child.value = edited;
+                if (cancel) h.api.cancelInline(slot);
+                await h.advance(submitDelay === null ? 10000 : 200);
+                assert.equal(h.prompt(slot), edited);
+                if (submitDelay === null || cancel) {
+                    assert.equal(h.requests.length, 1, "failed or cancelled launch must not prefetch");
+                }
+                if (submitDelay !== null && cancel) assert.deepEqual(h.interrupts, [slot]);
+                h.api.cancelInline(slot);
+            });
+        }
+    }
+}
+
 for (const [submitDelay, cancelAt] of [[16, 10], [16, 20], [60, 10]]) {
     test(`stop at ${cancelAt}ms interrupts a Forge task submitted at ${submitDelay}ms`, async () => {
         const h = harness({ submitDelay });

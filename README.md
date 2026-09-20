@@ -176,4 +176,4 @@ git -C extensions/sd-webui-llm-prompt-studio pull --ff-only
 - [PNG 提示词采集器](https://github.com/Rivulet138/sd-webui-png-prompt-collector)：从已有 PNG 图片的生成信息中提取提示词。
 - [Ranbooru Forge Neo](https://github.com/Rivulet138/sd-webui-ranbooru-Forge-neo)：采集和缓存 Booru 图片站的标签提示词。
 
-更多资料：[项目说明](ABOUT.md) · [更新记录](CHANGELOG.md) · [界面约定](PRODUCT.md) · [开发与验证](docs/DEVELOPMENT.md)
+更多资料：[更新记录](CHANGELOG.md) · [开发与验证](docs/DEVELOPMENT.md)

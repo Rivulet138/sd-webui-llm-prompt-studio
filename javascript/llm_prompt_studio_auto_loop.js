@@ -924,7 +924,10 @@
         const restore = () => {
             if (restored) return;
             restored = true;
-            setValue(`${slot}_prompt`, original, { emitChange: false });
+            // Restore only our temporary value; preserve edits made while Forge starts.
+            if (promptRawValue(slot) === override) {
+                setValue(`${slot}_prompt`, original, { emitChange: false });
+            }
             scheduleNextLinkedPrompt(run);
         };
         setValue(`${slot}_prompt`, override, { emitChange: false });
