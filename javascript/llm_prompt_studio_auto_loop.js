@@ -15,7 +15,7 @@
     function isRejectedPrompt(value) {
         const message = String(value?.message || value || "");
         return isContentBlocked(message)
-            || /LLM\s*输出(?:不是英文|包含非英文内容)|输出包含非英文|assistant text|finish_reason\s*[=:]\s*length|LLM 未返回可用 Prompt|输出为空/i.test(message);
+            || /assistant text|finish_reason\s*[=:]\s*length|LLM 未返回可用 Prompt|输出为空|不是英文|输出包含非英文|not English/i.test(message);
     }
 
     function promptRetryDelay(attempt) {
@@ -35,6 +35,7 @@
     const inlineRuns = { txt2img: null, img2img: null };
     const linkedRuns = { txt2img: null, img2img: null };
     const inlineCacheCursors = { txt2img: 0, img2img: 0 };
+    const processedCacheCursors = { txt2img: 0, img2img: 0 };
     const serverQueueWatchers = new Map();
     const CHOICE_ALIASES = Object.freeze({
         "Danbooru 标签": "Danbooru Tags",
@@ -46,6 +47,11 @@
         "自动 / 使用底模默认规则": "Auto / checkpoint default",
         "LLM 自动生成": "llm",
         "缓存顺序读取": "cache",
+        "原始缓存顺序读取": "cache",
+        "原始缓存库": "cache",
+        "处理结果库": "processed_cache",
+        "处理结果库顺序读取": "processed_cache",
+        "处理结果顺序读取": "processed_cache",
         "追加到后面": "append_end",
         "追加到前面": "append_start",
         "替换当前 Prompt": "replace",
@@ -86,6 +92,31 @@
         if (checked && checked.type !== "checkbox") return normalizeChoiceValue(checked.value, fallback);
         const element = host.querySelector("textarea, input, select");
         return element ? normalizeChoiceValue(element.value, fallback) : fallback;
+    }
+
+    function readTxt2imgSettings() {
+        const raw = (id, fallback = "") => componentValue(`txt2img_${id}`, fallback);
+        const number = (id, fallback) => {
+            const value = Number(raw(id, fallback));
+            return Number.isFinite(value) ? value : fallback;
+        };
+        const checked = (id, fallback = false) => {
+            const host = find(`txt2img_${id}`);
+            const element = host?.querySelector('input[type="checkbox"]');
+            return element ? Boolean(element.checked) : fallback;
+        };
+        return JSON.stringify({
+            "negative_prompt": String(componentValue("txt2img_neg_prompt", "") || ""),
+            steps: number("steps", 20), width: number("width", 1024), height: number("height", 1024),
+            cfg_scale: number("cfg_scale", 6), distilled_cfg_scale: number("distilled_cfg_scale", 3),
+            "sampler_name": raw("sampling", "Euler"), seed: number("seed", -1),
+            batch_size: number("batch_size", 1), batch_count: number("batch_count", 1),
+            enable_hr: checked("hr", false), hr_scale: number("hr_scale", 2),
+            hr_resize_x: number("hr_resize_x", 0), hr_resize_y: number("hr_resize_y", 0),
+            denoising_strength: number("denoising_strength", 0.6),
+            hr_second_pass_steps: number("hires_steps", 0), hr_upscaler: raw("hr_upscaler", ""),
+            hr_cfg: number("hr_cfg", 6), hr_distilled_cfg: number("hr_distilled_cfg", 3),
+        });
     }
 
     function normalizeChoiceValue(value, fallback = "") {
@@ -273,34 +304,17 @@
     }
 
     function saveQueue() {
-        try {
-            state.lastSaveFailure = "";
-            window.localStorage.setItem(QUEUE_KEY, JSON.stringify({
-                version: 2,
-                rows: state.queue,
-                requestIds: Array.from(state.requestIds),
-            }));
-            state.persistent = true;
-            return true;
-        } catch (error) {
-            state.persistent = false;
-            state.lastSaveFailure = "storage";
-            render("warning", "队列仅保存在内存中 (not persistent)", String(error?.message || error));
-            return false;
-        }
+        state.persistent = false;
+        state.lastSaveFailure = "";
+        return true;
     }
 
     function loadQueue() {
         try {
-            const raw = window.localStorage.getItem(QUEUE_KEY);
-            const migration = migrateQueue(raw ? JSON.parse(raw) : []);
-            state.queue = migration.rows;
-            state.requestIds = migration.requestIds;
+            window.localStorage.removeItem(QUEUE_KEY);
+            state.queue = [];
+            state.requestIds = new Set();
             renderQueue();
-            if (!saveQueue()) return;
-            if (migration.duplicateCount || migration.emptyCount) {
-                render("warning", "已整理历史 Prompt 队列", `移除重复 ${migration.duplicateCount} 条，空记录 ${migration.emptyCount} 条`);
-            }
         } catch (error) {
             state.queue = [];
             state.requestIds = new Set();
@@ -424,8 +438,6 @@
     function enqueuePrompt(prompt, request = "") {
         const value = String(prompt || "").trim();
         if (!value) throw new Error("LLM 未返回可用 Prompt");
-        const key = canonicalPrompt(value);
-        if (state.queue.some((row) => canonicalPrompt(row.prompt) === key && row.status !== STATUS.completed)) return false;
         const row = {
             index: state.queue.length + 1,
             id: createId("row"),
@@ -478,6 +490,11 @@
 
     function inlineId(slot, suffix) {
         return `llm_prompt_studio_${slot}_inline_${suffix}`;
+    }
+
+    function sharedWorkflowValue(suffix, fallback = "") {
+        const value = componentValue(`llm_prompt_studio_${suffix}`, "");
+        return value || fallback;
     }
 
     function promptValue(slot) {
@@ -534,6 +551,9 @@
         const base = rawBase.trim();
         const generatedText = String(generated || "").trim();
         if (mode === "replace") return generatedText;
+        if (mode === "marker" && !base.includes(String(marker || "{{LLM}}").trim() || "{{LLM}}")) {
+            throw new Error("当前 Prompt 中没有插入标记，请添加标记或更换写入方式");
+        }
         const delta = removePromptOverlap(base, generated);
         if (!delta) return base;
         const join = (left, right) => [String(left || "").trim().replace(/[\s,]+$/, ""), String(right || "").trim().replace(/^[\s,]+/, "")].filter(Boolean).join(", ");
@@ -541,7 +561,6 @@
         if (mode === "marker") {
             const token = String(marker || "{{LLM}}").trim() || "{{LLM}}";
             if (base.includes(token)) return base.replace(token, delta);
-            return join(base, delta);
         }
         return join(base, delta);
     }
@@ -558,36 +577,17 @@
         return immutableTechnicalTokens(source).every((token) => target.includes(token));
     }
 
-    async function readInlineCache(slot, run) {
-        assertActive(run);
-        if (typeof window.fetch !== "function") throw new Error("浏览器不支持 Fetch，无法读取 Prompt 缓存");
-        if (run.abortController) throw new Error("LLM Studio 当前已有生成任务");
-        const controller = typeof window.AbortController === "function" ? new window.AbortController() : null;
-        run.abortController = controller;
-        try {
-            const response = await studioFetch("/llm-prompt-studio/v1/cache?limit=1000", {
-                cache: "no-store",
-                ...(controller ? { signal: controller.signal } : {}),
-            });
-            let data = null;
-            try { data = await response.json(); } catch { data = null; }
-            if (!response.ok) throw new Error(String(data?.detail || `读取缓存失败：HTTP ${response.status}`));
-            const records = Array.isArray(data?.records)
-                ? data.records.filter((record) => String(record?.prompt || "").trim())
-                : [];
-            if (!records.length) throw new Error("缓存为空，请先生成或导入 Prompt");
-            const position = inlineCacheCursors[slot] % records.length;
-            inlineCacheCursors[slot] = position + 1;
-            const prompt = String(records[position].prompt || "").trim();
-            assertActive(run);
-            if (!prompt) throw new Error("缓存记录没有可用 Prompt");
-            return prompt;
-        } catch (error) {
-            if (controller?.signal.aborted || run.cancelled) throw new Error("已取消");
-            throw error;
-        } finally {
-            if (run.abortController === controller) run.abortController = null;
+    function composeInlinePrompt(base, generated, config) {
+        const mode = config.writeMode || "append_end";
+        const next = composePrompt(base, generated, mode, config.marker);
+        if (mode !== "replace" && !preservesImmutableTechnicalTokens(base, next)) {
+            throw new Error("固定 Prompt 完整性校验失败，已拒绝写入 Forge");
         }
+        return next;
+    }
+
+    function inlineSourceName(config) {
+        return config.source === "cache" ? "原始缓存库" : config.source === "processed_cache" ? "处理结果库" : "LLM";
     }
 
     async function requestPromptApi(run, path, payload) {
@@ -643,15 +643,22 @@
 
     async function generateInlinePrompt(config, run) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        const sharedConfig = {
+            ...config,
+            preset: sharedWorkflowValue("preset", config.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags")),
+            baseModel: sharedWorkflowValue("base_model", config.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default")),
+            safety: sharedWorkflowValue("safety", config.safety || componentValue(inlineId(slot, "safety"), "SFW")),
+        };
         const data = await requestPromptApi(run, "inline-generate", {
             slot,
-            request: String(config.request || ""),
-            source_tags: promptValue(slot),
-            variation: String(config.variation || ""),
-            preset: normalizeChoiceValue(config.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags")),
-            base_model: normalizeChoiceValue(config.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default")),
-            safety: normalizeChoiceValue(config.safety || componentValue(inlineId(slot, "safety"), "SFW")),
-            template: normalizeChoiceValue(config.template || componentValue(inlineId(slot, "template_choice"), "general")),
+            request: String(sharedConfig.request || ""),
+            source_tags: config.fixedPrompt ?? promptValue(slot),
+            ...(config.destination === "cache" || config.destination === "queue" ? { cache_result: true } : {}),
+            variation: String(sharedConfig.variation || ""),
+            preset: normalizeChoiceValue(sharedConfig.preset),
+            base_model: normalizeChoiceValue(sharedConfig.baseModel),
+            safety: normalizeChoiceValue(sharedConfig.safety),
+            template: normalizeChoiceValue(sharedConfig.template || componentValue(inlineId(slot, "template_choice"), "general")),
         });
         return String(data.prompt).trim();
     }
@@ -699,10 +706,42 @@
         }
     }
 
+    async function readInlineCache(slot, run, processed = false) {
+        const cursors = processed ? processedCacheCursors : inlineCacheCursors;
+        const endpoint = processed ? "processed-cache" : "cache";
+        const label = processed ? "处理结果库" : "原始缓存库";
+        let afterId = cursors[slot];
+        // Read by stable ID so large libraries, deletions and new records remain
+        // reachable without loading every Prompt into the browser on each round.
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            assertActive(run);
+            const response = await studioFetch(`/llm-prompt-studio/v1/${endpoint}?limit=1&after_id=${afterId}`, { cache: "no-store" });
+            let data = null;
+            try { data = await response.json(); } catch { data = null; }
+            assertActive(run);
+            if (!response.ok) throw new Error(String(data?.detail || `读取${label}失败：HTTP ${response.status}`));
+            if (!Array.isArray(data?.records)) throw new Error(`${label}返回格式无效，请更新插件并重启 Forge`);
+            if (!data.records.length) {
+                if (afterId === 0) break;
+                afterId = 0;
+                continue;
+            }
+            const record = data.records[0];
+            const nextId = Number(record?.id);
+            const prompt = String(record?.prompt || "").trim();
+            if (!Number.isSafeInteger(nextId) || nextId <= afterId || !prompt) {
+                throw new Error(`${label}返回无效记录，请更新插件并重启 Forge`);
+            }
+            cursors[slot] = nextId;
+            return prompt;
+        }
+        throw new Error(processed ? "处理结果库为空，请先完成缓存处理" : "原始缓存库为空，请先生成或导入 Prompt");
+    }
+
     async function getInlinePrompt(config, run) {
-        return config.source === "cache"
-            ? readInlineCache(config.slot, run)
-            : generateInlinePrompt(config, run);
+        if (config.source === "cache") return readInlineCache(config.slot, run);
+        if (config.source === "processed_cache") return readInlineCache(config.slot, run, true);
+        return generateInlinePrompt(config, run);
     }
 
     async function getInlinePromptWithRetry(config, run) {
@@ -723,16 +762,23 @@
     }
 
     function inlineConfig(slot, overrides = {}) {
+        const rawCount = overrides.count;
+        const explicitCount = typeof rawCount === "number" || (typeof rawCount === "string" && rawCount.trim() !== "");
+        const numericCount = Number(rawCount);
+        const count = explicitCount && numericCount === 0 ? 0
+            : (Number.isFinite(numericCount) ? Math.max(1, Math.min(200, Math.floor(numericCount))) : 1);
         return {
             slot,
+            destination: normalizeChoiceValue(overrides.destination, "prompt"),
+            count,
             writeMode: normalizeChoiceValue(overrides.writeMode, "append_end"),
             marker: String(overrides.marker || "{{LLM}}"),
             request: String(overrides.request || ""),
             variation: String(overrides.variation || ""),
             source: normalizeChoiceValue(overrides.source, "llm"),
-            preset: normalizeChoiceValue(overrides.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags")),
-            baseModel: normalizeChoiceValue(overrides.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default")),
-            safety: normalizeChoiceValue(overrides.safety || componentValue(inlineId(slot, "safety"), "SFW")),
+            preset: normalizeChoiceValue(sharedWorkflowValue("preset", overrides.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags"))),
+            baseModel: normalizeChoiceValue(sharedWorkflowValue("base_model", overrides.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default"))),
+            safety: normalizeChoiceValue(sharedWorkflowValue("safety", overrides.safety || componentValue(inlineId(slot, "safety"), "SFW"))),
             template: normalizeChoiceValue(overrides.template || componentValue(inlineId(slot, "template_choice"), "general")),
         };
     }
@@ -752,8 +798,8 @@
 
     async function prepareLinkedPrompt(run) {
         assertActive(run);
-        renderInline(run.slot, "warning", `正在准备第 ${run.count + 1} 条 LLM Prompt`, "Forge 会等待本轮 Prompt 准备完成");
-        for (let attempt = 0; attempt < 3; attempt += 1) {
+        renderInline(run.slot, "warning", `正在准备第 ${run.count + 1} 条 ${inlineSourceName(run.config)} Prompt`, "Forge 会等待本轮 Prompt 准备完成");
+        for (let attempt = 0; ; attempt += 1) {
             const current = promptValue(run.slot);
             if (current !== run.lastWrittenPrompt) run.basePrompt = current;
             const generated = await getInlinePromptWithRetry(run.config, run);
@@ -764,28 +810,14 @@
                 renderInline(run.slot, "warning", "正面 Prompt 已变化，正在重新准备", "旧请求结果已丢弃");
                 continue;
             }
-            // Inline generation always appends after the immutable source. The
-            // advanced merge modes remain available to the non-inline tools.
-            const next = composePrompt(run.basePrompt, generated, "append_end", run.config.marker);
-            if (run.basePrompt && (!String(next).startsWith(String(run.basePrompt).trim())
-                || !preservesImmutableTechnicalTokens(run.basePrompt, next))) {
-                throw new Error("固定 Prompt 完整性校验失败，已拒绝写入 Forge");
-            }
-            const duplicate = !next
-                || canonicalPrompt(next) === canonicalPrompt(current)
-                || canonicalPrompt(next) === canonicalPrompt(run.lastUsedPrompt);
-            if (!duplicate) {
-                run.preparedPrompt = next;
-                run.preparedSource = current;
-                run.lastWrittenPrompt = current;
-                renderInline(run.slot, "success", `第 ${run.count + 1} 条 LLM Prompt 已就绪`, "等待本轮生图；正面 Prompt 框保持不变");
-                return next;
-            }
-            if (attempt < 2) {
-                renderInline(run.slot, "warning", "检测到重复 Prompt，正在重新生成", `第 ${attempt + 2}/3 次尝试`);
-            }
+            const next = composeInlinePrompt(run.basePrompt, generated, run.config);
+            if (!next) continue;
+            run.preparedPrompt = next;
+            run.preparedSource = current;
+            run.lastWrittenPrompt = current;
+            renderInline(run.slot, "success", `第 ${run.count + 1} 条 ${inlineSourceName(run.config)} Prompt 已就绪`, "等待本轮生图；正面 Prompt 框保持不变");
+            return next;
         }
-        throw new Error("LLM 连续返回重复内容，本轮未提交给 Forge");
     }
 
     function startLinkedRun(config) {
@@ -824,13 +856,13 @@
         run.abortController?.abort();
         if (!run.forgeLaunching) finishLinkedRun(run);
         if (interruptForge && ownsActiveForgeTask(run)) findButton(`${normalizedSlot}_interrupt`)?.click();
-        renderInline(normalizedSlot, "warning", "LLM 无限生成已停止", `已提交 ${run.count} 轮`);
+        renderInline(normalizedSlot, "warning", "连续生图已停止", `已提交 ${run.count} 轮`);
     }
 
     function failLinkedRun(run, error) {
         if (linkedRuns[run.slot] !== run) return;
         stopLinkedRun(run.slot);
-        renderInline(run.slot, "error", "LLM 无限生成已停止", String(error?.message || error));
+        renderInline(run.slot, "error", "连续生图已停止", String(error?.message || error));
     }
 
     function startInlineLoop(config) {
@@ -850,7 +882,7 @@
         window.setTimeout(() => {
             if (linkedRuns[slot] === run) startLinkedGenerationLoop(run);
         }, 0);
-        return "LLM 无限生成已开始";
+        return "连续生图已开始";
     }
 
     function scheduleNextLinkedPrompt(run) {
@@ -874,7 +906,7 @@
         run.preparedSource = "";
         run.lastUsedPrompt = prompt;
         run.count += 1;
-        renderInline(slot, "success", `第 ${run.count} 条 LLM Prompt 已提交给 Forge`, "正面 Prompt 框未修改；正在准备下一条");
+        renderInline(slot, "success", `第 ${run.count} 条 ${inlineSourceName(run.config)} Prompt 已提交给 Forge`, "正面 Prompt 框未修改；正在准备下一条");
         return prompt;
     }
 
@@ -887,7 +919,7 @@
         ensureForgeIdle(slot);
         const original = String(input(`${slot}_prompt`).value || "");
         const override = consumeLinkedPrompt(slot);
-        if (!override) throw new Error("准备好的 LLM Prompt 已过期，请重新生成");
+        if (!override) throw new Error("准备好的 Prompt 已过期，请重新生成");
         let restored = false;
         const restore = () => {
             if (restored) return;
@@ -931,24 +963,135 @@
         }
     }
 
-    async function inlineOnce(config) {
-        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
-        const target = slot;
-        const run = beginInlineRun(slot, target);
-        if (!run) return "当前内嵌面板已有任务正在运行";
+    async function cancelInlineQueue(run) {
+        if (!run.queueBatchId || run.queueCancelSent) return;
+        run.queueCancelSent = true;
         try {
-            renderInline(slot, "warning", config.source === "cache" ? "正在读取缓存 Prompt" : "正在生成 Prompt", "当前请求处理中");
+            const response = await studioFetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(run.queueBatchId)}/cancel`, { method: "POST" });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        } catch (error) {
+            run.queueCancelSent = false;
+            renderInline(run.slot, "error", "生图队列取消失败", String(error?.message || error));
+        }
+    }
+
+    function renderInlineQueue(run, snapshot) {
+        const status = snapshot.status || "生图队列已提交";
+        renderInline(run.slot, "success", run.unlimited ? `无限 · 已完成 ${run.completed} 条 · ${status}` : status, "正面 Prompt 框保持不变");
+        const host = find(inlineId(run.slot, "queue_log")) || find(inlineId(run.slot, "loop_status"));
+        if (host) {
+            const rows = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
+            const content = serverQueueRowsHtml(rows);
+            if (host.id === inlineId(run.slot, "loop_status")) host.innerHTML += content;
+            else host.innerHTML = content;
+        }
+    }
+
+    async function runInlineDestination(config, run, original) {
+        if (!["cache", "queue"].includes(config.destination)) throw new Error("未知的 Prompt 去向");
+        if (config.destination === "queue" && run.slot !== "txt2img") throw new Error("生图队列仅支持 txt2img");
+        if (config.destination === "cache" && config.source !== "llm") throw new Error("仅存缓存请使用 LLM 自动生成来源");
+        const settings = config.destination === "queue" ? readTxt2imgSettings() : null;
+        const prompts = [];
+        config.fixedPrompt = original;
+        for (let index = 0; index < config.count; index += 1) {
+            assertActive(run);
+            renderInline(run.slot, "warning", run.unlimited ? "无限 · 正在准备下一条 Prompt" : `正在准备 Prompt ${index + 1} / ${config.count}`,
+                `已完成 ${run.unlimited ? run.completed : prompts.length} 条`);
             const prompt = await getInlinePromptWithRetry(config, run);
             assertActive(run);
-            if (!enqueuePrompt(prompt, config.request)) {
-                throw new Error("LLM 返回了队列中已有的重复 Prompt，未加入队列");
+            prompts.push(config.destination === "queue" ? composeInlinePrompt(original, prompt, config) : prompt);
+        }
+        if (config.destination === "cache") {
+            const message = `已完成 ${prompts.length} 条 Prompt，已保存到缓存；未启动生图`;
+            renderInline(run.slot, "success", message);
+            return message;
+        }
+        // Do not abort queue creation: its response provides the exact batch ID needed for safe cancellation.
+        const response = await studioFetch("/llm-prompt-studio/v1/queue", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ requests: prompts, target: "txt2img", config: {
+                direct_prompt: true, cache_result: false, generation_settings: settings,
+            } }),
+        });
+        const snapshot = await response.json();
+        if (!response.ok) throw new Error(String(snapshot.detail || `入队失败：HTTP ${response.status}`));
+        run.queueBatchId = String(snapshot.batch_id || "");
+        run.queueCancelSent = false;
+        if (!run.queueBatchId) throw new Error("生图队列未返回任务 ID");
+        if (run.cancelled) await cancelInlineQueue(run);
+        assertActive(run);
+        let current = snapshot;
+        while (true) {
+            assertActive(run);
+            renderInlineQueue(run, current);
+            const counts = current.counts || {};
+            const total = Number(current.jobs?.length || 0);
+            if (run.unlimited) {
+                if (Number(counts.error || 0) > 0 || current.jobs?.some((job) => job.status === "error")) {
+                    throw new Error(`生图队列 ${run.queueBatchId} 失败，已停止无限生成`);
+                }
+                if (Number(counts.cancelled || 0) > 0 || current.jobs?.some((job) => job.status === "cancelled")) {
+                    throw new Error(`生图队列 ${run.queueBatchId} 已取消，已停止无限生成`);
+                }
+                if (Array.isArray(current.jobs) && current.jobs.length === 0) {
+                    throw new Error(`生图队列 ${run.queueBatchId} 的任务已不存在，已停止无限生成`);
+                }
             }
-            const message = config.source === "cache" ? "已取缓存 Prompt 并加入队列" : "已生成 Prompt 并加入队列";
-            renderInline(slot, "success", message, "请在队列中勾选后写入固定正面 Prompt");
+            if (total && Number(counts.completed || 0) + Number(counts.error || 0) + Number(counts.cancelled || 0) >= total) {
+                if (run.unlimited) run.queueBatchId = "";
+                return String(current.status || "生图队列已结束");
+            }
+            await wait(1000);
+            assertActive(run);
+            try {
+                const response = await studioFetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(run.queueBatchId)}`, { cache: "no-store" });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const next = await response.json();
+                assertActive(run);
+                current = next;
+            } catch (error) {
+                assertActive(run);
+                renderInline(run.slot, "warning", run.unlimited ? `无限 · 已完成 ${run.completed} 条 · 正在重新获取队列进度`
+                    : "生图队列仍在后台运行，正在重新获取进度", String(error?.message || error));
+            }
+        }
+    }
+
+    async function inlineOnce(config) {
+        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        config = inlineConfig(slot, config);
+        const run = beginInlineRun(slot, slot);
+        if (!run) return "当前内嵌面板已有任务正在运行";
+        try {
+            const original = promptValue(slot);
+            if (config.destination !== "prompt") {
+                if (config.count !== 0) return await runInlineDestination(config, run, original);
+                run.unlimited = true;
+                run.completed = 0;
+                while (true) {
+                    assertActive(run);
+                    await runInlineDestination({ ...config, count: 1 }, run, original);
+                    assertActive(run);
+                    run.completed += 1;
+                }
+            }
+            const sourceName = inlineSourceName(config);
+            renderInline(slot, "warning", `正在${config.source === "llm" ? "生成" : "读取"} ${sourceName} Prompt`, "");
+            const prompt = await getInlinePromptWithRetry(config, run);
+            assertActive(run);
+            if (promptValue(slot) !== original) {
+                throw new Error("正面 Prompt 已被修改，本次结果未写入，请重试");
+            }
+            const next = composeInlinePrompt(original, prompt, config);
+            setValue(`${slot}_prompt`, next);
+            const message = `${sourceName} Prompt 已写入正面提示词`;
+            renderInline(slot, "success", message, "");
             return message;
         } catch (error) {
             const message = String(error?.message || error);
-            renderInline(slot, message === "已取消" ? "warning" : "error", "内嵌 Prompt 操作已停止", message);
+            renderInline(slot, message === "已取消" ? "warning" : "error", "内嵌 Prompt 操作已停止",
+                run.unlimited ? `无限 · 已完成 ${run.completed} 条 · ${message}` : message);
             return message;
         } finally {
             finishInlineRun(run);
@@ -959,11 +1102,12 @@
         const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
         const run = inlineRuns[normalizedSlot];
         const linked = linkedRuns[normalizedSlot];
-        if (!run && !linked) return "当前没有该面板的 LLM 任务";
+        if (!run && !linked) return "当前没有该面板的 Prompt 任务";
         if (run) {
             cancelInlineRequest(run);
             run.cancelled = true;
             run.abortController?.abort();
+            void cancelInlineQueue(run);
             if (run.target) {
                 const interrupt = find(`${run.target}_interrupt`);
                 if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
@@ -972,8 +1116,8 @@
         if (linked) {
             stopLinkedRun(normalizedSlot, true);
         }
-        renderInline(normalizedSlot, "warning", "LLM 任务已停止", "");
-        return "LLM 任务已停止";
+        renderInline(normalizedSlot, "warning", "Prompt 任务已停止", run?.unlimited ? `无限 · 已完成 ${run.completed} 条` : "");
+        return "Prompt 任务已停止";
     }
 
     function writePrompt(prompt, target, mode, basePrompt = "") {
@@ -1023,22 +1167,12 @@
         run.phase = "llm";
         run.target = null;
         const batchId = createId("batch");
-        const queuedPrompts = new Set(state.queue.map((row) => canonicalPrompt(row.prompt)));
-        const allowRepeat = config.allowRepeat !== false;
-        const allowDuplicateOutput = Boolean(config.allowDuplicateOutput);
         state.lastBatchRowIds = [];
-        let duplicateOutputCount = 0;
-        let skippedRequestCount = 0;
         try {
             for (const request of parsed.requests) {
                 assertActive(run);
                 const requestId = canonicalPrompt(request);
-                if (!allowRepeat && state.requestIds.has(requestId)) {
-                    skippedRequestCount += 1;
-                    continue;
-                }
                 let prompt = "";
-                let promptKey = "";
                 let accepted = false;
                 for (let attempt = 0; attempt < 3; attempt += 1) {
                     const attemptRequest = parsed.generatedInspiration && attempt
@@ -1055,13 +1189,8 @@
                         continue;
                     }
                     assertActive(run);
-                    promptKey = canonicalPrompt(prompt);
-                    if (allowDuplicateOutput || !queuedPrompts.has(promptKey)) {
-                        accepted = true;
-                        break;
-                    }
-                    duplicateOutputCount += 1;
-                    render("warning", "检测到重复 Prompt，正在重新抽样", "当前连续任务会继续运行");
+                    accepted = true;
+                    break;
                 }
                 if (!accepted) continue;
                 state.requestIds.add(requestId);
@@ -1075,14 +1204,13 @@
                 };
                 state.queue.push(row);
                 state.lastBatchRowIds.push(row.id);
-                queuedPrompts.add(promptKey);
                 saveQueue();
                 renderQueue();
             }
             const added = state.lastBatchRowIds.length;
             const persistence = state.persistent ? "" : "；当前队列未持久化 (not persistent)";
             const message = `Prompt 批量生成完成，新增 ${added} 条${persistence}`;
-            render("success", message, `重复要求作为独立任务 ${parsed.duplicateCount} 条，历史请求跳过 ${skippedRequestCount} 条，重复结果 ${duplicateOutputCount} 条`);
+            render("success", message, "所有非空结果均已保留");
             return message;
         } catch (error) {
             const message = String(error?.message || error);
@@ -1264,7 +1392,6 @@
     function focusHandoff() {
         navigateStudioTab("llm_prompt_studio_library_tab");
         window.setTimeout(() => {
-            openAccordionByLabel("Ranbooru 缓存联动");
             openAccordionByLabel("Ranbooru 实时交接箱");
             findButtonByText("刷新交接箱")?.click();
             find("llm_prompt_studio_handoff_table")?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -1272,49 +1399,30 @@
         return true;
     }
 
-    function syncFooterNavigation() {
-        const footer = root().querySelector("#llm_prompt_studio_footer_nav");
-        if (!footer) return;
-        const tabs = root().querySelectorAll('#llm_prompt_studio_main_tabs [role="tab"]');
-        footer.querySelectorAll("[data-lps-tab]").forEach((link) => {
-            const target = String(link.dataset.lpsTab || "");
-            const panel = root().querySelector(`#${target}`) || root().querySelector(`#tab_${target}`);
-            const panelId = panel?.id || `tab_${target}`;
-            const active = Array.from(tabs).some((tab) => tab.getAttribute("aria-selected") === "true" && tab.getAttribute("aria-controls") === panelId);
-            link.toggleAttribute("aria-current", active);
-            if (active) link.classList.add("is-active");
-            else link.classList.remove("is-active");
-        });
-    }
-
-    if (typeof MutationObserver === "function") {
-        const observer = new MutationObserver(syncFooterNavigation);
-        const observeTabs = () => {
-            const tabs = root().querySelector("#llm_prompt_studio_main_tabs");
-            if (!tabs) return;
-            observer.observe(tabs, { subtree: true, attributes: true, attributeFilter: ["aria-selected", "class"] });
-            syncFooterNavigation();
-        };
-        if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(observeTabs);
-        else window.setTimeout(observeTabs, 500);
+    function serverQueueRowsHtml(rows) {
+        return rows.length ? rows.map((row) => {
+            const images = (Array.isArray(row.images) ? row.images : []).map((value) => {
+                const raw = String(value || "");
+                const source = raw.startsWith("data:image/") ? raw : /^[A-Za-z0-9+/=\s]+$/.test(raw) ? `data:image/png;base64,${raw}` : "";
+                return source ? `<img class="lps-queue-image" src="${escapeHtml(source)}" alt="生成结果" loading="lazy">` : "";
+            }).join("");
+            return `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><code>${escapeHtml(row.prompt || row.request || "")}</code><small>${escapeHtml(row.error || "")}</small><div class="lps-queue-images">${images}</div></div>`;
+        }).join("") : '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
     }
 
     function renderServerQueue(snapshot) {
         const statusHost = find("llm_prompt_studio_server_queue_status");
         const logHost = find("llm_prompt_studio_server_queue_log");
         if (statusHost) statusHost.innerHTML = escapeHtml(snapshot?.status || "服务端队列状态未知");
-        if (!logHost) return;
-        const rows = Array.isArray(snapshot?.jobs) ? snapshot.jobs : [];
-        logHost.innerHTML = rows.length
-            ? rows.map((row) => `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><code>${escapeHtml(row.prompt || row.request || "")}</code><small>${escapeHtml(row.error || "")}</small></div>`).join("")
-            : '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
+        if (logHost) logHost.innerHTML = serverQueueRowsHtml(Array.isArray(snapshot?.jobs) ? snapshot.jobs : []);
     }
 
     async function watchServerQueue(batchId) {
         const id = String(batchId || "").trim();
         if (!id) return "尚未提交服务端任务";
-        const prior = serverQueueWatchers.get(id);
-        if (prior) prior.cancelled = true;
+        // These watchers share one Studio log; replacing the view does not cancel queued jobs.
+        for (const prior of serverQueueWatchers.values()) prior.cancelled = true;
+        serverQueueWatchers.clear();
         const watcher = { cancelled: false };
         serverQueueWatchers.set(id, watcher);
         while (!watcher.cancelled) {
@@ -1322,12 +1430,14 @@
                 const response = await studioFetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(id)}`, { cache: "no-store" });
                 if (!response.ok) throw new Error(`服务端队列 HTTP ${response.status}`);
                 const snapshot = await response.json();
+                if (watcher.cancelled) break;
                 renderServerQueue(snapshot);
                 const counts = snapshot.counts || {};
                 const total = Number(snapshot.jobs?.length || 0);
                 const finished = Number(counts.completed || 0) + Number(counts.error || 0) + Number(counts.cancelled || 0);
                 if (total && finished >= total) break;
             } catch (error) {
+                if (watcher.cancelled) break;
                 const statusHost = find("llm_prompt_studio_server_queue_status");
                 if (statusHost) statusHost.innerHTML = escapeHtml(`服务端队列轮询失败：${error?.message || error}`);
             }
@@ -1384,5 +1494,6 @@
         focusHandoff,
         cancel,
         start: generateBatch,
+        readTxt2imgSettings,
     };
 })();

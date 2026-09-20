@@ -14,10 +14,10 @@ class InfinitePromptContractTests(unittest.TestCase):
         cls.entry_source = (ROOT / "scripts" / "llm_prompt_studio.py").read_text(encoding="utf-8")
 
     def test_inline_panel_exposes_start_stop_buttons_and_merge_positions(self):
-        self.assertIn('inline_start = gr.Button("开始无限生成"', self.ui_source)
+        self.assertIn('inline_start = gr.Button("开始连续生图"', self.ui_source)
         self.assertIn('inline_cancel = gr.Button("停止"', self.ui_source)
         self.assertNotIn("inline_infinite", self.ui_source)
-        self.assertIn('label="本轮 LLM Prompt 合并位置"', self.ui_source)
+        self.assertIn('label="与当前 Prompt 合并方式"', self.ui_source)
         for value in ("append_end", "append_start", "replace", "marker"):
             self.assertIn(f'"{value}"', self.ui_source)
         self.assertIn("正面 Prompt 框保持不变", self.browser_source)
@@ -56,7 +56,7 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertNotIn("async function startInlineLoop", self.browser_source)
         self.assertNotIn("ensureLinkedPrompt(run).catch", handler)
         binding_start = self.ui_source.index("inline_start.click(")
-        binding_end = self.ui_source.index("with _INLINE_LOCK:", binding_start)
+        binding_end = self.ui_source.index("def _wd14_model_choices", binding_start)
         bindings = self.ui_source[binding_start:binding_end]
         self.assertIn("startInlineLoop", bindings)
         self.assertIn("cancelInline", bindings)
@@ -76,7 +76,7 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn("startLinkedGenerationLoop(run)", self.browser_source)
         self.assertIn("setValue(`${slot}_prompt`, override, { emitChange: false })", self.browser_source)
         self.assertIn("setValue(`${slot}_prompt`, original, { emitChange: false })", self.browser_source)
-        self.assertIn("source_tags: promptValue(slot)", self.browser_source)
+        self.assertIn("source_tags: config.fixedPrompt ?? promptValue(slot)", self.browser_source)
         self.assertIn("removePromptOverlap", self.browser_source)
         self.assertIn("preservesImmutableTechnicalTokens", self.browser_source)
         self.assertIn("固定 Prompt 完整性校验失败", self.browser_source)
@@ -113,14 +113,18 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn("run.preparedSource !== promptValue(slot)", self.browser_source)
         for field in ("preset", "baseModel", "safety"):
             self.assertIn(field, self.browser_source)
-        self.assertIn("inline_preset, inline_base_model, inline_safety", self.ui_source)
+        self.assertIn("preset: {json.dumps(workflow['preset'])}", self.ui_source)
         self.assertIn('"template"', self.ui_source)
         self.assertIn('template:', self.browser_source)
-        self.assertIn("preset, baseModel, safety, cacheResult", self.ui_source)
+        self.assertIn("request, variation, source, destination, count", self.ui_source)
+        self.assertIn("cache_result: Boolean(config.cacheResult)", self.browser_source)
 
-    def test_browser_batch_supports_bounded_and_unbounded_rounds(self):
-        self.assertIn('label="循环轮数（留空或 0 = 一直运行）"', self.ui_source)
-        self.assertIn("minimum=0, maximum=100", self.ui_source)
+    def test_legacy_browser_batch_controls_are_removed_but_runtime_is_preserved(self):
+        self.assertNotIn('label="循环轮数（留空或 0 = 一直运行）"', self.ui_source)
+        self.assertNotIn("window.llmPromptStudioAutoLoop.start(", self.ui_source)
+        self.assertIn('inline_start = gr.Button("开始连续生图"', self.ui_source)
+        self.assertIn('generation_destination = gr.Radio(', self.ui_source)
+        self.assertIn("_studio_generate,", self.ui_source)
         self.assertIn("cycleLimit === null || completedCycles < cycleLimit", self.browser_source)
         self.assertIn("点击停止结束", self.browser_source)
 
@@ -162,7 +166,6 @@ if (typeof window.llmPromptStudioAutoLoop?.startInlineLoop !== "function") proce
 
     def test_ranbooru_handoff_focus_bridge_is_exposed(self):
         self.assertIn("function focusHandoff", self.browser_source)
-        self.assertIn('openAccordionByLabel("Ranbooru 缓存联动")', self.browser_source)
         self.assertIn('openAccordionByLabel("Ranbooru 实时交接箱")', self.browser_source)
         self.assertIn('findButtonByText("刷新交接箱")', self.browser_source)
 

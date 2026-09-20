@@ -46,12 +46,90 @@ class ChoiceContractTests(unittest.TestCase):
         self.assertNotIn("batch_base_model.change(", ui_block)
         self.assertNotIn("batch_preset.change(", ui_block)
 
-    def test_json_payload_refresh_ignores_backend_writeback(self):
+    def test_cache_processing_lives_in_studio_and_retained_payload_ignores_backend_writeback(self):
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
-        self.assertIn("json_payload.input(", source)
+        inline_panel = source[source.index("def _create_inline_panel"):source.index("def _wd14_interrogate")]
+        self.assertNotIn("_create_inline_cache_panel(slot, prompt_target, embedded=True)", inline_panel)
+        self.assertIn('_create_inline_cache_panel("txt2img", _PROMPT_TARGETS.get("txt2img"), result_queue_controls)', source)
+        self.assertNotIn("json_payload", inline_panel)
         self.assertIn("png_batch_payload.input(", source)
         self.assertNotIn("json_payload.change(", source)
         self.assertNotIn("png_batch_payload.change(", source)
+
+    def test_plugin_batch_is_the_only_import_workspace_and_can_pull_plugin_caches(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        batch_panel = source[source.index('with gr.Accordion("导入与插件批次"'):source.index('with gr.Tab("处理结果库"')]
+        cache_panel = source[source.index('with gr.Tab("缓存"'):source.index('with gr.Tab("设置"')]
+        self.assertIn('"读取 PNG Collector 当前缓存"', batch_panel)
+        self.assertIn('"读取 Ranbooru 缓存"', batch_panel)
+        self.assertIn('with gr.Accordion("Ranbooru 读取范围"', batch_panel)
+        self.assertNotIn('with gr.Tab("直接导入")', source)
+        self.assertNotIn('with gr.Accordion("Ranbooru 缓存联动"', cache_panel)
+
+    def test_inline_cache_panel_is_collapsed_by_default(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        cache_panel = source[source.index("def _create_inline_cache_panel"):source.index("def _create_inline_panel")]
+        self.assertIn('gr.Accordion("缓存 Prompt 处理", open=False', cache_panel)
+        self.assertIn('"继续处理未完成"', cache_panel)
+        self.assertIn('"将已处理结果加入生图队列"', cache_panel)
+
+    def test_txt2img_prompt_batch_is_separate_from_studio_cache_processing(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        inline = source[source.index("def _create_inline_panel"):source.index("def _wd14_interrogate")]
+        self.assertIn('with gr.Column(elem_id=f"llm_prompt_studio_{slot}_inline", elem_classes=["lps-inline-workbench"])', inline)
+        self.assertIn('with gr.Accordion("Prompt 批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline_batch")', inline)
+        studio = source[source.index("def on_ui_tabs"):source.index("workflow_inputs = [")]
+        self.assertIn('with gr.Column(elem_id="llm_prompt_studio_cache_processing"', studio)
+        self.assertIn('_create_inline_cache_panel("txt2img", _PROMPT_TARGETS.get("txt2img"), result_queue_controls)', studio)
+        self.assertIn('("原始缓存库", "cache")', inline)
+        self.assertIn('("处理结果库", "processed_cache")', inline)
+
+    def test_processed_results_have_an_independent_library_and_queue_entry(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        self.assertIn("RESULT_DB = StudioDB(PROCESSED_DB_PATH)", source)
+        self.assertIn('with gr.Tab("处理结果库"', source)
+        self.assertIn("processed_result_enqueue.click(", source)
+        self.assertIn('("全部筛选结果", "filtered")', source)
+        self.assertNotIn("processed_result_enqueue_all", source)
+        self.assertIn("_save_inline_processed_result", source)
+        auto_loop = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
+        self.assertIn("readTxt2imgSettings", auto_loop)
+        self.assertIn('"negative_prompt"', auto_loop)
+        self.assertIn('"sampler_name"', auto_loop)
+
+    def test_png_collector_pull_reads_the_shared_payload_component(self):
+        source = (ROOT / "javascript" / "llm_prompt_studio_png_batch.js").read_text(encoding="utf-8")
+        self.assertIn('componentValue("ppc_prompt_batch_cache")', source)
+        self.assertIn('setValue(target, JSON.stringify(batch))', source)
+        self.assertIn("loadCollectorCache", source)
+
+    def test_inline_workbench_is_injected_only_into_txt2img(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        capture = source[source.index("def capture_prompt_component"):source.index("def inject_inline_before_negative")]
+        inject = source[source.index("def inject_inline_before_negative"):source.index("def _inline_cache_transform")]
+        self.assertIn('if elem_id != "txt2img_prompt"', capture)
+        self.assertIn('if elem_id != "txt2img_neg_prompt_row"', inject)
+        self.assertNotIn("img2img_prompt", capture)
+        self.assertNotIn("img2img_neg_prompt_row", inject)
+
+    def test_settings_expose_an_independent_fallback_connection(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        settings = source[source.index('with gr.Tab("设置"'):source.index('with gr.Tab("更多"')]
+        for elem_id in (
+            "llm_prompt_studio_fallback_provider", "llm_prompt_studio_fallback_endpoint",
+            "llm_prompt_studio_fallback_model", "llm_prompt_studio_fallback_api_key",
+            "llm_prompt_studio_fallback_test",
+        ):
+            self.assertIn(elem_id, settings)
+        self.assertIn("fallback_provider.input(", source)
+        self.assertNotIn("fallback_provider.change(", source)
+        self.assertIn("fallback_discover_models.click(", source)
+
+    def test_inline_generation_preserves_the_saved_inference_snapshot(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        inline = source[source.index("def _inline_generate"):source.index("def _unwrap_component")]
+        self.assertIn("connection_settings=connection", inline)
+        self.assertIn("preserve_inference_settings=True", inline)
 
     def test_template_picker_returns_the_selected_template(self):
         self.assertEqual(ui._template_request("general"), ui.GENERAL_CREATIVE_REQUEST_TEMPLATE)
@@ -101,7 +179,7 @@ class ChoiceContractTests(unittest.TestCase):
 
     def test_custom_template_controls_are_on_generate_panel(self):
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
-        generate_panel = source[source.index('with gr.Tab("生成"'):source.index('with gr.Tab("批处理"')]
+        generate_panel = source[source.index('with gr.Tab("生成"'):source.index('with gr.Tab("缓存"')]
         self.assertIn('elem_id="llm_prompt_studio_template_name"', generate_panel)
         self.assertIn('elem_id="llm_prompt_studio_template_save"', generate_panel)
         self.assertIn('elem_id="llm_prompt_studio_template_delete"', generate_panel)
@@ -131,6 +209,13 @@ class ChoiceContractTests(unittest.TestCase):
             ui._release_server_queue_cancel_event("batch-b")
         self.assertNotIn("batch-a", ui._SERVER_QUEUE_CANCEL_EVENTS)
         self.assertNotIn("batch-b", ui._SERVER_QUEUE_CANCEL_EVENTS)
+
+    def test_server_queue_worker_only_starts_after_explicit_enqueue(self):
+        source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        app_started = source[source.index("def on_app_started"):source.index("def on_ui_tabs")]
+        enqueue = source[source.index("def _enqueue_server_queue"):source.index("def _server_queue_html")]
+        self.assertNotIn("_ensure_server_queue_worker()", app_started)
+        self.assertIn("_ensure_server_queue_worker()", enqueue)
 
     def test_legacy_connection_settings_are_migrated_before_deletion(self):
         legacy = {

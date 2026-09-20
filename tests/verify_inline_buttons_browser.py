@@ -82,7 +82,7 @@ def main():
             pass  # Forge can keep background requests open.
         page.wait_for_function("typeof window.llmPromptStudioAutoLoop?.startInlineLoop === 'function'")
         assert page.locator("#llm_prompt_studio_txt2img_inline_infinite").count() == 0
-        page.locator("#llm_prompt_studio_txt2img_inline > .label-wrap").click()
+        page.locator("#llm_prompt_studio_txt2img_inline_batch > .label-wrap").click()
         start = page.locator("#llm_prompt_studio_txt2img_inline_start")
         stop = page.locator("#llm_prompt_studio_txt2img_inline_cancel")
         start.wait_for(state="visible")

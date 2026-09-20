@@ -4,39 +4,54 @@
 #llm_prompt_studio_main_tabs .gradio-tabitem { padding: .55rem .7rem .8rem; }
 #llm_prompt_studio_main_tabs .gradio-group { gap: .35rem; }
 #llm_prompt_studio_main_tabs label { line-height: 1.3; }
-#llm_prompt_studio_main_tabs textarea, #llm_prompt_studio_main_tabs input, #llm_prompt_studio_main_tabs select { min-height: 2.35rem; }
+#llm_prompt_studio_main_tabs textarea,
+#llm_prompt_studio_main_tabs input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+#llm_prompt_studio_main_tabs select { min-height: 2.15rem; font-size: .96rem; }
+#llm_prompt_studio_main_tabs textarea { font-size: .98rem; line-height: 1.5; resize: vertical; }
+#llm_prompt_studio_main_tabs input[type="range"] { min-height: 0; height: 1rem; padding: 0; }
+#llm_prompt_studio_main_tabs input:is([type="checkbox"], [type="radio"]) { min-height: 0; width: 1rem; height: 1rem; flex: 0 0 1rem; padding: 0; }
 #llm_prompt_studio .lps-heading { margin-bottom: .15rem; }
 .lps-heading h2 { margin-bottom: .1rem; }
-#llm_prompt_studio_generate_button { min-height: 2.8rem; font-weight: 700; }
+#llm_prompt_studio_generate_button { min-height: 2.1rem; font-weight: 700; }
 .lps-primary, #llm_prompt_studio_auto_loop_generate_run, #llm_prompt_studio_auto_loop_start,
-#llm_prompt_studio_png_batch_run { min-height: 2.5rem; font-weight: 700; }
-.lps-help { color: var(--body-text-color, #ddd); font-size: .88rem; line-height: 1.45; }
-.lps-main-workbench { align-items: flex-start; gap: .65rem; }
+#llm_prompt_studio_png_batch_run { min-height: 2.1rem; font-weight: 700; }
+.lps-help { color: var(--body-text-color, #ddd); font-size: .94rem; line-height: 1.45; }
+#llm_prompt_studio_main_tabs .lps-main-workbench { align-items: flex-start; gap: 1rem; }
 .lps-source-column, .lps-rules-column { min-width: 0; }
 .lps-column-title { margin: .1rem 0 .3rem !important; color: var(--body-text-color, #eee); font-size: .92rem; font-weight: 700; }
 .lps-result-title { margin-top: .85rem !important; }
 .lps-quick-start { margin: .35rem 0 .65rem; padding: .55rem .7rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; background: var(--background-fill-secondary, #222); }
-.lps-output textarea { min-height: 12rem; line-height: 1.55; }
+.lps-output textarea { line-height: 1.65; }
 #llm_prompt_studio_main_tabs > .tab-nav { gap: .35rem; border-bottom: 1px solid var(--border-color-primary, #555); }
-#llm_prompt_studio_main_tabs > .tab-nav button { min-height: 2.5rem; font-weight: 600; }
+#llm_prompt_studio_main_tabs > .tab-nav button { min-height: 2.1rem; font-weight: 600; }
 .lps-form-row, #llm_prompt_studio_main_tabs .gradio-row { align-items: flex-end; gap: .45rem; }
 .lps-infinite-controls { padding: .55rem .7rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; background: var(--background-fill-secondary, #222); }
 .lps-infinite-controls .gradio-checkbox { min-width: 19rem; }
 .lps-infinite-controls .gradio-checkbox label { font-weight: 700; }
 .lps-infinite-controls input[type="checkbox"] { accent-color: var(--primary-500, #3b82f6); }
-.lps-status { display: block; min-height: 1.8rem; padding: .35rem .55rem; border: 1px solid var(--border-color-primary, #555); border-radius: 5px; overflow-wrap: anywhere; font-size: .82rem; }
+.lps-status { display: block; min-height: 1.8rem; padding: .35rem .55rem; border: 1px solid var(--border-color-primary, #555); border-radius: 5px; overflow-wrap: anywhere; font-size: .94rem; }
 .lps-status strong { display: block; margin-bottom: .15rem; }
 .lps-status--success { border-color: #22c55e; background: color-mix(in srgb, #22c55e 10%, transparent); }
 .lps-status--warning { border-color: #eab308; background: color-mix(in srgb, #eab308 10%, transparent); }
 .lps-status--error { border-color: #ef4444; background: color-mix(in srgb, #ef4444 10%, transparent); }
 .lps-table { overflow-x: auto; }
+.lps-wd14-results { max-height: 25rem; overflow: auto; width: 100%; }
+.lps-wd14-results table { width: 100%; min-width: 640px; table-layout: fixed; border-collapse: collapse; }
+.lps-wd14-results :is(th, td) { padding: .65rem; text-align: left; vertical-align: top; overflow-wrap: anywhere; font-size: 1rem; line-height: 1.5; border-bottom: 1px solid var(--border-color-primary, #d1d5db); }
+.lps-wd14-results th { position: sticky; top: 0; background: var(--background-fill-primary, white); }
+.lps-wd14-results :is(th, td):first-child { width: 3.5rem; }
+.lps-wd14-results :is(th, td):nth-child(2) { width: 25%; }
+.lps-wd14-results :is(th, td):nth-child(3) { width: 5rem; }
+.lps-wd14-results :is(th, td):last-child { width: 18%; }
 #llm_prompt_studio_auto_loop_log { display: grid !important; grid-auto-rows: max-content; gap: .4rem; margin-top: .75rem; min-height: 0 !important; max-height: min(32rem, 55vh) !important; overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; scrollbar-gutter: stable; contain: layout paint; }
 #llm_prompt_studio_auto_loop_log > .prose { display: grid; gap: .4rem; min-width: 0; margin: 0; padding: 0; }
 .lps-queue-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem; padding: .45rem .6rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; background: var(--background-fill-secondary, #222); }
-.lps-queue-summary span { color: var(--body-text-color-subdued, #aaa); font-size: .88rem; }
+.lps-queue-summary span { color: var(--body-text-color-subdued, #aaa); font-size: .94rem; }
 .lps-server-queue-row { display: grid; grid-template-columns: 3rem 6rem minmax(0, 1fr); gap: .5rem; align-items: start; padding: .45rem .55rem; border-bottom: 1px solid var(--border-color-primary, #555); }
 .lps-server-queue-row code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .lps-server-queue-row small { grid-column: 3; color: var(--body-text-color-subdued, #aaa); overflow-wrap: anywhere; }
+.lps-queue-images { grid-column: 3; display: flex; flex-wrap: wrap; gap: .45rem; }
+.lps-queue-image { width: 8rem; height: 8rem; object-fit: contain; border-radius: .35rem; background: var(--background-fill-secondary, #222); }
 .lps-auto-loop-row { display: grid; grid-template-columns: 1.4rem 3rem 7rem minmax(0, 1fr); gap: .5rem; align-items: start; width: 100%; min-width: 0; padding: .45rem .6rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; box-sizing: border-box; cursor: pointer; }
 .lps-auto-loop-row code { display: block; min-width: 0; max-height: 7rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
 .lps-auto-loop-row input[type="checkbox"] { margin-top: .2rem; accent-color: var(--primary-500, #3b82f6); }
@@ -49,7 +64,7 @@
 .lps-model-advanced { margin-top: .5rem; }
 #llm_prompt_studio_connection_tab .lps-primary-actions { flex-wrap: wrap; gap: .55rem; }
 #llm_prompt_studio_connection_tab .lps-primary-actions > button { flex: 1 1 11rem; min-width: 9rem; }
-#llm_prompt_studio_discover_models { min-height: 2.35rem; }
+#llm_prompt_studio_discover_models { min-height: 1.9rem; }
 .lps-danger { border-color: var(--error-500, #ef4444); color: var(--error-500, #ef4444); }
 .lps-secondary { opacity: .82; }
 .lps-secondary-panel { margin-top: .45rem; }
@@ -62,15 +77,6 @@
 #llm_prompt_studio .lps-template-picker { align-items: end; gap: .5rem; }
 #llm_prompt_studio .lps-template-picker > :first-child { flex: 1 1 18rem; }
 #llm_prompt_studio .lps-template-picker > button { flex: 0 0 auto; min-width: 7rem; }
-.lps-footer-nav { position: sticky; bottom: .5rem; z-index: 20; display: flex; align-items: center; gap: .3rem; max-width: 1600px; margin: 1rem auto 0; padding: .45rem .55rem; border: 1px solid var(--border-color-primary, #555); border-radius: 8px; background: color-mix(in srgb, var(--background-fill-primary, #111) 94%, transparent); box-shadow: 0 .35rem 1rem rgba(0,0,0,.18); }
-.lps-footer-nav button { display: inline-flex; align-items: center; gap: .4rem; min-height: 2.15rem; padding: .3rem .65rem; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--body-text-color, #ddd); cursor: pointer; }
-.lps-footer-nav button:hover { border-color: var(--border-color-primary, #666); background: var(--background-fill-secondary, #222); }
-.lps-footer-nav button.is-active { border-color: var(--primary-500, #3b82f6); background: color-mix(in srgb, var(--primary-500, #3b82f6) 14%, transparent); color: var(--body-text-color, #fff); }
-.lps-footer-nav button:first-of-type, .lps-footer-nav button:nth-of-type(2), .lps-footer-nav button:nth-of-type(3) { font-weight: 700; }
-.lps-footer-nav b { display: inline-grid; place-items: center; width: 1.35rem; height: 1.35rem; border-radius: 50%; background: var(--primary-500, #3b82f6); color: white; font-size: .78rem; }
-.lps-footer-label, .lps-footer-arrow { color: var(--body-text-color-subdued, #999); font-size: .8rem; }
-.lps-footer-spacer { flex: 1; }
-.lps-footer-secondary { font-size: .82rem; color: var(--body-text-color-subdued, #aaa) !important; }
 #llm_prompt_studio :is(button, input, textarea, [role="tab"]):focus-visible { outline: 2px solid var(--primary-500, #3b82f6) !important; outline-offset: 2px; }
 #llm_prompt_studio_cache_table, #llm_prompt_studio_handoff_table { overflow-x: auto; }
 @media (prefers-reduced-motion: reduce) { #llm_prompt_studio *, #llm_prompt_studio *::before, #llm_prompt_studio *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
@@ -84,4 +90,124 @@
     padding: 0 !important;
     border: 0 !important;
     overflow: hidden !important;
+}
+
+/* Readable controls and content-sized fields, scoped to Studio. */
+:is(#llm_prompt_studio_main_tabs, .lps-inline-cache) {
+    --block-padding: .65rem;
+    --layout-gap: .65rem;
+    --input-padding: .5rem .65rem;
+    --button-small-padding: .45rem .8rem;
+    --button-large-padding: .5rem .9rem;
+    --button-large-text-size: 1rem;
+    --button-small-text-size: .96rem;
+    --block-label-text-size: 1rem;
+    --block-title-text-size: 1rem;
+}
+:is(#llm_prompt_studio_main_tabs, .lps-inline-cache) :is(.row, .stretch) { align-items: flex-start; gap: .65rem; }
+:is(#llm_prompt_studio_main_tabs, .lps-inline-cache) :is(.row, .stretch) > button { flex: 0 1 auto; min-width: 6rem; align-self: end; }
+:is(#llm_prompt_studio_main_tabs, .lps-inline-cache) button { font-size: 1rem; min-height: 2.4rem; padding: .45rem .8rem; }
+:is(#llm_prompt_studio_main_tabs, .lps-inline-cache) label { font-size: 1rem; line-height: 1.5; }
+:is(#llm_prompt_studio_main_tabs, .lps-inline-cache) textarea {
+    font-family: inherit; font-size: 1rem; line-height: 1.65; padding: .55rem .7rem; resize: vertical;
+}
+.lps-inline-cache input:not([type="radio"]):not([type="checkbox"]) { font-size: 1rem; }
+:is(#llm_prompt_studio_main_tabs, .lps-inline-cache) .block { border-radius: 6px; box-shadow: none; }
+#llm_prompt_studio_main_tabs .gradio-tabitem { padding: .75rem .3rem; }
+#llm_prompt_studio_main_tabs .gradio-dropdown .wrap { padding: .35rem .5rem; min-height: 2.1rem; }
+#llm_prompt_studio_main_tabs .gradio-dropdown input { padding: 0; }
+#llm_prompt_studio_main_tabs .lps-primary-actions > button { flex: 0 1 auto; width: auto; }
+#llm_prompt_studio_main_tabs .lps-status { padding: .3rem 0; border: 0; min-height: 1.5rem; }
+#llm_prompt_studio_main_tabs .lps-status p { margin: 0; }
+#llm_prompt_studio_png_batch_tab .lps-section-heading { margin: .25rem 0 0; }
+#llm_prompt_studio_png_batch_tab .lps-section-heading h3 { margin: 0; font-size: 1.12rem; line-height: 1.4; }
+#llm_prompt_studio_png_batch_tab .lps-section-copy { margin: 0 0 .25rem; max-width: 72ch; }
+#llm_prompt_studio_png_batch_tab .lps-section-copy p { margin: 0; font-size: 1rem; line-height: 1.55; }
+#llm_prompt_studio_png_batch_tab .lps-plugin-source-actions { flex-wrap: wrap; align-items: stretch; gap: .65rem; }
+#llm_prompt_studio_png_batch_tab :is(#llm_prompt_studio_png_collector_pull, #llm_prompt_studio_ranbooru_batch_load) { flex: 0 1 18rem; width: 18rem; min-height: 2.75rem; align-self: stretch; }
+#llm_prompt_studio_png_batch_tab .lps-source-settings { margin-top: .2rem; }
+#llm_prompt_studio_png_batch_tab :is(textarea, input):disabled { color: var(--body-text-color, #f2f2f2); opacity: 1; }
+#llm_prompt_studio_png_batch_table { max-width: 100%; overflow-x: auto; }
+#llm_prompt_studio_png_batch_table table { min-width: 840px; table-layout: fixed; }
+#llm_prompt_studio_main_tabs .lps-main-workbench > .lps-source-column { flex: 3 1 360px !important; min-width: 0 !important; }
+#llm_prompt_studio_main_tabs .lps-main-workbench > .lps-rules-column { flex: 2 1 280px !important; min-width: 0 !important; }
+.lps-inline-cache { margin: .6rem 0; }
+.lps-inline-cache .prose { font-size: .96rem; line-height: 1.5; }
+.lps-inline-workbench { width: 100%; margin: .45rem 0; gap: .55rem; }
+.lps-inline-workbench > .gradio-accordion { margin-top: .35rem; }
+.lps-inline-workbench :is(button, input, textarea, select, label) { font-size: max(1rem, 16px); }
+.lps-inline-workbench textarea { line-height: 1.55; resize: vertical; }
+.lps-inline-workbench .lps-source-picker .wrap { display: flex; flex-wrap: wrap; gap: .5rem; }
+.lps-inline-workbench .lps-source-picker .wrap > label { flex: 1 1 10rem; justify-content: center; min-height: 2.75rem; font-weight: 600; }
+.lps-inline-workbench .lps-source-hint { font-size: .94rem; line-height: 1.5; }
+.lps-inline-workbench .lps-source-hint p { margin: 0; }
+.lps-inline-workbench .lps-template-picker { align-items: end; gap: .65rem; }
+.lps-inline-workbench .lps-template-picker > button { flex: 0 0 auto; width: auto; min-height: 2.5rem; padding: .5rem .9rem; }
+.lps-inline-workbench .lps-inline-merge { align-items: end; }
+.lps-inline-workbench .lps-inline-actions { flex-wrap: wrap; gap: .65rem; }
+.lps-inline-workbench .lps-inline-actions > button { flex: 0 1 auto; width: auto; min-width: 7rem; min-height: 2.75rem; padding: .55rem 1rem; }
+.lps-inline-workbench :is(button, input, textarea):focus-visible { outline: 2px solid var(--primary-500, #3b82f6); outline-offset: 2px; }
+@media (max-width: 600px) {
+    .lps-inline-workbench .lps-inline-writing { flex-direction: column; }
+    .lps-inline-workbench .lps-inline-writing > * { width: 100%; min-width: 0 !important; }
+    .lps-inline-workbench .lps-source-picker .wrap > label { flex-basis: 100%; }
+    .lps-inline-workbench .lps-inline-actions > button { flex: 1 1 100%; }
+}
+.lps-cache-workbench { width: 100%; margin-top: .75rem; }
+.lps-generation-destination { align-items: end; gap: .75rem; }
+.lps-generation-destination .wrap { display: flex; flex-wrap: wrap; gap: .45rem; }
+.lps-generation-destination .wrap > label { flex: 1 1 9rem; min-height: 2.6rem; justify-content: center; }
+.lps-template-editor textarea { min-height: 0; }
+:is(#llm_prompt_studio_server_queue_log, #llm_prompt_studio_txt2img_inline_queue_log) {
+    max-height: min(34rem, 60vh); overflow-y: auto; overflow-wrap: anywhere;
+}
+#llm_prompt_studio_generation_stop { min-width: 6rem; }
+@media (max-width: 600px) {
+    .lps-generation-destination { flex-direction: column; }
+    .lps-generation-destination > * { width: 100%; min-width: 0 !important; }
+    .lps-server-queue-row { grid-template-columns: 2rem 5rem minmax(0, 1fr); gap: .35rem; }
+}
+.lps-cache-workbench > .lps-inline-cache { margin: 0; }
+#llm_prompt_studio_main_tabs .lps-template-picker > :first-child { flex: 1 1 18rem; }
+#llm_prompt_studio_main_tabs .lps-template-picker > button { flex: 0 0 auto; }
+.lps-inline-cache :is(button, input, textarea):focus-visible { outline: 2px solid var(--primary-500, #3b82f6); outline-offset: 2px; }
+
+/* Keep the main writing areas readable without turning short prompts into
+   oversized fixed panels. Gradio can still grow them up to the defined cap. */
+#llm_prompt_studio_request textarea,
+#llm_prompt_studio_source_tags textarea { min-height: 7rem; max-height: 18rem; }
+#llm_prompt_studio_output textarea { min-height: 11rem; max-height: 28rem; font-size: 1.06rem; line-height: 1.7; }
+#llm_prompt_studio_batch_base_prompt textarea { min-height: 5rem; max-height: 14rem; }
+#llm_prompt_studio_png_batch_current textarea { min-height: 7rem; max-height: 20rem; font-size: 1.04rem; }
+#llm_prompt_studio_main_tabs .lps-status { font-size: 1rem; }
+
+/* Stable row height prevents Gradio's virtual table from jumping while scrolling. */
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) { overflow-anchor: none; }
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) table { table-layout: fixed; width: 100%; }
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) :is(th, td) {
+    white-space: nowrap !important; overflow: hidden; text-overflow: ellipsis;
+    padding: .55rem .5rem; font-size: 1rem; line-height: 1.5;
+}
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) td { height: 3rem; max-height: 3rem; }
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) .cell-wrap {
+    padding: 0 .3rem !important; min-height: 1.6rem; line-height: 1.6rem;
+}
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) td .cell-wrap {
+    max-height: 1.6rem; overflow: hidden; text-overflow: ellipsis; display: block;
+}
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) :is(th, td):nth-child(-n+2) { width: 3.5rem; }
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) :is(th, td):nth-child(3),
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) :is(th, td):nth-child(4) { width: 8rem; }
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) :is(th, td):last-child { width: 7rem; }
+/* The positive prompt takes all remaining width, instead of competing with duplicate summaries. */
+:is(#llm_prompt_studio_cache_table, .lps-cache-table) :is(table.table, .table-wrap) {
+    scrollbar-gutter: stable; overscroll-behavior: contain; overflow-anchor: none;
+}
+.lps-inline-cache .lps-result-table :is(th, td):nth-child(3) { width: auto; }
+@media (max-width: 760px) {
+    #llm_prompt_studio_main_tabs { padding: .2rem; }
+    #llm_prompt_studio_main_tabs .lps-main-workbench { flex-direction: column; }
+    #llm_prompt_studio_main_tabs .lps-main-workbench > :is(.lps-source-column, .lps-rules-column) { flex: 1 1 auto !important; width: 100%; }
+    #llm_prompt_studio_png_batch_tab :is(#llm_prompt_studio_png_collector_pull, #llm_prompt_studio_ranbooru_batch_load) { flex-basis: 100%; width: 100%; }
+    :is(#llm_prompt_studio_cache_table, .lps-cache-table) table { min-width: 680px; }
 }

@@ -29,7 +29,7 @@ def main():
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.goto(args.url)
         page.get_by_role("tab", name="批处理", exact=True).click()
-        page.get_by_role("tab", name="JSON 转换", exact=True).click()
+        page.get_by_role("tab", name="导入与插件批次", exact=True).click()
         page.wait_for_timeout(1500)
         baseline = dict(requests)
         page.locator('#llm_prompt_studio_png_batch_file input[type=file]').set_input_files(

@@ -36,6 +36,36 @@
         return host.matches("textarea, input") ? host : host.querySelector("textarea, input");
     }
 
+    function componentValue(id) {
+        const host = root().querySelector(`#${id}`);
+        if (!host) return null;
+        const input = componentInput(id);
+        const raw = input?.value ?? host.querySelector("pre, code")?.textContent ?? "";
+        if (!String(raw).trim()) return null;
+        try {
+            return JSON.parse(raw);
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    function openWorkspace() {
+        const scope = root();
+        function activate(container, panelId, label) {
+            const buttons = Array.from(container?.querySelectorAll('button') || []);
+            const button = buttons.find(item => (item.getAttribute('aria-controls') || '').split(/\s+/).includes(panelId))
+                || buttons.find(item => item.textContent.trim() === label);
+            button?.click();
+        }
+        activate(scope.querySelector('#tabs'), 'tab_llm_prompt_studio', 'LLM 提示词工作室');
+        activate(scope.querySelector('#llm_prompt_studio_main_tabs'), 'llm_prompt_studio_library_tab', '缓存');
+        window.requestAnimationFrame(() => {
+            const header = scope.querySelector('#llm_prompt_studio_png_batch_tab .label-wrap');
+            if (header?.getAttribute('aria-expanded') === 'false') header.click();
+            scope.querySelector('#llm_prompt_studio_png_batch_tab')?.scrollIntoView({ behavior: 'auto', block: 'start' });
+        });
+    }
+
     function appendToPrompt(processedPrompt, target, mode) {
         const incoming = String(processedPrompt ?? "").trim();
         if (!incoming) return [status("warning", "当前条没有可写入的结果", "请先完成润色或扩写。"), false];
@@ -96,26 +126,30 @@
         return appendSelectedToPrompt(payload, selectedIds, mode);
     }
 
-    function receiveCollectorBatch(slot) {
-        const targetId = `llm_prompt_studio_${slot || "txt2img"}_json_batch_payload`;
-        const target = componentInput(targetId);
-        const legacy = componentInput("llm_prompt_studio_png_batch_payload");
-        if (!target) return status("error", "未找到内嵌 JSON 面板", `目标：#${targetId}`);
-        if (!legacy || !String(legacy.value || "").trim()) {
-            return status("warning", "PNG Collector 尚无批次", "请先在 PNG Prompt Collector 读取 PNG 或导入 JSON。");
+    function loadCollectorCache() {
+        const target = componentInput("llm_prompt_studio_png_batch_payload");
+        if (!target) {
+            return status("error", "无法读取插件批次", "未找到 LLM Prompt Studio 的批次输入组件。");
         }
-        setValue(target, legacy.value);
-        target.focus({ preventScroll: true });
-        // Put the user at the next actionable step. Gradio details panels are
-        // not guaranteed to be open after a tab switch, so expand them here.
-        const studio = window.llmPromptStudioAutoLoop;
-        studio?.navigate?.("png_batch");
-        const panel = target.closest("details");
-        if (panel) panel.open = true;
-        const runButton = root().querySelector("#llm_prompt_studio_png_batch_run button");
-        runButton?.scrollIntoView?.({ behavior: "smooth", block: "center" });
-        return status("success", "已接收 PNG Collector 批次", "批次已写入当前 txt2img JSON 面板。");
+        const batch = componentValue("ppc_prompt_batch_cache");
+        const records = Array.isArray(batch?.records) ? batch.records : [];
+        if (!records.length) {
+            return status("warning", "PNG Collector 当前没有缓存", "请先在 PNG Prompt Collector 读取 PNG 或载入 JSON 批次。");
+        }
+        setValue(target, JSON.stringify(batch));
+        openWorkspace();
+        return status("success", `已读取 PNG Collector ${records.length} 条`, "正在刷新批次预览。");
     }
 
-    window.llmPromptStudioPngBatch = { appendToPrompt, appendAllToPrompt, appendSelectedToPrompt, appendScopedToPrompt, receiveCollectorBatch };
+    const receiveCollectorBatch = loadCollectorCache;
+
+    window.llmPromptStudioPngBatch = {
+        appendToPrompt,
+        appendAllToPrompt,
+        appendSelectedToPrompt,
+        appendScopedToPrompt,
+        loadCollectorCache,
+        receiveCollectorBatch,
+        openWorkspace,
+    };
 })();

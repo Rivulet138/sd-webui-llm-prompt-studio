@@ -1,4 +1,5 @@
 import unittest
+import ast
 from pathlib import Path
 from unittest import mock
 
@@ -29,9 +30,16 @@ class ProviderResponseTests(unittest.TestCase):
 
     def test_batch_count_normalizes_non_finite_gradio_values(self):
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
-        self.assertIn("requested_count = int(float(generation_count))", source)
-        self.assertIn("except (TypeError, ValueError, OverflowError):", source)
-        self.assertIn("count = max(1, min(200, requested_count))", source)
+        function = next(node for node in ast.parse(source).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "_normalize_generation_count")
+        namespace = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "count-normalization", "exec"), namespace)  # noqa: S102
+        normalize = namespace["_normalize_generation_count"]
+        for value in (None, "", float("nan"), float("inf"), "invalid"):
+            self.assertEqual(normalize(value), 8)
+        self.assertEqual(normalize(0), 0)
+        self.assertEqual(normalize(-1), 1)
+        self.assertEqual(normalize(201), 200)
 
     def test_https_requests_never_downgrade_to_cleartext(self):
         requested_urls = []

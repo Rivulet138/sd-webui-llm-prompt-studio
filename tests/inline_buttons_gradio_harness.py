@@ -19,7 +19,8 @@ def main():
     import prompt_studio_core as core
 
     with tempfile.TemporaryDirectory(prefix="studio-inline-buttons-") as folder:
-        with patch.object(core, "StudioDB", return_value=core.StudioDB(Path(folder) / "studio.db")), patch.object(
+        databases = [core.StudioDB(Path(folder) / name) for name in ("studio.db", "processed.db")]
+        with patch.object(core, "StudioDB", side_effect=databases), patch.object(
             core, "CredentialStore", return_value=core.CredentialStore(Path(folder) / "credentials.json")
         ):
             import prompt_studio_ui as ui
@@ -41,8 +42,7 @@ def main():
         js = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
         with gr.Blocks(head=f"<script>{bootstrap}\n{js}</script>", css=ui.UI_CSS) as app:
             prompt = gr.Textbox(label="Prompt", elem_id="txt2img_prompt")
-            with patch.object(ui, "_create_inline_json_batch_panel"):
-                ui._create_inline_panel("txt2img", prompt)
+            ui._create_inline_panel("txt2img", prompt)
             generate = gr.Button("Generate", elem_id="txt2img_generate")
             interrupt = gr.Button("Interrupt", elem_id="txt2img_interrupt", visible=False)
             task_id = gr.Textbox(visible=False)

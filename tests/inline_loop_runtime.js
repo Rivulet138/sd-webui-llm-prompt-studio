@@ -52,6 +52,7 @@ function harness({ submitDelay = 0 } = {}) {
     }
     function add(id, child = null) {
         const node = new Element();
+        node.id = id;
         node.child = child;
         nodes.set(id, node);
         return node;
@@ -62,6 +63,9 @@ function harness({ submitDelay = 0 } = {}) {
         nodes.get(`${slot}_interrupt`).style.display = "none";
         nodes.get(`${slot}_status`).textContent = `completed ${submissions.length}`;
     }
+    add("llm_prompt_studio_auto_loop_log");
+    add("llm_prompt_studio_server_queue_status");
+    add("llm_prompt_studio_server_queue_log");
     for (const slot of ["txt2img", "img2img"]) {
         add(`${slot}_prompt`, new Element("fixed subject"));
         add(`${slot}_status`);
@@ -112,10 +116,19 @@ function harness({ submitDelay = 0 } = {}) {
                 cancellations.push(body);
                 return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
             }
-            assert.ok(url.endsWith("inline-generate") || url.endsWith("auto-loop-generate"), `unexpected endpoint ${url}`);
+            assert.ok(url.includes("/v1/queue") || url.endsWith("inline-generate") || url.endsWith("auto-loop-generate") || /\/(?:processed-)?cache\?/.test(url), `unexpected endpoint ${url}`);
             // Keep promises pending after abort to exercise late network results as well.
             return new Promise((resolve, reject) => requests.push({
-                body, signal: options.signal, reject,
+                url, body, signal: options.signal, reject,
+                json(data) { resolve({ ok: true, status: 200, json: async () => data }); },
+                records(records) {
+                    const params = new URL(url, "http://localhost").searchParams;
+                    const after = Number(params.get("after_id") || 0);
+                    const limit = Number(params.get("limit") || 100);
+                    const page = records.map((record, index) => ({ id: index + 1, ...record }))
+                        .filter(record => record.id > after && String(record.prompt || "").trim()).slice(0, limit);
+                    resolve({ ok: true, status: 200, json: async () => ({ records: page }) });
+                },
                 resolve(prompt) { resolve({ ok: true, status: 200, json: async () => ({ prompt }) }); },
                 fail(detail) { resolve({ ok: false, status: 500, json: async () => ({ detail }) }); },
             }));
@@ -348,8 +361,11 @@ test("continuous batch skips a rejected request while preserving earlier and lat
     h.requests.at(-1).resolve("last accepted scenery");
     await h.advance();
     assert.match(await completed, /持续 Prompt 生成完成/);
-    const saved = JSON.parse(h.storage.get("llm_prompt_studio_auto_loop_queue_v1"));
-    assert.deepEqual(saved.rows.map((row) => row.prompt), ["first accepted scenery", "last accepted scenery"]);
+    // This queue now lives in memory; assert the user-visible retained results.
+    const queue = h.nodes.get("llm_prompt_studio_auto_loop_log").innerHTML;
+    assert.match(queue, /<code>first accepted scenery<\/code>/);
+    assert.match(queue, /<code>last accepted scenery<\/code>/);
+    assert.match(queue, /队列 2 条/);
 });
 
 test("empty continuous batches advance to fresh rounds until Stop cancels retry backoff", async () => {
@@ -538,5 +554,418 @@ for (const cancelDuringStartup of [false, true]) {
         await h.advance();
         assert.equal(h.requests.length, 2, "watchdog expiry must permit a new explicit start");
         h.api.cancelInline("txt2img");
+    });
+}
+
+for (const [sourceName, endpoint, label] of [
+    ["原始缓存库", "/cache?", "原始缓存库"],
+    ["处理结果库", "/processed-cache?", "处理结果库"],
+]) {
+    test(`${sourceName} writes one prompt without image generation or hidden queue`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, source: sourceName });
+        assert.ok(h.requests[0].url.includes(endpoint));
+        h.requests[0].records([{ prompt: "first scenery" }, { prompt: "second scenery" }]);
+        assert.match(await pending, new RegExp(label));
+        assert.equal(h.prompt(), "fixed subject, first scenery");
+        assert.equal(h.submissions.length, 0);
+        assert.equal(h.requests.length, 1);
+        assert.equal(h.storage.has("llm_prompt_studio_auto_loop_queue_v1"), false);
+    });
+    test(`${sourceName} late cancelled reads do not advance the cursor`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, source: sourceName });
+        h.api.cancelInline("txt2img");
+        h.requests[0].records([{ prompt: "first scenery" }, { prompt: "second scenery" }]);
+        assert.equal(await pending, "已取消");
+        assert.equal(h.prompt(), "fixed subject");
+        const retry = h.api.inlineOnce({ ...config, source: sourceName });
+        h.requests[1].records([{ prompt: "first scenery" }, { prompt: "second scenery" }]);
+        await retry;
+        assert.equal(h.prompt(), "fixed subject, first scenery");
+    });
+    test(`${sourceName} empty library returns its own error`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, source: sourceName });
+        h.requests[0].records([]);
+        assert.match(await pending, new RegExp(`${label}为空`));
+        assert.equal(h.prompt(), "fixed subject");
+        assert.equal(h.submissions.length, 0);
+    });
+}
+
+test("cache libraries maintain independent sequential cursors", async () => {
+    const h = harness();
+    for (const [sourceName, expected] of [["cache", "raw one"], ["processed_cache", "processed one"], ["cache", "raw two"]]) {
+        const pending = h.api.inlineOnce({ ...config, source: sourceName, writeMode: "replace" });
+        h.requests.at(-1).records(sourceName === "cache" ? [{ prompt: "raw one" }, { prompt: "raw two" }] : [{ prompt: "processed one" }]);
+        await pending;
+        assert.equal(h.prompt(), expected);
+    }
+});
+
+for (const sourceName of ["cache", "processed_cache"]) {
+    test(`${sourceName} traverses more than 1000 rows with bounded cursor reads and wraps at the end`, async () => {
+        const h = harness();
+        const rows = Array.from({ length: 1205 }, (_, index) => ({ id: index * 3 + 2, prompt: `scene ${index}` }));
+        let lastId = 0;
+        for (const row of rows) {
+            const pending = h.api.inlineOnce({ ...config, source: sourceName, writeMode: "replace" });
+            const request = h.requests.at(-1);
+            const params = new URL(request.url, "http://localhost").searchParams;
+            assert.equal(params.get("after_id"), String(lastId));
+            assert.equal(params.get("limit"), "1", "do not load the whole database for a single image");
+            request.records(rows);
+            await pending;
+            assert.equal(h.prompt(), row.prompt);
+            lastId = row.id;
+        }
+        const wrap = h.api.inlineOnce({ ...config, source: sourceName, writeMode: "replace" });
+        h.requests.at(-1).records(rows);
+        await h.flush();
+        assert.equal(new URL(h.requests.at(-1).url, "http://localhost").searchParams.get("after_id"), "0");
+        h.requests.at(-1).records(rows);
+        await wrap;
+        assert.equal(h.prompt(), rows[0].prompt);
+        assert.equal(h.requests.length, rows.length + 2);
+    });
+
+    test(`${sourceName} skips deleted IDs, sees appended rows and handles an emptied library`, async () => {
+        const h = harness();
+        let rows = [{ id: 2, prompt: "first" }, { id: 4, prompt: "deleted next" }, { id: 7, prompt: "third" }];
+        async function read(expected) {
+            const pending = h.api.inlineOnce({ ...config, source: sourceName, writeMode: "replace" });
+            h.requests.at(-1).records(rows);
+            await pending;
+            assert.equal(h.prompt(), expected);
+        }
+        await read("first");
+        rows = rows.filter(row => row.id !== 4);
+        await read("third");
+        rows.push({ id: 12, prompt: "appended" });
+        await read("appended");
+        const empty = h.api.inlineOnce({ ...config, source: sourceName, writeMode: "replace" });
+        h.requests.at(-1).records([]);
+        await h.flush();
+        h.requests.at(-1).records([]);
+        assert.match(await empty, /为空/);
+        assert.equal(h.prompt(), "appended");
+    });
+
+    test(`${sourceName} failed reads and cancelled wraparound do not advance the cursor`, async () => {
+        const h = harness();
+        const options = { ...config, source: sourceName, writeMode: "replace" };
+        const first = h.api.inlineOnce(options);
+        h.requests.at(-1).records([{ id: 5, prompt: "first" }]);
+        await first;
+        const failed = h.api.inlineOnce(options);
+        h.requests.at(-1).fail("temporary read failure");
+        assert.match(await failed, /temporary read failure/);
+        const wrap = h.api.inlineOnce(options);
+        assert.equal(new URL(h.requests.at(-1).url, "http://localhost").searchParams.get("after_id"), "5");
+        h.requests.at(-1).records([]);
+        await h.flush();
+        h.api.cancelInline("txt2img");
+        h.requests.at(-1).records([{ id: 2, prompt: "late wrapped result" }]);
+        assert.equal(await wrap, "已取消");
+        const retry = h.api.inlineOnce(options);
+        assert.equal(new URL(h.requests.at(-1).url, "http://localhost").searchParams.get("after_id"), "5");
+        h.requests.at(-1).records([{ id: 8, prompt: "fresh result" }]);
+        await retry;
+        assert.equal(h.prompt(), "fresh result");
+    });
+}
+
+for (const sourceName of ["llm", "cache", "processed_cache"]) {
+    test(`${sourceName} single write never overwrites user edits during a pending request`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, source: sourceName });
+        h.nodes.get("txt2img_prompt").child.value = "user edited subject";
+        if (sourceName === "llm") h.requests[0].resolve("new scenery");
+        else h.requests[0].records([{ prompt: "new scenery" }]);
+        assert.match(await pending, /已被修改/);
+        assert.equal(h.prompt(), "user edited subject");
+        assert.equal(h.submissions.length, 0);
+    });
+}
+
+for (const [mode, base, expected] of [
+    ["append_end", "subject_token, <lora:sample:1>", "subject_token, <lora:sample:1>, new scenery"],
+    ["append_start", "subject_token, <lora:sample:1>", "new scenery, subject_token, <lora:sample:1>"],
+    ["marker", "subject_token, {{LLM}}, <lora:sample:1>", "subject_token, new scenery, <lora:sample:1>"],
+    ["replace", "subject_token, <lora:sample:1>", "new scenery"],
+]) {
+    for (const continuous of [false, true]) {
+        test(`${continuous ? "continuous" : "single"} write respects ${mode}`, async () => {
+            const h = harness();
+            h.nodes.get("txt2img_prompt").child.value = base;
+            const pending = continuous ? h.api.startInlineLoop({ ...config, writeMode: mode }) : h.api.inlineOnce({ ...config, writeMode: mode });
+            await h.advance();
+            h.requests[0].resolve("new scenery");
+            await h.advance();
+            if (continuous) {
+                assert.equal(h.submissions[0].prompt, expected);
+                assert.equal(h.prompt(), base);
+                h.api.cancelInline("txt2img");
+            } else {
+                await pending;
+                assert.equal(h.prompt(), expected);
+                assert.equal(h.submissions.length, 0);
+            }
+        });
+    }
+}
+
+for (const continuous of [false, true]) {
+    test(`${continuous ? "continuous" : "single"} marker mode rejects absent markers`, async () => {
+        const h = harness();
+        const pending = continuous ? h.api.startInlineLoop({ ...config, writeMode: "marker" }) : h.api.inlineOnce({ ...config, writeMode: "marker" });
+        await h.advance();
+        h.requests[0].resolve("new scenery");
+        await h.advance();
+        if (!continuous) assert.match(await pending, /没有插入标记/);
+        assert.match(h.status(), /没有插入标记/);
+        assert.equal(h.prompt(), "fixed subject");
+        assert.equal(h.submissions.length, 0);
+    });
+}
+
+for (const sourceName of ["cache", "processed_cache"]) {
+    test(`${sourceName} continuous mode reads sequential rows and preserves visible prompt`, async () => {
+        const h = harness();
+        h.api.startInlineLoop({ ...config, source: sourceName });
+        await h.advance();
+        const rows = [{ prompt: "first scenery" }, { prompt: "second scenery" }];
+        h.requests[0].records(rows);
+        await h.advance();
+        assert.equal(h.submissions[0].prompt, "fixed subject, first scenery");
+        assert.equal(h.prompt(), "fixed subject");
+        h.requests[1].records(rows);
+        await h.advance(750);
+        assert.equal(h.submissions.length, 1);
+        h.finish();
+        await h.advance(250);
+        assert.equal(h.submissions[1].prompt, "fixed subject, second scenery");
+        assert.equal(h.prompt(), "fixed subject");
+        assert.ok(h.requests.every(request => !request.url.includes("inline-generate")));
+        h.api.cancelInline("txt2img");
+    });
+}
+
+
+test("cache destination saves every generated result without changing native prompt or starting images", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "cache", count: 2 });
+    assert.equal(h.requests[0].body.cache_result, true);
+    h.requests[0].resolve("forest");
+    await h.flush();
+    assert.equal(h.requests[1].body.cache_result, true);
+    assert.equal(h.requests[1].body.source_tags, "fixed subject");
+    h.requests[1].resolve("beach");
+    assert.match(await pending, /2.*未启动生图/);
+    assert.equal(h.prompt(), "fixed subject");
+    assert.equal(h.submissions.length, 0);
+    assert.equal(h.requests.length, 2);
+});
+
+test("zero count caches indefinitely until cancel with visible completed count", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "cache", count: 0 });
+    for (let i = 0; i < 3; i += 1) {
+        h.requests[i].resolve(`scene ${i}`);
+        await h.flush();
+    }
+    assert.equal(h.requests.length, 4);
+    assert.match(h.status(), /无限/);
+    assert.match(h.status(), /已完成 3/);
+    h.api.cancelInline("txt2img");
+    h.requests[3].resolve("late");
+    assert.equal(await pending, "已取消");
+    assert.match(h.status(), /已完成 3/);
+    assert.equal(h.submissions.length, 0);
+    assert.equal(h.prompt(), "fixed subject");
+});
+
+for (const count of [-1, "", null, "invalid", Infinity, 0.5]) {
+    test(`invalid count ${String(count)} does not become unlimited`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, destination: "cache", count });
+        h.requests[0].resolve("scene");
+        await pending;
+        assert.equal(h.requests.length, 1);
+    });
+}
+
+for (const sourceName of ["llm", "cache", "processed_cache"]) {
+    test(`zero count queues ${sourceName} sequentially without unbounded pending jobs`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, source: sourceName, destination: "queue", count: "0" });
+        if (sourceName === "llm") h.requests[0].resolve("scene");
+        else h.requests[0].records([{ prompt: "scene" }]);
+        await h.flush();
+        assert.deepEqual(h.requests[1].body.requests, ["fixed subject, scene"]);
+        h.requests[1].json({ batch_id: "first", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
+        await h.flush();
+        assert.equal(h.requests.length, 2);
+        assert.match(h.status(), /无限/);
+        await h.advance(1000);
+        h.requests[2].json({ counts: { completed: 1 }, jobs: [{ status: "completed" }] });
+        await h.flush();
+        assert.equal(h.requests.length, 4);
+        assert.match(h.status(), /已完成 1/);
+        h.api.cancelInline("txt2img");
+        if (sourceName === "llm") h.requests[3].resolve("late");
+        else h.requests[3].records([{ prompt: "late" }]);
+        assert.equal(await pending, "已取消");
+        assert.equal(h.requests.length, 4, "completed queue is not cancelled again");
+        assert.equal(h.submissions.length, 0);
+    });
+}
+
+for (const sourceName of ["cache", "processed_cache"]) {
+    test(`unlimited ${sourceName} stops when source becomes empty`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, source: sourceName, destination: "queue", count: 0 });
+        h.requests[0].records([]);
+        assert.match(await pending, /为空/);
+        assert.equal(h.requests.length, 1);
+    });
+}
+
+test("unlimited queue cancellation targets the current cycle only", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "queue", count: 0 });
+    h.requests[0].resolve("first");
+    await h.flush();
+    h.requests[1].json({ batch_id: "done", counts: { completed: 1 }, jobs: [{ status: "completed" }] });
+    await h.flush();
+    h.requests[2].resolve("second");
+    await h.flush();
+    h.api.cancelInline("txt2img");
+    h.requests[3].json({ batch_id: "current", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
+    await h.flush();
+    assert.ok(h.requests[4].url.endsWith("/queue/current/cancel"));
+    h.requests[4].json({});
+    assert.equal(await pending, "已取消");
+    assert.equal(h.requests.length, 5);
+    assert.match(h.status(), /已完成 1/);
+});
+
+for (const outcome of ["error", "cancelled", "missing"]) {
+    test(`unlimited queue stops after ${outcome} without counting it as completed`, async () => {
+        const h = harness();
+        const pending = h.api.inlineOnce({ ...config, destination: "queue", count: 0 });
+        h.requests[0].resolve("scene");
+        await h.flush();
+        h.requests[1].json({ batch_id: "failed-cycle", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
+        await h.advance(1000);
+        h.requests[2].json({
+            counts: outcome === "missing" ? {} : { [outcome]: 1 },
+            jobs: outcome === "missing" ? [] : [{ status: outcome }],
+        });
+        await h.flush();
+        assert.match(h.status(), /操作已停止/);
+        assert.match(h.status(), /已完成 0/);
+        assert.match(await pending, outcome === "error" ? /失败/ : outcome === "cancelled" ? /取消/ : /不存在|消失/);
+        assert.equal(h.requests.length, 3, "failed cycle must not request another prompt");
+    });
+}
+
+test("queue destination submits composed prompts and renders images beside inline controls", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "queue", count: 2 });
+    h.requests[0].resolve("forest");
+    await h.flush();
+    h.requests[1].resolve("beach");
+    await h.flush();
+    const enqueue = h.requests[2];
+    assert.ok(enqueue.url.endsWith("/v1/queue"));
+    assert.deepEqual(enqueue.body.requests, ["fixed subject, forest", "fixed subject, beach"]);
+    assert.equal(enqueue.body.config.direct_prompt, true);
+    assert.equal(enqueue.body.config.cache_result, false, "LLM results were cached already");
+    assert.equal(enqueue.body.target, "txt2img");
+    assert.ok(enqueue.body.config.generation_settings);
+    enqueue.json({ batch_id: "own-batch", status: "已完成 2", counts: { completed: 2 }, jobs: [
+        { position: 1, status: "completed", prompt: "fixed subject, forest", images: ["aGVsbG8="] },
+        { position: 2, status: "completed", prompt: "fixed subject, beach" },
+    ] });
+    await pending;
+    assert.equal(h.prompt(), "fixed subject");
+    assert.equal(h.submissions.length, 0);
+    assert.match(h.status(), /fixed subject, forest/);
+    assert.match(h.status(), /data:image\/png;base64,aGVsbG8=/);
+});
+
+test("cancel during queue submission cancels only the returned batch and never changes native prompt", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "queue" });
+    h.requests[0].resolve("forest");
+    await h.flush();
+    h.api.cancelInline("txt2img");
+    h.requests[1].json({ batch_id: "late-owned-batch", jobs: [] });
+    await h.flush();
+    assert.ok(h.requests[2].url.endsWith("/queue/late-owned-batch/cancel"));
+    h.requests[2].json({});
+    assert.equal(await pending, "已取消");
+    assert.equal(h.prompt(), "fixed subject");
+    assert.equal(h.interrupts.length, 0);
+});
+
+test("cancel cache generation preserves completed cache entries and does not enqueue late results", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "cache", count: 3 });
+    h.requests[0].resolve("forest");
+    await h.flush();
+    h.api.cancelInline("txt2img");
+    assert.equal(h.requests[1].signal.aborted, true);
+    h.requests[1].resolve("late beach");
+    assert.equal(await pending, "已取消");
+    assert.equal(h.requests.length, 2);
+    assert.equal(h.prompt(), "fixed subject");
+});
+
+
+test("queue cancellation while polling targets only its batch and ignores late progress", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "queue" });
+    h.requests[0].resolve("forest");
+    await h.flush();
+    h.requests[1].json({ batch_id: "only-owned", status: "处理中", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
+    await h.advance(1000);
+    const poll = h.requests[2];
+    assert.ok(poll.url.endsWith("/queue/only-owned"));
+    h.api.cancelInline("txt2img");
+    assert.ok(h.requests[3].url.endsWith("/queue/only-owned/cancel"));
+    h.requests[3].json({});
+    poll.json({ status: "obsolete progress", counts: { completed: 1 }, jobs: [{ status: "completed" }] });
+    assert.equal(await pending, "已取消");
+    assert.doesNotMatch(h.status(), /obsolete progress/);
+    assert.equal(h.interrupts.length, 0);
+});
+
+test("cache-only ignores prompt insertion markers and rejects non-LLM cache copying", async () => {
+    const h = harness();
+    const pending = h.api.inlineOnce({ ...config, destination: "cache", writeMode: "marker" });
+    h.requests[0].resolve("forest");
+    assert.match(await pending, /已保存到缓存/);
+    assert.match(await h.api.inlineOnce({ ...config, source: "processed_cache", destination: "cache" }), /仅存缓存请使用/);
+    assert.equal(h.requests.length, 1);
+});
+
+
+for (const lateFailure of [false, true]) {
+    test(`Studio queue watcher ignores superseded ${lateFailure ? "errors" : "snapshots"} without cancelling jobs`, async () => {
+        const h = harness();
+        const old = h.api.watchServerQueue("old-batch");
+        const current = h.api.watchServerQueue("new-batch");
+        h.requests[1].json({ status: "new complete", counts: { completed: 1 }, jobs: [{ prompt: "new result" }] });
+        await current;
+        if (lateFailure) h.requests[0].fail("obsolete error");
+        else h.requests[0].json({ status: "old complete", counts: { completed: 1 }, jobs: [{ prompt: "old result" }] });
+        await old;
+        assert.equal(h.nodes.get("llm_prompt_studio_server_queue_status").innerHTML, "new complete");
+        assert.match(h.nodes.get("llm_prompt_studio_server_queue_log").innerHTML, /new result/);
+        assert.equal(h.requests.length, 2);
+        assert.equal(h.cancellations.length, 0);
     });
 }

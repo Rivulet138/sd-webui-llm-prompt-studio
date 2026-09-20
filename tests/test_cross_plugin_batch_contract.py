@@ -45,7 +45,11 @@ class CrossPluginBatchContractTests(unittest.TestCase):
         js = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
         png_js = (ROOT / "javascript" / "llm_prompt_studio_png_batch.js").read_text(encoding="utf-8")
         self.assertIn('system_preview = gr.Textbox(visible=False', ui)
-        self.assertIn("writeSelectedToPositive", ui)
+        self.assertNotIn("writeSelectedToPositive", ui)
+        cache_panel = ui[ui.index("def _create_inline_cache_panel"):ui.index("def _create_inline_panel")]
+        self.assertIn('gr.Accordion("缓存 Prompt 处理", open=False', cache_panel)
+        self.assertIn('write = gr.Button("写入 txt2img"', cache_panel)
+        self.assertIn("write.click(_inline_cache_write, inputs=[prompt_target, result, write_mode], outputs=[prompt_target, status])", cache_panel)
         self.assertIn("selectAllRows", js)
         self.assertIn("请先勾选待使用的 Prompt", js)
         self.assertIn('const target = config?.target === "img2img" ? "img2img" : "txt2img";', js)
