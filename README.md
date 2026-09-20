@@ -1,182 +1,168 @@
 # LLM Prompt Studio
 
-LLM Prompt Studio 是面向 Forge Neo 的 Prompt 生成、转换、批处理、缓存和联动扩展。它支持单条生成、服务端队列、txt2img 内嵌生成，以及 JSON/PNG Prompt 批量转换。
+为 **Stable Diffusion Forge Neo** 提供 Prompt 生成、缓存处理和本地图片反推。可以只生成并保存 Prompt，也可以使用当前 txt2img 参数加入生图队列。
 
-## 功能概览
-
-- 支持 OpenAI Responses、OpenAI Chat Completions、Anthropic、Gemini、OpenRouter、DeepSeek、Ollama、LM Studio 和自定义 OpenAI 兼容接口。
-- 输出预设覆盖 Danbooru Tags、Danbooru + Natural、Natural Language、NoobAI Tags、Anima Tags 和 Krea 2 Natural。
-- 每个底模均有独立的生成、转换、扩写、润色模板（共 24 个模型/操作组合），不会把 Pony/NoobAI 标签规则套到 Flux/Krea 2。
-- 支持 `Plain Prompt`、`Regional JSON` 和 `Regional Markdown` 结构化输出。
-- txt2img 下方提供内嵌 Prompt 生成与 JSON 批量转换面板，所有写回操作都指向固定的 txt2img 正面 Prompt。
-- 提供“灵感批量生成”：可以在没有输入时随机抽取静态词库，生成题材各异的提示词；也可以保留已有角色 Tag，让 LLM 补全动作、物品、环境、构图和光线。每条结果会参考已生成内容的排除摘要，减少同质化。
-- 保留兽耳萝莉批量模板；模板只规定主体方向和差异规则，SFW/NSFW 由内容模式及现有安全注入负责。
-- 支持本地 SQLite 缓存、服务端队列、取消、导入导出、Ranbooru 交接和 PNG Prompt Collector 批次。
-
-Ranbooru 缓存联动区提供“载入到 LLM 批处理”：按当前来源、分级、评分和数量筛选读取缓存，直接填入 JSON 批处理。随后可选择“格式转换”“扩写”或“润色”、目标底模和写入目标；原始 Tag 与自然语言字段会保留在每条 `prompt_batch.v1` 记录中。
+单条与批量生成共用一个页面；txt2img 内嵌面板共用已保存的 LLM 推理设置和快速模板。支持独立配置主、备用服务商，以及 WD14 / CL Tagger 本地模型。
 
 ## 安装与更新
 
-在 Forge Neo 扩展目录执行：
+在 Forge Neo 的「扩展 → 从网址安装」中填写：
 
-```powershell
-cd E:\sd-webui-forge-neo\extensions
-git clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio.git
+```text
+https://github.com/Rivulet138/sd-webui-llm-prompt-studio.git
 ```
 
-重启 Forge Neo 后，在浏览器执行 `Ctrl + F5`。更新已有安装：
+也可以在 **Forge Neo 根目录**执行：
 
 ```powershell
-cd E:\sd-webui-forge-neo\extensions\sd-webui-llm-prompt-studio
-git pull
+git -C extensions clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio.git
 ```
+
+更新已有安装：
+
+```powershell
+git -C extensions/sd-webui-llm-prompt-studio pull --ff-only
+```
+
+完成后重启 Forge Neo，并用 `Ctrl + F5` 刷新页面。沿用平时的 `webui-user.bat` 或 `webui.bat` 启动方式即可，生图队列不需要添加 `--api`。
 
 ## 首次配置
 
-在 `LLM Prompt Studio` 页面填写服务提供方、模型服务地址、预训练模型/模型 ID 和 API Key，然后使用“测试连接”验证。点击“发现模型”会通过当前 Provider 的模型列表接口读取可用模型；接口不支持发现时仍可手动填写模型 ID。温度、超时、最大输出 Token 和重试次数位于“高级模型选项”中，温度默认值为 `1.0`；独立批量、内嵌多样性和 PNG 批量会将请求温度提升到至少 `1.25`。最大输出 Token 默认值为 `8096`，适合 Krea2/Anima 等长 Prompt，可避免响应因达到长度上限而缺少完整的 assistant 文本。API Key 保存在 `user/credentials/llm_credentials.json`，界面不会回填明文。
+1. 打开 **LLM Prompt Studio → 设置**，填写服务提供方、模型服务地址、模型 ID 和 API Key。
+2. 点击「测试连接」，再「保存并应用」。支持「发现模型」，也可手动填写模型 ID。
+3. 在「生成」页选择 System Prompt 预设和模型预设，填写创作要求，选择生成去向。
 
-“加载模型配置 / 权重文件”支持读取包含 `provider`、`endpoint`、`model_id`、`fallback_model`、`weights_path` 和 `version` 字段的 JSON；`.safetensors`、`.gguf` 和 `.bin` 文件只会登记本地权重路径。远程 LLM API 不能直接加载原始权重，实际加载由 Ollama、LM Studio 或其他本地推理服务完成。填写“权重版本回退模型”后，主模型在重试仍失败或返回空 assistant 文本时会自动调用备用模型。
+「模型 ID」是调用的 LLM；「模型预设」决定生成的 Prompt 如何适配绘图模型。实际生图仍使用 Forge 当前加载的模型。
 
-对于模型 ID 含 `deepseek` 且不是 `reasoner` / `R1` 的 OpenAI 兼容接口，插件会自动关闭 thinking，避免隐藏推理占满输出预算；Reasoner/R1 模型不会套用该参数。
+支持 OpenAI Responses / Chat Completions、Anthropic、Gemini、OpenRouter、DeepSeek、Ollama、LM Studio 和自定义 OpenAI 兼容接口。备用连接可单独设置服务商、地址、模型和凭据，主连接重试失败后才会启用。
 
-“创作要求”描述本次画面；“源 Danbooru 标签”可选。System Prompt 预设决定输出格式，目标底模会追加对应模型的内容约束。SFW/NSFW 是独立的内容模式；自定义 System Prompt、额外 NSFW 注入和输出后处理参数也在工作参数中统一保存。
+温度、Top P、Top K、输出 Token、超时及推理选项在设置页统一保存。一级生成与 txt2img 内嵌批量生成使用同一套已保存参数；采样字段按服务商适配，具体可用参数以所选服务和模型为准。API Key 保存在本地，界面不回填明文。
 
-连接失败时，插件对临时网络错误、408/409/425/429、部分 5xx 状态和常见 TLS 提前断开最多重试两次并退避等待。HTTPS 连接不会自动降级到 HTTP，以免 API Key 和 Prompt 被明文发送。OpenAI 兼容服务应确认 Endpoint 包含正确的 `/v1` 路径、模型 ID 可用，并检查本地代理或服务端 TLS 配置。若 HTTPS 握手在所有重试后仍返回 `UNEXPECTED_EOF_WHILE_READING`，这是远端端点或代理在握手阶段关闭连接，需更换可用端点或修复其 TLS 反向代理，客户端无法凭空生成 assistant 响应。
+## 功能入口
 
-## 单条生成
+| 需要做什么 | 入口 |
+| --- | --- |
+| 生成一条或一批 Prompt，选择仅缓存或生图 | 工作室 → 生成 |
+| 转换、扩写、润色原始缓存 | 生成 → 缓存 Prompt 处理（默认收起） |
+| 查找、编辑、导入、导出原始 Prompt | 工作室 → 缓存 |
+| 读取 PNG Collector / Ranbooru 的已有内容 | 缓存 → 导入与插件批次 |
+| 使用已经处理过的 Prompt | 工作室 → 处理结果库 |
+| 从两个缓存库取词，或调用 LLM | txt2img 正面 Prompt 下方 → Prompt 批量生成 |
+| 单图、文件夹和子文件夹反推 | 更多 → WD14 / CL 反推 |
+| 搜索词条并追加到固定 Prompt | 更多 → 静态词库 |
 
-界面按“生成 → 批处理 → 缓存”组织。生成页只保留一个主按钮；快速模板通过下拉框选择后统一套用，连接、后处理和其他低频选项放在设置或高级参数中。
+## 生成与生图
 
-“生成提示词”执行一次完整链路：读取已保存连接和工作参数，构建 System Prompt 与用户消息，调用 Provider，解析 assistant 文本，执行安全校验和标签后处理，按设置写入缓存。
+### 在工作室生成
 
-结果只应是一条完整的单图 Prompt。插件会拒绝空响应、解释性文本、负面 Prompt、分镜/拼图/候选方案和与所选输出预设不符的格式。
+填写「创作要求」，需要保留的主体、角色 Tag、LoRA 或权重放入「固定 Prompt」。选择数量与生成去向后，点击主按钮：
 
-## 批处理
+- **仅保存到缓存**：生成的 Prompt 写入原始缓存库，不启动生图。
+- **生成并加入生图队列**：先保存 Prompt，再按当前 txt2img 参数提交生图，页面显示进度和图片。
 
-### 服务端批量生成
+数量为 `1` 时生成一条，正数支持到 `200`，`0` 表示持续生成直到停止。展开「批量选项」可逐行填写独立要求、选择随机题材、启用词库抽样或设置失败后是否继续。填入逐行要求时，正数模式按输入列表执行（最多 200 条）；`0` 模式循环使用这份列表。创作要求留空时可按题材与词库生成。
 
-批处理页每行对应一个独立请求。服务端队列只负责生成并保存 Prompt，不会自动改写 Forge 输入框。任务写入 `user/prompt_studio.db` 后由 Forge 进程内 worker 执行，页面关闭、刷新或隐藏不会停止队列。
+「本次结果」保存本轮记录与待重试项。无限模式界面保留最近 200 条记录，成功生成的完整结果仍保存在缓存中。
 
-- 相同文本默认仍是两次独立请求。
-- 可主动开启“跳过批次开始前已有缓存”。
-- 单条失败会记录错误并继续后续任务。
-- 取消只作用于对应批次，并阻止该批次的下一次重试和下一条请求；当前底层 HTTP 返回或超时后生效，已完成结果保留。
-- txt2img 队列需要 Forge 以 `--api` 启动，并使用 Forge 自身的保存设置。
+### 在 txt2img 使用
 
-### txt2img 内嵌生成
+展开正面 Prompt 下方的「Prompt 批量生成」，选择来源：
 
-内嵌面板位于正向 Prompt 区域下方，包含：
+| Prompt 来源 | 可用操作 |
+| --- | --- |
+| LLM 自动生成 | 写入 Prompt、仅保存到缓存、加入生图队列 |
+| 原始缓存库 | 写入 Prompt、加入生图队列 |
+| 处理结果库 | 写入 Prompt、加入生图队列 |
 
-- 本轮创作要求、System Prompt 预设、目标底模和内容模式。
-- `LLM 自动生成` 或 `缓存顺序读取` 两种来源。
-- `开始无限生成`启动持续的 LLM → Forge 自动生图循环，`停止`结束后续轮次；`生成并入队`仍可单次手动建立队列。浏览器队列和服务端队列位于批处理页的高级队列区域。
-- `批量变化维度（可选）`：明确哪些内容允许逐轮变化，例如“保持人物身份和画风不变，只变化动作、道具、场景、镜头和光线”。内嵌流程会把当前正向 Prompt 作为源 Prompt 发送给 LLM，变化要求作为本轮软约束。
-- JSON Prompt 批量润色/扩写及结果写回控件。
+选择写入时，可设置与当前 Prompt 的合并方式。选择仅缓存或入队时，固定 Prompt 框保持不变；数量设为 `0` 可持续执行。「开始连续生图」则启动原生 txt2img 连续流程，每轮临时提交生成的 Prompt 后恢复固定内容。
 
-持续生成会读取当前固定正面 Prompt 作为源内容，并提前准备下一条结果。每轮只在提交请求的瞬间临时写入生成 Prompt，随后立即恢复页面中的固定正面 Prompt；点击 `停止` 或 Forge 中断会结束后续轮次。系统保留最近一批结果，提取重复出现的动作、物品和场景概念形成多样性参考，过于接近时最多重新生成三次。
+两个缓存库均按记录顺序读取，读到末尾后循环；支持超过 1000 条的缓存，每次仅取下一条，不将整库载入浏览器。数据库没有插件设置的记录总数上限，实际容量取决于磁盘空间。
 
-批处理页的“持续生成并生图”支持填写轮数；轮数留空或填 `0` 表示一直运行，填入 `1-100` 则达到对应轮数后自动停止。
+生图队列读取提交时的 txt2img 参数，包括负面 Prompt、采样器、步数、宽高、CFG、Seed、批量和 Hires 设置。图片保存在 Forge 的正常输出目录。
 
-无限生成遇到非英文输出、内容校验拦截或空响应时，会丢弃失败候选并自动生成下一条；预生成下一条时也采用相同处理，不中断当前生图。连续失败的重试间隔从 0.5 秒逐步增加到最多 5 秒，点击“停止”可结束。批处理持续模式每项最多尝试 3 次，失败后继续下一项；整轮没有可用结果时仍会继续后续轮次。
+### 无限模式、停止与后台运行
 
-### 自定义快速模板
+- `0 = 无限` 适用于标明该含义的生成数量控件；页码、区域数量等仍按各自范围使用。
+- 数量为 `0` 且去向为生图时，每轮提交一条并等待生图结束，再准备下一条。生图任务失败或取消后停止。
+- 点击「停止」结束后续生成，已完成的缓存保留。一级无限任务连续 3 次 LLM 失败后停止；关闭「失败后继续」则在首次失败时停止。
+- 「取消等待中的生图」取消尚未执行的队列项；正在执行的绘图使用 Forge 的「中断」停止。
 
-在一级“生成”面板展开“自定义快速模板”，填写名称和创作要求后点击“保存模板”。模板会保存到本地 SQLite，可从快速模板下拉框选择并点击“套用模板”；选择自定义模板时编辑区会自动回填内容。使用“删除模板”可移除当前自定义模板。自定义快速模板保存的是创作要求文本，不会修改 System Prompt 预设。
+**最小化浏览器或切到桌面继续生图**：开启 Forge 设置中的 `Keep generating even when the WebUI browser tab is not in focus`（`keep_alive`），应用设置并刷新页面。浏览器页面、Forge 进程和电脑须保持运行。
 
-队列操作区显示总数、已选数和待生图数。请先勾选需要处理的行，再选择“写入所选到正面 Prompt”或“使用所选并生图”；两项操作都会在完成后取消勾选并标记状态。Prompt 只会写入 Forge 的 `txt2img_prompt`，系统提示词只用于请求构造，不会进入队列结果或正面 Prompt。
+已经提交的服务端生图任务由 Forge 执行，关闭页面后仍可完成。依赖页面的连续生成不会在关闭页面后继续创建下一轮；不要把「无限」视为关闭浏览器后的常驻任务。启动 Forge、打开或刷新页面均不会自动开始生图，也不会自动续跑上次未完成任务。
 
-点击“停止”会设置当前面板的取消事件；当前 LLM 请求返回或超时后，迟到响应不会写入 Prompt，已写入的结果保持不变。
+## 缓存与处理结果
 
-## 灵感探索与 JSON 批量转换
+插件保留两个独立的缓存库：
 
-JSON 转换页使用一个“写入结果”按钮。先选择“当前结果”或“已选结果”，再选择追加或覆盖；两种范围不会再显示为两个相似按钮。
+- **原始缓存库**：保存生成、导入和反推得到的 Prompt，可在「缓存」页编辑和管理。
+- **处理结果库**：保存缓存经过转换、扩写、润色后的结果，可独立追加到 txt2img 或入队生图。
 
-在“灵感探索（批量 Prompt）”中可以直接留空创作要求。设置生成数量后，系统会为每条任务抽取不同题材，并从 action、expression、setting、prop、camera、light/material 等静态词库分类取样，再交给当前目标模型模板生成完整 Prompt。也可以填写“已有 Prompt / 角色 Tag”；勾选锁定后，角色身份、LoRA、权重和明确属性会作为固定锚点，模型只补全动作、表情、道具、背景、构图、天气和光线。题材、抽样词和历史输出会参与批次排重，降低同质化。
+处理原始缓存：
 
-“已有创作要求”仍支持逐行输入；此时每行是一条独立任务，生成数量仅用于空输入场景。关闭静态词库抽样后仍会保留题材与变化重点，只是不读取本地词库。
+1. 在 **生成 → 缓存 Prompt 处理**筛选并选择记录，或将范围设为「全部筛选结果」。该范围包括全部分页。
+2. 选择转换、扩写或润色并开始处理。界面显示已处理、未处理和失败数量；中断后可点击「继续处理未完成」。
+3. 成功结果自动进入处理结果库，可直接入队，或以追加／替换方式写入 txt2img。只有显式使用「覆盖原始缓存」才会改写原始记录。
 
-面板支持导入 PNG Prompt Collector 的 `prompt_batch.v1`，也支持常见 JSON 形状：字符串数组、`prompts`/`items`/`records`/`results`/`data` 数组、对象中的 `prompt`/`positive`/`text`/`content` 字段，以及 ID 到字符串或对象的映射。
+本次处理尚未结束时也可提交已完成结果，重复点击会跳过本次已提交项。历史结果在「处理结果库」选择「所选结果」或「全部筛选结果」后入队；空选不会隐式提交全库。两处共用底部「缓存结果生图队列」查看进度和图片。
 
-操作流程：
+原始缓存支持关键词、格式、目标模型筛选，每页 50 条；支持编辑、批量修改、删除和撤销删除。导入支持 JSON / CSV，导出始终包含全部原始缓存，不受当前筛选和分页影响。
 
-1. 导入 JSON，或从 Ranbooru 交接箱载入批次。
-2. 选择 `润色` 或 `扩写`，再选择转换预设和目标底模。
-3. 选择批量多样性模式、写入目标和追加/覆盖方式。
-4. 开始处理；结果按“一张图片一条记录”保存。
-5. 在结果表中选择需要写回的条目，再使用“写入所选到正面 Prompt”；未选择时只导出 JSON。
+### PNG Collector 与 Ranbooru
 
-### 两种批量多样性模式
+在 **缓存 → 导入与插件批次**主动读取 PNG Prompt Collector 当前已载入的缓存，或读取 Ranbooru 的 `tag_cache.db`。Ranbooru 支持自动检测路径、设置读取范围、预览和同步到本插件缓存。
 
-- `多样灵感`：用于没有灵感或希望探索不同题材的场景，按题材和静态词库分类生成互不相同的单图 Prompt。
-- `保留原意转换`：只转换表达方式和目标模型格式，尽量保留原始 Prompt 的画面事实。适合把旧标签转换成 Krea 2、Anima 或自然语言，不重新设计构图。
+该面板也接受 `prompt_batch.v1` 和兼容的 Prompt JSON 文件。载入后可转换、扩写、润色，再将当前或已选结果追加／覆盖到 txt2img，或导出批次 JSON。PNG 读取需要兼容的 Collector 版本提供当前缓存；Ranbooru 实时交接另在缓存页的交接箱处理。
 
-Krea2/Anima 细节增强角色会输出固定的英文结构：`PART ONE: TAG ANCHORS`、`BREAK`、`PART TWO: EXTREME LAYERED DETAIL`、`SUBJECT` 和 `MASTER DESCRIPTION`。每层描述构图、头发、面部、服装、道具、光影和背景；静态词库只作为兼容词汇参考，不会整库倾倒或执行词库中的指令。
+## 本地 WD14 / CL 反推
 
-## 静态词库
+打开 **更多 → WD14 / CL 反推**，检测并选择已有模型。插件会扫描 Forge 模型目录、已安装 WD14 插件的目录、Hugging Face 缓存和指定的额外目录；无需安装另一个 WD14 插件。
 
-默认词库目录为 `assets/wildcards/`。插件在启动、打开页面或修改词库目录时自动增量索引。词库条目会以惰性参考的形式注入 System Prompt，用于提供兼容的发型、服装、道具、环境、镜头和材质词；模型必须按画面需要选择，不能机械复制无关条目。词库中的文本被视为数据，不会覆盖系统规则。
+支持的本地文件组合：
 
-## Ranbooru 与 PNG 的独立入口
+| 类型 | 同一目录内需要的文件 |
+| --- | --- |
+| WD14 ONNX 模型 | `.onnx` 模型和 `selected_tags.csv` |
+| CL Tagger 1.01 | `.onnx` 模型和 `tag_mapping.json` |
 
-### Ranbooru
+没有模型时，在下载区域自行选择模型，点击下载；也可以使用面板提供的文件链接手动下载，再重新检测。检测不会自动下载，模型列表不设置推荐项。
 
-插件会自动探测 Ranbooru 的 `tag_cache.db`，也可以在设置中指定路径。可按 Tag、评分和内容模式筛选，预览并同步缓存。Ranbooru 交接箱支持载入，再使用当前 LLM 的格式转换、扩写或润色模板处理；源评分只用于筛选源记录，不会成为本插件的 LLM 评分。
+- **单张图片**：反推后可编辑标签、交给 LLM 处理，再送入 txt2img 或保存到原始缓存。
+- **文件夹批量**：填写目录，按需勾选「包含子文件夹」，支持 PNG、JPG、WEBP、BMP、TIFF、GIF。提供进度、停止、继续未完成和重试失败。
+- **全部送入 txt2img 批量列表**：使用 Forge 的 `Prompts from File or Textbox` 脚本装载结果；仍需手动点击 Forge「生成」。也可将全部结果保存到缓存。
 
-### PNG Prompt Collector
+反推在本地运行；选择 LLM 处理时才调用已配置的模型服务。文件夹任务的续跑状态保留在当前服务进程中，重启后需要重新扫描。
 
-在内嵌 JSON 面板点击“接收 PNG Prompt Collector 当前批次”即可导入共享的 `prompt_batch.v1` 数据。处理后的 `processed`、输出类型、预设和目标底模会保留在每条图片记录中。PNG Collector 和 Ranbooru 都只把数据交给 LLM Prompt Studio，彼此不直接交换数据。
+## 模板与词库
 
-## 缓存、队列与 API
+一级生成和 txt2img 共用自定义快速模板。可编辑、保存、设为默认或删除；同名保存更新原模板，新名称另存。快速模板用于创作要求和变化规则。
 
-缓存页支持关键词、最低手动评分、输出格式和目标底模筛选，提供查看、编辑、删除、撤销删除以及 JSON/CSV 导入导出。服务端队列日志包含请求、生成 Prompt、状态、错误和尝试次数，可用批次 ID 恢复查看。
+System Prompt 使用独立的「当前生效内容」编辑框。切换预设会替换正文；内置正文跟随模型适配，自定义正文在切换模型时保留。通过「工作参数 → 保存当前参数」保存修改，「恢复所选预设」取消覆盖。支持标签、自然语言以及区域 JSON / Markdown 输出。
 
-主要本地 API：
+「更多 → 静态词库」支持 TXT、CSV、JSON、YAML，按目录和文件分类索引。选中词条后可「追加到固定 Prompt」。修改词库后重新索引；索引失败会保留上一次有效数据。
 
-| 方法 | 路径 | 作用 |
-| --- | --- | --- |
-| POST | `/llm-prompt-studio/v1/generate` | 使用已保存连接生成 Prompt |
-| POST | `/llm-prompt-studio/v1/inline-generate` | 内嵌固定 Prompt 更新流程生成单条 Prompt |
-| POST | `/llm-prompt-studio/v1/auto-loop-generate` | 浏览器连续生成流程每轮生成一条 Prompt |
-| GET | `/llm-prompt-studio/v1/cache` | 查询本地缓存 |
-| POST | `/llm-prompt-studio/v1/queue` | 创建持久化服务端队列 |
-| GET | `/llm-prompt-studio/v1/queue/{batch_id}` | 查询队列状态和日志 |
-| POST | `/llm-prompt-studio/v1/queue/{batch_id}/cancel` | 取消待处理队列项 |
-| POST | `/llm-prompt-studio/v1/handoff` | 接收 Ranbooru 交接 |
-| POST | `/llm-prompt-studio/v1/handoff/process` | 处理并缓存交接记录 |
-| GET | `/llm-prompt-studio/v1/handoffs` | 查询交接箱 |
+## 数据与常见问题
 
-默认 API 仅允许本机访问。请求正文不接受 API Key，也不能临时切换到未保存的 Provider 或 Endpoint。
+插件本地数据位于扩展目录下的 `user/`，不随 Git 提交：
 
-## 数据目录
+| 路径 | 内容 |
+| --- | --- |
+| `user/prompt_studio.db` | 原始 Prompt、设置、模板、词库索引、队列和交接记录 |
+| `user/processed_prompt_cache.db` | 缓存处理结果 |
+| `user/credentials/llm_credentials.json` | 按服务商和地址保存的 API Key |
+| `user/exports/` | 导出文件 |
+| `user/backups/` | 删除操作的恢复备份 |
+| `assets/wildcards/` | 随插件提供的静态词库 |
 
-```text
-user/
-├── prompt_studio.db
-├── credentials/
-│   └── llm_credentials.json
-├── exports/
-└── backups/
-```
+内置下载的反推模型存放于 **Forge 模型目录的 `WD14/` 下**，不放在插件缓存数据库中。备份全部本地配置与缓存时，先关闭 Forge 再复制 `user/`；该目录含凭据，不应上传公开仓库。
 
-- `prompt_studio.db`：Prompt、设置、静态词库索引、队列和交接记录。
-- `credentials/llm_credentials.json`：按 Provider 和 Endpoint 保存的凭据。
-- `exports/`：JSON/CSV 导出。
-- `backups/`：删除操作创建的可恢复备份。
+| 问题 | 处理方式 |
+| --- | --- |
+| 更新后缺少页面或提示模块不存在 | 确认扩展完整更新，重启 Forge 后 `Ctrl + F5` 刷新 |
+| LLM 连接失败 | 核对服务商、地址、模型 ID 和凭据；兼容接口通常需要正确的 `/v1` 路径 |
+| HTTPS / TLS 握手失败 | 检查代理或服务端连接；插件不会自动降级为 HTTP |
+| 检测不到反推模型 | 检查 ONNX 与标签文件是否成对，设置额外目录后重新检测 |
+| 提示缺少反推依赖 | 在 Forge 使用的 Python 环境中安装提示的依赖；推理使用 `onnxruntime`、`numpy`、`Pillow`，自动下载使用 `huggingface_hub` |
+| 已有 Prompt，但没有开始生图 | 检查去向是否为仅缓存／写入；需要生图时选择入队或点击 Forge「生成」 |
 
-修改 Python 或 JavaScript 后重启 Forge，并使用 `Ctrl + F5` 刷新页面。缺少 Ranbooru、PNG Prompt Collector 或 WD14 Tagger 时，本插件的基础生成和缓存仍可独立运行，相应联动按钮会显示不可用状态。
-
-## 模板依据
-
-System Prompt 使用任务、模型规则、输入数据和输出契约分区，并将用户原文作为不执行的数据传入。这套结构参考了官方提示词工程建议：
-
-- [OpenAI Prompt Engineering](https://platform.openai.com/docs/guides/prompt-engineering)：明确指令、Markdown/XML 分隔、固定快照并进行评测。
-- [Anthropic Prompt Engineering](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview) 与 [XML 标签](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/use-xml-tags)：用清晰角色、边界和结构化标签隔离输入。
-- [Gemini Prompting Strategies](https://ai.google.dev/gemini-api/docs/prompting-strategies)：具体约束、统一分隔符和严格输出格式。
-
-这些资料提供的是工程原则，不是某个 Provider 的固定成品 Prompt；插件会根据所选操作（转换、扩写、润色）和底模协议（Pony/Illustrious、NoobAI、Flux、Anima、Krea 2 或自动）选择对应模板。
-
-## 相关扩展
-
-- [sd-webui-ranbooru-Forge-neo](https://github.com/Rivulet138/sd-webui-ranbooru-Forge-neo)
-- [sd-webui-png-prompt-collector](https://github.com/Rivulet138/sd-webui-png-prompt-collector)
-- [stable-diffusion-webui-wd14-tagger](https://github.com/toriato/stable-diffusion-webui-wd14-tagger)
+更多资料：[更新记录](CHANGELOG.md) · [项目说明](ABOUT.md) · [界面约定](PRODUCT.md) · [开发与验证](docs/DEVELOPMENT.md)
