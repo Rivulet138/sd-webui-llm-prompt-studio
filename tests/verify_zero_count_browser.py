@@ -30,7 +30,7 @@ def main():
         def enqueue(route):
             queued.append(route.request.post_data_json)
             route.fulfill(json={"batch_id": f"inline-{len(queued)}", "status": "pending"})
-            page.evaluate("count => window.__inlineQueued = count", len(queued))
+
 
         def snapshot(route):
             ident = route.request.url.rsplit("/", 1)[-1]
@@ -99,14 +99,32 @@ def main():
         assert len(generated) == before
         expect(prompt).to_have_value(original)
 
-        destination.get_by_text("加入生图队列", exact=True).click()
-        page.evaluate("window.__inlineQueued = 0")
+        destination.get_by_text("前端连续生图（使用当前 txt2img 参数）", exact=True).click()
+        page.evaluate("""() => {
+            window.__frontendSubmissions = [];
+            const generate = document.createElement('button');
+            generate.id = 'txt2img_generate';
+            generate.textContent = 'Mock Forge Generate';
+            generate.addEventListener('click', () => {
+                const id = 'mock-task-' + (window.__frontendSubmissions.length + 1);
+                window.__frontendSubmissions.push(document.querySelector('#txt2img_prompt textarea').value);
+                localStorage.setItem('txt2img_task_id', id);
+                setTimeout(() => localStorage.removeItem('txt2img_task_id'), 250);
+            });
+            document.body.appendChild(generate);
+        }""")
+        expect(page.locator(prefix + "_once")).to_have_text("开始前端生图")
+        expect(page.locator(prefix + "_start")).to_be_hidden()
         page.locator(prefix + "_once").click()
-        page.wait_for_function("window.__inlineQueued >= 3", timeout=15000)
-        expect(inline_status).to_contain_text("无限")
+        page.wait_for_function("window.__frontendSubmissions.length >= 3", timeout=15000)
+        expect(inline_status).to_contain_text(re.compile(r"无限.*已完成 [1-9]\d* 轮"))
         page.locator(prefix + "_cancel").click()
-        expect(inline_status).to_contain_text("取消")
-        assert len(queued) >= 2 and all(len(batch["requests"]) == 1 for batch in queued)
+        expect(inline_status).to_contain_text("前端连续生图已停止")
+        assert queued == [], "Inline generation must never call the Studio server queue"
+        submissions = page.evaluate("window.__frontendSubmissions")
+        assert len(submissions) >= 3 and all("garden scene" in value for value in submissions)
+        page.wait_for_timeout(600)
+        assert page.evaluate("window.__frontendSubmissions") == submissions, "Stop must prevent the next Forge submission"
         expect(prompt).to_have_value(original)
         for width in (1440, 390):
             page.set_viewport_size({"width": width, "height": 1000})
@@ -115,7 +133,7 @@ def main():
         assert not errors, errors
         (artifacts / "result.json").write_text(json.dumps({
             "main": ["0 caches until stopped", "positive 2 finishes", "0 queue waits for current render", "stop prevents next round"],
-            "inline": ["0 caches until stopped", "0 submits one prompt at a time", "fixed prompt unchanged"],
+            "inline": ["0 caches until stopped", "0 clicks native Forge Generate one round at a time", "no Studio queue request", "stop prevents next Forge submission", "fixed prompt unchanged"],
             "page_errors": errors, "mock_llm": True, "worker_disabled": True, "gpu_invoked": False,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         browser.close()

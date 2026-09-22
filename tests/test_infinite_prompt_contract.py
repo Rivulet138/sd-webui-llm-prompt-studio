@@ -14,13 +14,28 @@ class InfinitePromptContractTests(unittest.TestCase):
         cls.entry_source = (ROOT / "scripts" / "llm_prompt_studio.py").read_text(encoding="utf-8")
 
     def test_inline_panel_exposes_start_stop_buttons_and_merge_positions(self):
-        self.assertIn('inline_start = gr.Button("开始连续生图"', self.ui_source)
+        self.assertIn('inline_start = gr.Button("开始前端连续生图"', self.ui_source)
         self.assertIn('inline_cancel = gr.Button("停止"', self.ui_source)
         self.assertNotIn("inline_infinite", self.ui_source)
         self.assertIn('label="与当前 Prompt 合并方式"', self.ui_source)
         for value in ("append_end", "append_start", "replace", "marker"):
             self.assertIn(f'"{value}"', self.ui_source)
         self.assertIn("正面 Prompt 框保持不变", self.browser_source)
+
+    def test_inline_generation_destination_is_explicitly_frontend_and_passes_count(self):
+        panel_start = self.ui_source.index("def _create_inline_panel")
+        panel_end = self.ui_source.index("def _wd14_model_choices", panel_start)
+        panel_source = self.ui_source[panel_start:panel_end]
+        self.assertIn("前端连续生图（使用当前 txt2img 参数）", panel_source)
+        self.assertIn("开始前端生图", self.ui_source)
+        self.assertIn("inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_destination, inline_count]", panel_source)
+        self.assertIn("source, destination, count", panel_source)
+
+    def test_inline_generation_never_creates_server_queue_jobs(self):
+        start = self.browser_source.index("async function runInlineDestination")
+        end = self.browser_source.index("function writePrompt", start)
+        self.assertNotIn("/v1/queue", self.browser_source[start:end])
+        self.assertIn('if (config.destination === "queue") return startInlineLoop(config)', self.browser_source)
 
     def test_hidden_gradio_generation_bridge_is_removed(self):
         panel_start = self.ui_source.index("def _create_inline_panel")
@@ -68,6 +83,12 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn("Forge 未启动生图任务", self.browser_source)
         self.assertIn('setValue(`${slot}_prompt`, original, { emitChange: false })', self.browser_source)
         self.assertIn('setValue(`${slot}_prompt`, override, { emitChange: false })', self.browser_source)
+
+    def test_background_generation_requires_forge_keep_alive_when_page_is_hidden(self):
+        self.assertIn("window.opts.keep_alive !== true", self.browser_source)
+        self.assertIn("Forge 未启用后台继续生成", self.browser_source)
+        self.assertIn("currentForgeLog", self.browser_source)
+        self.assertIn("out of memory|traceback|exception|cuda", self.browser_source)
 
     def test_forge_submission_is_owned_by_the_extension(self):
         self.assertNotIn("forgeConsumePromptOverride", self.browser_source)
@@ -122,7 +143,7 @@ class InfinitePromptContractTests(unittest.TestCase):
     def test_legacy_browser_batch_controls_are_removed_but_runtime_is_preserved(self):
         self.assertNotIn('label="循环轮数（留空或 0 = 一直运行）"', self.ui_source)
         self.assertNotIn("window.llmPromptStudioAutoLoop.start(", self.ui_source)
-        self.assertIn('inline_start = gr.Button("开始连续生图"', self.ui_source)
+        self.assertIn('inline_start = gr.Button("开始前端连续生图"', self.ui_source)
         self.assertIn('generation_destination = gr.Radio(', self.ui_source)
         self.assertIn("_studio_generate,", self.ui_source)
         self.assertIn("cycleLimit === null || completedCycles < cycleLimit", self.browser_source)

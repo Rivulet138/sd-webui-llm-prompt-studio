@@ -44,7 +44,16 @@ def main():
         except PlaywrightTimeoutError:
             pass  # Gradio's heartbeat connection stays open.
         page.wait_for_function("typeof window.llmPromptStudioAutoLoop?.inlineOnce === 'function'")
-        page.evaluate("window.__generations = 0; document.querySelector('#txt2img_generate').addEventListener('click', () => window.__generations++)")
+        page.locator("#txt2img_generate").wait_for(state="visible")
+        page.evaluate("""() => {
+            window.__generations = 0;
+            window.__submittedPrompts = [];
+            document.querySelector('#txt2img_generate').addEventListener('click', () => {
+                window.__generations++;
+                window.__submittedPrompts.push(document.querySelector('#txt2img_prompt textarea').value);
+            });
+            window.requestProgress = (id, container, gallery, done) => setTimeout(done, 250);
+        }""")
         page.locator(prefix + "_batch > .label-wrap").click()
         panel = page.locator(prefix)
         source = page.locator(prefix + "_source")
@@ -117,27 +126,34 @@ def main():
 
         queued = []
         def queue_request(route):
-            payload = route.request.post_data_json
-            queued.append(payload)
-            route.fulfill(json={"batch_id": "browser-queue", "status": "等待中"})
+            queued.append(route.request.post_data_json)
+            route.fulfill(status=500, json={"detail": "Unexpected Studio server queue call"})
         page.route("**/llm-prompt-studio/v1/queue", queue_request)
-        page.route("**/llm-prompt-studio/v1/queue/browser-queue", lambda route: route.fulfill(json={
-            "batch_id": "browser-queue", "status": "完成 2 条", "counts": {"completed": 2},
-            "jobs": [{"position": i, "status": "completed", "prompt": "new sunrise"} for i in (1, 2)],
-        }))
-        destination.get_by_text("加入生图队列", exact=True).click()
-        expect(once).to_have_text("生成并入队生图")
+        destination.get_by_text("前端连续生图（使用当前 txt2img 参数）", exact=True).click()
+        expect(once).to_have_text("开始前端生图")
+        expect(page.locator(prefix + "_start")).to_be_hidden()
         page.locator(prefix + "_count input").fill("2")
         once.click()
-        expect(page.locator(prefix + "_loop_status")).to_contain_text("完成 2 条")
+        expect(page.locator(prefix + "_loop_status")).to_contain_text("前端生图完成，共 2 轮", timeout=15000)
         expect(prompt).to_have_value("fixed subject")
-        assert len(queued) == 1 and len(queued[0]["requests"]) == 2, queued
-        assert queued[0]["config"]["direct_prompt"] is True
-        assert queued[0]["target"] == "txt2img"
-        expect(page.locator(prefix + "_queue_log")).to_contain_text("new sunrise")
+        assert page.evaluate("window.__generations") == 2
+        assert page.evaluate("window.__submittedPrompts") == ["new sunrise", "new sunrise"]
+        assert queued == [], queued
         source.get_by_text("原始缓存库", exact=True).click()
-        expect(once).to_have_text("读取并入队生图")
+        expect(once).to_have_text("开始前端生图")
         expect(destination.get_by_text("仅保存到缓存", exact=True)).to_have_count(0)
+        once.click()
+        page.wait_for_function("window.__generations === 4")
+        expect(page.locator(prefix + "_loop_status")).to_contain_text("前端生图完成，共 2 轮", timeout=15000)
+        assert page.evaluate("window.__submittedPrompts.slice(2)") == ["raw garden", "raw beach"]
+        records["processed-cache"] = ["polished forest"]
+        source.get_by_text("处理结果库", exact=True).click()
+        once.click()
+        page.wait_for_function("window.__generations === 6")
+        expect(page.locator(prefix + "_loop_status")).to_contain_text("前端生图完成，共 2 轮", timeout=15000)
+        assert page.evaluate("window.__submittedPrompts.slice(4)") == ["polished forest", "polished forest"]
+        expect(prompt).to_have_value("fixed subject")
+        assert queued == [], queued
         panel.screenshot(path=str(artifacts / "queue-desktop.png"))
 
         for width in (720, 390):
@@ -153,7 +169,7 @@ def main():
         expect(llm_fields).to_be_hidden()
         panel.screenshot(path=str(artifacts / "cache-mobile.png"))
         assert not errors, errors
-        print("PASS: source visibility, cache reads, writes, merge controls, cache-only/queue destinations, fixed prompt, no automatic generation, responsive layout")
+        print("PASS: source visibility, cache reads, writes, merge controls, cache-only/native frontend destinations, fixed prompt, no automatic generation, responsive layout")
         browser.close()
 
 

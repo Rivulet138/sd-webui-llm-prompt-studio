@@ -281,6 +281,10 @@
         const host = find(`llm_prompt_studio_${normalizedSlot}_inline_loop_status`);
         if (!host) return;
         const tone = kind === "success" ? "success" : kind === "error" ? "error" : "warning";
+        const run = linkedRuns[normalizedSlot];
+        if (run && !run.cancelled) {
+            detail = [`${run.limit ? `计划 ${run.limit} 轮` : "无限"} · 已完成 ${run.completed} 轮`, detail].filter(Boolean).join(" · ");
+        }
         host.innerHTML = `<div class="lps-status lps-status--${tone}" role="status" aria-live="polite"><strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</div>`;
     }
 
@@ -342,6 +346,19 @@
         } catch {
             return "";
         }
+    }
+
+    function currentForgeLog(tab) {
+        return String(find(`html_log_${tab}`)?.textContent || "").trim();
+    }
+
+    function currentForgeOutput(tab) {
+        const ids = [`${tab}_gallery`, `generation_info_${tab}`, `html_info_${tab}`];
+        const hosts = ids.map((id) => find(id)).filter(Boolean);
+        return hosts.length ? hosts.map((host) => {
+            const field = host.querySelector?.("textarea, input");
+            return [host.innerHTML, field?.value, host.textContent, host.value].map((value) => String(value || "")).join("|");
+        }).join("\n") : "";
     }
 
     function ownsActiveForgeTask(run) {
@@ -454,9 +471,10 @@
         return true;
     }
 
-    async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000) {
+    async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000, beforeLog = "", beforeOutput = "") {
         const statusHost = find(`${tab}_status`);
         let sawBusy = Boolean(taskId);
+        let noOutputSince = 0;
         const budget = createTimeoutBudget(timeoutMs);
         const launchBudget = createTimeoutBudget(10000);
         while (true) {
@@ -467,6 +485,8 @@
             const busy = taskId ? taskTracked : isForgeBusy(tab);
             sawBusy ||= busy;
             const currentStatus = String(statusHost?.textContent || "");
+            const currentLog = currentForgeLog(tab);
+            const currentOutput = currentForgeOutput(tab);
             const statusCompleted = currentStatus !== beforeStatus && SUCCESS_PATTERN.test(currentStatus);
             if (taskReplaced) {
                 throw new Error(`${tab} generation task ownership changed; prompt returned to pending`);
@@ -475,7 +495,21 @@
                 throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
             }
             if (!busy && (sawBusy || statusCompleted)) {
-                if (FAILURE_PATTERN.test(currentStatus)) throw new Error(currentStatus);
+                const failure = [currentStatus, currentLog !== beforeLog ? currentLog : ""]
+                    .filter(Boolean).join(" ");
+                if (FAILURE_PATTERN.test(failure) || /out of memory|traceback|exception|cuda/i.test(failure)) {
+                    throw new Error(failure);
+                }
+                if (taskId && beforeOutput && currentOutput === beforeOutput && !statusCompleted && currentLog === beforeLog) {
+                    const now = typeof window.performance?.now === "function" ? window.performance.now() : Date.now();
+                    if (!noOutputSince) noOutputSince = now;
+                    if (now - noOutputSince < 1500) {
+                        await waitForUiSignal(250);
+                        continue;
+                    }
+                    throw new Error("Forge 任务结束但没有收到输出，可能是进度连接中断");
+                }
+                noOutputSince = 0;
                 return;
             }
             if (budget.expired()) break;
@@ -676,10 +710,15 @@
 
     async function runForgeGeneration(tab, run, generate, afterClick = null) {
         const beforeStatus = String(find(`${tab}_status`)?.textContent || "");
+        const beforeLog = currentForgeLog(tab);
+        const beforeOutput = currentForgeOutput(tab);
         const previousTaskId = currentForgeTaskId(tab);
         let taskId = "";
         try {
             run.forgeLaunching = typeof afterClick === "function";
+            if (document.hidden && window.opts && window.opts.keep_alive !== true) {
+                throw new Error("Forge 未启用后台继续生成，请开启 keep_alive 后刷新页面");
+            }
             generate.click();
             taskId = currentForgeTaskId(tab);
             if (typeof afterClick === "function") {
@@ -697,7 +736,7 @@
             if (run.cancelled && ownsActiveForgeTask(run)) findButton(`${tab}_interrupt`)?.click();
             if (typeof afterClick === "function") afterClick();
             assertActive(run);
-            await waitForForgeGeneration(tab, run, beforeStatus, taskId);
+            await waitForForgeGeneration(tab, run, beforeStatus, taskId, 1800000, beforeLog, beforeOutput);
         } finally {
             run.forgeLaunching = false;
             if (typeof afterClick === "function") afterClick();
@@ -822,15 +861,19 @@
 
     function startLinkedRun(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
+        const normalizedConfig = inlineConfig(slot, config);
         if (linkedRuns[slot]) {
-            linkedRuns[slot].config = inlineConfig(slot, config);
+            linkedRuns[slot].config = normalizedConfig;
             return linkedRuns[slot];
         }
         const run = {
-            scope: "linked", slot, target: slot, cancelled: false, count: 0,
-            config: inlineConfig(slot, config), basePrompt: promptValue(slot),
+            scope: "linked", slot, target: slot, cancelled: false, count: 0, completed: 0,
+            config: normalizedConfig, basePrompt: promptValue(slot),
             lastWrittenPrompt: promptValue(slot), lastUsedPrompt: "", preparedPrompt: "", preparedSource: "",
             nextPromise: null, abortController: null, requestId: "", generationLoopPromise: null,
+            // For the inline queue destination, generate through the native
+            // Forge button. Zero means unlimited until the user presses Stop.
+            limit: normalizedConfig.destination === "queue" ? Number(normalizedConfig.count || 0) : 0,
         };
         linkedRuns[slot] = run;
         return run;
@@ -856,18 +899,19 @@
         run.abortController?.abort();
         if (!run.forgeLaunching) finishLinkedRun(run);
         if (interruptForge && ownsActiveForgeTask(run)) findButton(`${normalizedSlot}_interrupt`)?.click();
-        renderInline(normalizedSlot, "warning", "连续生图已停止", `已提交 ${run.count} 轮`);
+        renderInline(normalizedSlot, "warning", "前端连续生图已停止", `已完成 ${run.completed} 轮 · 已提交 ${run.count} 轮`);
     }
 
     function failLinkedRun(run, error) {
         if (linkedRuns[run.slot] !== run) return;
         stopLinkedRun(run.slot);
-        renderInline(run.slot, "error", "连续生图已停止", String(error?.message || error));
+        renderInline(run.slot, "error", "前端连续生图已停止", `已完成 ${run.completed} 轮 · ${String(error?.message || error)}`);
     }
 
     function startInlineLoop(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         if (linkedRuns[slot] || inlineRuns[slot]) return "当前内嵌面板已有任务正在运行";
+        if (config.destination === "cache") return "仅保存到缓存请使用生成到缓存按钮";
         try {
             ensureForgeIdle(slot);
             if (!findButton(`${slot}_generate`) || !input(`${slot}_prompt`)) {
@@ -878,16 +922,18 @@
         }
         const run = startLinkedRun(config);
         setInlineLoopButtons(slot, true);
+        const log = find(inlineId(slot, "queue_log"));
+        if (log) log.innerHTML = "";
         // Let Gradio finish the button event before starting the long-running loop.
         window.setTimeout(() => {
             if (linkedRuns[slot] === run) startLinkedGenerationLoop(run);
         }, 0);
-        return "连续生图已开始";
+        return `前端连续生图已开始（${run.limit ? `${run.limit} 轮` : "无限"}），使用当前 ${slot} 参数`;
     }
 
     function scheduleNextLinkedPrompt(run) {
         window.setTimeout(() => {
-            if (run.cancelled || linkedRuns[run.slot] !== run) return;
+            if (run.cancelled || linkedRuns[run.slot] !== run || (run.limit > 0 && run.count >= run.limit)) return;
             ensureLinkedPrompt(run).catch((error) => failLinkedRun(run, error));
         }, 0);
     }
@@ -906,7 +952,7 @@
         run.preparedSource = "";
         run.lastUsedPrompt = prompt;
         run.count += 1;
-        renderInline(slot, "success", `第 ${run.count} 条 ${inlineSourceName(run.config)} Prompt 已提交给 Forge`, "正面 Prompt 框未修改；正在准备下一条");
+        renderInline(slot, "warning", `前端生图：正在提交第 ${run.count} 轮`, "使用当前 Forge 参数");
         return prompt;
     }
 
@@ -944,9 +990,19 @@
             while (linkedRuns[run.slot] === run) {
                 assertActive(run);
                 await submitLinkedForgeGeneration(run);
+                assertActive(run);
+                run.completed += 1;
+                if (run.limit > 0 && run.count >= run.limit) {
+                    finishLinkedRun(run);
+                    renderInline(run.slot, "success", `前端生图完成，共 ${run.completed} 轮`, "结果显示在 Forge 图库");
+                    break;
+                }
+                renderInline(run.slot, "success", "本轮前端生图已完成", "正在准备下一轮");
             }
         })().catch((error) => {
-            if (String(error?.message || error) !== "已取消") failLinkedRun(run, error);
+            if (String(error?.message || error) !== "已取消") {
+                failLinkedRun(run, error);
+            }
         }).finally(() => {
             run.generationLoopPromise = null;
             if (run.cancelled) finishLinkedRun(run);
@@ -966,35 +1022,12 @@
         }
     }
 
-    async function cancelInlineQueue(run) {
-        if (!run.queueBatchId || run.queueCancelSent) return;
-        run.queueCancelSent = true;
-        try {
-            const response = await studioFetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(run.queueBatchId)}/cancel`, { method: "POST" });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        } catch (error) {
-            run.queueCancelSent = false;
-            renderInline(run.slot, "error", "生图队列取消失败", String(error?.message || error));
-        }
-    }
-
-    function renderInlineQueue(run, snapshot) {
-        const status = snapshot.status || "生图队列已提交";
-        renderInline(run.slot, "success", run.unlimited ? `无限 · 已完成 ${run.completed} 条 · ${status}` : status, "正面 Prompt 框保持不变");
-        const host = find(inlineId(run.slot, "queue_log")) || find(inlineId(run.slot, "loop_status"));
-        if (host) {
-            const rows = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
-            const content = serverQueueRowsHtml(rows);
-            if (host.id === inlineId(run.slot, "loop_status")) host.innerHTML += content;
-            else host.innerHTML = content;
-        }
-    }
-
     async function runInlineDestination(config, run, original) {
-        if (!["cache", "queue"].includes(config.destination)) throw new Error("未知的 Prompt 去向");
-        if (config.destination === "queue" && run.slot !== "txt2img") throw new Error("生图队列仅支持 txt2img");
-        if (config.destination === "cache" && config.source !== "llm") throw new Error("仅存缓存请使用 LLM 自动生成来源");
-        const settings = config.destination === "queue" ? readTxt2imgSettings() : null;
+        // The inline cache action only stores prompts.  Browser generation is
+        // handled by startLinkedGenerationLoop, which clicks Forge's native
+        // button and therefore receives the complete current txt2img state.
+        if (config.destination !== "cache") throw new Error("未知的 Prompt 去向");
+        if (config.source !== "llm") throw new Error("仅存缓存请使用 LLM 自动生成来源");
         const prompts = [];
         config.fixedPrompt = original;
         for (let index = 0; index < config.count; index += 1) {
@@ -1003,67 +1036,19 @@
                 `已完成 ${run.unlimited ? run.completed : prompts.length} 条`);
             const prompt = await getInlinePromptWithRetry(config, run);
             assertActive(run);
-            prompts.push(config.destination === "queue" ? composeInlinePrompt(original, prompt, config) : prompt);
+            prompts.push(prompt);
         }
-        if (config.destination === "cache") {
-            const message = `已完成 ${prompts.length} 条 Prompt，已保存到缓存；未启动生图`;
-            renderInline(run.slot, "success", message);
-            return message;
-        }
-        // Do not abort queue creation: its response provides the exact batch ID needed for safe cancellation.
-        const response = await studioFetch("/llm-prompt-studio/v1/queue", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ requests: prompts, target: "txt2img", config: {
-                direct_prompt: true, cache_result: false, generation_settings: settings,
-            } }),
-        });
-        const snapshot = await response.json();
-        if (!response.ok) throw new Error(String(snapshot.detail || `入队失败：HTTP ${response.status}`));
-        run.queueBatchId = String(snapshot.batch_id || "");
-        run.queueCancelSent = false;
-        if (!run.queueBatchId) throw new Error("生图队列未返回任务 ID");
-        if (run.cancelled) await cancelInlineQueue(run);
-        assertActive(run);
-        let current = snapshot;
-        while (true) {
-            assertActive(run);
-            renderInlineQueue(run, current);
-            const counts = current.counts || {};
-            const total = Number(current.jobs?.length || 0);
-            if (run.unlimited) {
-                if (Number(counts.error || 0) > 0 || current.jobs?.some((job) => job.status === "error")) {
-                    throw new Error(`生图队列 ${run.queueBatchId} 失败，已停止无限生成`);
-                }
-                if (Number(counts.cancelled || 0) > 0 || current.jobs?.some((job) => job.status === "cancelled")) {
-                    throw new Error(`生图队列 ${run.queueBatchId} 已取消，已停止无限生成`);
-                }
-                if (Array.isArray(current.jobs) && current.jobs.length === 0) {
-                    throw new Error(`生图队列 ${run.queueBatchId} 的任务已不存在，已停止无限生成`);
-                }
-            }
-            if (total && Number(counts.completed || 0) + Number(counts.error || 0) + Number(counts.cancelled || 0) >= total) {
-                if (run.unlimited) run.queueBatchId = "";
-                return String(current.status || "生图队列已结束");
-            }
-            await wait(1000);
-            assertActive(run);
-            try {
-                const response = await studioFetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(run.queueBatchId)}`, { cache: "no-store" });
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const next = await response.json();
-                assertActive(run);
-                current = next;
-            } catch (error) {
-                assertActive(run);
-                renderInline(run.slot, "warning", run.unlimited ? `无限 · 已完成 ${run.completed} 条 · 正在重新获取队列进度`
-                    : "生图队列仍在后台运行，正在重新获取进度", String(error?.message || error));
-            }
-        }
+        const message = `已完成 ${prompts.length} 条 Prompt，已保存到缓存；未启动生图`;
+        renderInline(run.slot, "success", message);
+        return message;
     }
 
     async function inlineOnce(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         config = inlineConfig(slot, config);
+        // Forge snapshots all current native controls; do not serialize a
+        // partial settings list or create a Studio server queue job here.
+        if (config.destination === "queue") return startInlineLoop(config);
         const run = beginInlineRun(slot, slot);
         if (!run) return "当前内嵌面板已有任务正在运行";
         try {
@@ -1110,7 +1095,6 @@
             cancelInlineRequest(run);
             run.cancelled = true;
             run.abortController?.abort();
-            void cancelInlineQueue(run);
             if (run.target) {
                 const interrupt = find(`${run.target}_interrupt`);
                 if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
@@ -1118,6 +1102,7 @@
         }
         if (linked) {
             stopLinkedRun(normalizedSlot, true);
+            return `前端连续生图已停止 · 已完成 ${linked.completed} 轮 · 已提交 ${linked.count} 轮`;
         }
         renderInline(normalizedSlot, "warning", "Prompt 任务已停止", run?.unlimited ? `无限 · 已完成 ${run.completed} 条` : "");
         return "Prompt 任务已停止";

@@ -4226,12 +4226,15 @@ def _inline_destination_controls(source, destination):
     choices = [("写入 Prompt", "prompt")]
     if source == "llm":
         choices.append(("仅保存到缓存", "cache"))
-    choices.append(("加入生图队列", "queue"))
+    # Keep the wire value ``queue`` for compatibility with the browser loop,
+    # but make the user-facing behavior explicit: this path clicks Forge's
+    # native txt2img button and uses the current front-end controls.
+    choices.append(("前端连续生图（使用当前 txt2img 参数）", "queue"))
     if destination not in {value for _, value in choices}:
         destination = "prompt"
     llm_fields, button, hint = _inline_source_controls(source)
     if destination != "prompt":
-        button = gr.update(value="生成到缓存" if destination == "cache" else ("生成并入队生图" if source == "llm" else "读取并入队生图"))
+        button = gr.update(value="生成到缓存" if destination == "cache" else "开始前端生图")
     return (llm_fields, button, hint, gr.update(choices=choices, value=destination),
             gr.update(visible=destination != "prompt"), gr.update(visible=destination == "prompt"),
             gr.update(visible=destination != "cache"))
@@ -4278,7 +4281,7 @@ def _create_inline_panel(slot, prompt_target):
                 )
             with gr.Row(elem_classes=["lps-generation-destination"]):
                 inline_destination = gr.Radio(
-                    label="本次操作", choices=[("写入 Prompt", "prompt"), ("仅保存到缓存", "cache"), ("加入生图队列", "queue")],
+                    label="本次操作", choices=[("写入 Prompt", "prompt"), ("仅保存到缓存", "cache"), ("前端连续生图（使用当前 txt2img 参数）", "queue")],
                     value="prompt", elem_id=f"llm_prompt_studio_{slot}_inline_destination", scale=3,
                 )
                 inline_count = gr.Number(label="数量（0 = 无限）", value=1, minimum=0, maximum=200, precision=0, visible=False,
@@ -4302,9 +4305,9 @@ def _create_inline_panel(slot, prompt_target):
                 )
             with gr.Row(elem_classes=["lps-inline-actions"]):
                 inline_once = gr.Button("生成一条并写入 Prompt", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_once")
-                inline_start = gr.Button("开始连续生图", elem_id=f"llm_prompt_studio_{slot}_inline_start")
+                inline_start = gr.Button("开始前端连续生图", elem_id=f"llm_prompt_studio_{slot}_inline_start")
                 inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
-            inline_loop_status = gr.HTML("单次写入不生图；连续生图保留当前 Prompt 框。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+            inline_loop_status = gr.HTML("单次写入不生图；前端连续生图使用当前 txt2img 参数并保留 Prompt 框。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
             gr.HTML("", elem_id=f"llm_prompt_studio_{slot}_inline_queue_log", elem_classes=["lps-auto-loop-log"])
             destination_outputs = [llm_fields, inline_once, source_hint, inline_destination, inline_count, inline_start, inline_merge]
             inline_source.change(_inline_destination_controls, inputs=[inline_source, inline_destination], outputs=destination_outputs, queue=False)
@@ -4320,9 +4323,9 @@ def _create_inline_panel(slot, prompt_target):
             )
             inline_start.click(
                 fn=None,
-                inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source],
+                inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_destination, inline_count],
                 outputs=inline_loop_status,
-                js=f"(writeMode, marker, request, variation, source) => window.llmPromptStudioAutoLoop.startInlineLoop({{slot: '{slot}', writeMode, marker, request, variation, source, preset: {json.dumps(workflow['preset'])}, baseModel: {json.dumps(workflow['base_model'])}, safety: {json.dumps(workflow['safety'])}}})",
+                js=f"(writeMode, marker, request, variation, source, destination, count) => window.llmPromptStudioAutoLoop.startInlineLoop({{slot: '{slot}', writeMode, marker, request, variation, source, destination, count, preset: {json.dumps(workflow['preset'])}, baseModel: {json.dumps(workflow['base_model'])}, safety: {json.dumps(workflow['safety'])}}})",
                 queue=False,
             )
             inline_cancel.click(

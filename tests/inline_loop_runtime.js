@@ -13,7 +13,7 @@ const config = {
     preset: "Danbooru Tags", baseModel: "Auto / checkpoint default", safety: "SFW",
 };
 
-function harness({ submitDelay = 0 } = {}) {
+function harness({ submitDelay = 0, hidden = false } = {}) {
     let now = 0;
     let sequence = 0;
     const timers = new Map();
@@ -22,6 +22,7 @@ function harness({ submitDelay = 0 } = {}) {
     const requests = [];
     const cancellations = [];
     const submissions = [];
+    const submittedSettings = [];
     const interrupts = [];
     class Element {
         constructor(value = "") {
@@ -57,18 +58,27 @@ function harness({ submitDelay = 0 } = {}) {
         nodes.set(id, node);
         return node;
     }
-    function finish(slot = "txt2img") {
+    function finish(slot = "txt2img", log = "", output = true, status = true) {
         storage.delete(`${slot}_task_id`);
         nodes.get(`${slot}_generate`).disabled = false;
         nodes.get(`${slot}_interrupt`).style.display = "none";
-        nodes.get(`${slot}_status`).textContent = `completed ${submissions.length}`;
+        if (status) nodes.get(`${slot}_status`).textContent = `completed ${submissions.length}`;
+        if (log) nodes.get(`html_log_${slot}`).textContent = log;
+        if (output) nodes.get(`${slot}_gallery`).innerHTML = `<img data-round="${submissions.length}">`;
     }
     add("llm_prompt_studio_auto_loop_log");
     add("llm_prompt_studio_server_queue_status");
     add("llm_prompt_studio_server_queue_log");
+    add("html_log_txt2img");
+    add("html_log_img2img");
     for (const slot of ["txt2img", "img2img"]) {
         add(`${slot}_prompt`, new Element("fixed subject"));
+        for (const [name, value] of Object.entries({ steps: 37, cfg_scale: 6.5, width: 896, height: 1152, seed: 12345, negative_prompt: "bad anatomy", sampling: "Euler" })) {
+            add(`${slot}_${name}`, new Element(value));
+        }
         add(`${slot}_status`);
+        add(`${slot}_gallery`, new Element("<div class=placeholder></div>"));
+        nodes.get(`${slot}_gallery`).innerHTML = "<div class=placeholder></div>";
         add(`llm_prompt_studio_${slot}_inline_loop_status`);
         const start = add(`llm_prompt_studio_${slot}_inline_loop_start`);
         const stop = add(`llm_prompt_studio_${slot}_inline_loop_stop`);
@@ -77,6 +87,7 @@ function harness({ submitDelay = 0 } = {}) {
         generate.button = true;
         const submit = () => {
             submissions.push({ slot, prompt: nodes.get(`${slot}_prompt`).child.value });
+            submittedSettings.push(Object.fromEntries(["steps", "cfg_scale", "width", "height", "seed", "negative_prompt", "sampling"].map(name => [name, nodes.get(`${slot}_${name}`).child.value])));
             storage.set(`${slot}_task_id`, `task-${submissions.length}`);
             generate.disabled = true;
             nodes.get(`${slot}_interrupt`).style.display = "block";
@@ -135,7 +146,7 @@ function harness({ submitDelay = 0 } = {}) {
         },
     };
     const context = vm.createContext({
-        window, document: { ...root, hidden: false }, gradioApp: () => root,
+        window, document: { ...root, hidden }, gradioApp: () => root,
         HTMLTextAreaElement: Element, HTMLInputElement: Element, Event,
         console, Date, Set, Map,
     });
@@ -158,7 +169,7 @@ function harness({ submitDelay = 0 } = {}) {
         }
         throw new Error("timer loop did not settle");
     }
-    return { api: window.llmPromptStudioAutoLoop, requests, cancellations, submissions, interrupts,
+    return { api: window.llmPromptStudioAutoLoop, requests, cancellations, submissions, submittedSettings, interrupts,
         nodes, storage, advance, flush, finish,
         prompt: (slot = "txt2img") => nodes.get(`${slot}_prompt`).child.value,
         status: (slot = "txt2img") => nodes.get(`llm_prompt_studio_${slot}_inline_loop_status`).innerHTML,
@@ -864,118 +875,170 @@ for (const count of [-1, "", null, "invalid", Infinity, 0.5]) {
 }
 
 for (const sourceName of ["llm", "cache", "processed_cache"]) {
-    test(`zero count queues ${sourceName} sequentially without unbounded pending jobs`, async () => {
-        const h = harness();
-        const pending = h.api.inlineOnce({ ...config, source: sourceName, destination: "queue", count: "0" });
-        if (sourceName === "llm") h.requests[0].resolve("scene");
-        else h.requests[0].records([{ prompt: "scene" }]);
-        await h.flush();
-        assert.deepEqual(h.requests[1].body.requests, ["fixed subject, scene"]);
-        h.requests[1].json({ batch_id: "first", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
-        await h.flush();
-        assert.equal(h.requests.length, 2);
-        assert.match(h.status(), /无限/);
-        await h.advance(1000);
-        h.requests[2].json({ counts: { completed: 1 }, jobs: [{ status: "completed" }] });
-        await h.flush();
-        assert.equal(h.requests.length, 4);
-        assert.match(h.status(), /已完成 1/);
+    function resolveSource(request, prompt) {
+        if (sourceName === "llm") request.resolve(prompt);
+        else request.records([{ id: 1, prompt: "forest" }, { id: 2, prompt: "beach" }, { id: 3, prompt: "mountain" }]);
+    }
+
+    test(`zero count ${sourceName} completes two native Forge rounds while hidden without Studio queue`, async () => {
+        const h = harness({ hidden: true });
+        assert.match(await h.api.inlineOnce({ ...config, source: sourceName, destination: "queue", count: 0 }), /前端连续生图已开始/);
+        await h.advance(250);
+        resolveSource(h.requests[0], "forest");
+        await h.advance(250);
+        assert.equal(h.submissions.length, 1);
+        assert.match(h.status(), /无限 · 已完成 0 轮/);
+        resolveSource(h.requests[1], "beach");
+        await h.advance(250);
+        assert.equal(h.submissions.length, 1, "prefetch cannot submit while Forge is busy");
+        h.finish();
+        await h.advance(250);
+        assert.equal(h.submissions.length, 2);
+        assert.match(h.status(), /无限 · 已完成 1 轮/);
+        h.finish();
+        await h.advance(250);
+        assert.match(h.status(), /无限 · 已完成 2 轮/);
         h.api.cancelInline("txt2img");
-        if (sourceName === "llm") h.requests[3].resolve("late");
-        else h.requests[3].records([{ prompt: "late" }]);
-        assert.equal(await pending, "已取消");
-        assert.equal(h.requests.length, 4, "completed queue is not cancelled again");
-        assert.equal(h.submissions.length, 0);
+        resolveSource(h.requests[2], "mountain");
+        await h.advance(250);
+        assert.match(h.status(), /已完成 2 轮/);
+        assert.equal(h.submissions.length, 2);
+        assert.equal(h.prompt(), "fixed subject");
+        assert.equal(h.requests.some(request => request.url.includes("/v1/queue")), false);
+    });
+
+    test(`finite ${sourceName} queue uses current native parameters and stops exactly at N`, async () => {
+        const h = harness();
+        assert.match(await h.api.inlineOnce({ ...config, source: sourceName, destination: "queue", count: 2 }), /前端连续生图已开始/);
+        await h.advance(250);
+        resolveSource(h.requests[0], "forest");
+        await h.advance(250);
+        assert.deepEqual(h.submissions[0], { slot: "txt2img", prompt: "fixed subject, forest" });
+        assert.deepEqual(h.submittedSettings[0], { steps: 37, cfg_scale: 6.5, width: 896, height: 1152, seed: 12345, negative_prompt: "bad anatomy", sampling: "Euler" });
+        h.nodes.get("txt2img_steps").child.value = 19;
+        h.nodes.get("txt2img_seed").child.value = 67890;
+        resolveSource(h.requests[1], "beach");
+        await h.advance(250);
+        assert.equal(h.submissions.length, 1);
+        h.finish();
+        await h.advance(250);
+        assert.deepEqual(h.submissions[1], { slot: "txt2img", prompt: "fixed subject, beach" });
+        assert.equal(h.submittedSettings[1].steps, 19);
+        assert.equal(h.submittedSettings[1].seed, 67890);
+        assert.equal(h.requests.length, 2, "last round must not prefetch an unused prompt");
+        assert.doesNotMatch(h.status(), /前端生图完成/);
+        h.finish();
+        await h.advance(250);
+        assert.match(h.status(), /前端生图完成，共 2 轮/);
+        await h.advance(1000);
+        assert.equal(h.submissions.length, 2);
+        assert.equal(h.requests.length, 2);
+        assert.equal(h.prompt(), "fixed subject");
+        assert.equal(h.requests.some(request => request.url.includes("/v1/queue")), false);
     });
 }
 
 for (const sourceName of ["cache", "processed_cache"]) {
-    test(`unlimited ${sourceName} stops when source becomes empty`, async () => {
-        const h = harness();
-        const pending = h.api.inlineOnce({ ...config, source: sourceName, destination: "queue", count: 0 });
-        h.requests[0].records([]);
-        assert.match(await pending, /为空/);
-        assert.equal(h.requests.length, 1);
-    });
-}
-
-test("unlimited queue cancellation targets the current cycle only", async () => {
-    const h = harness();
-    const pending = h.api.inlineOnce({ ...config, destination: "queue", count: 0 });
-    h.requests[0].resolve("first");
-    await h.flush();
-    h.requests[1].json({ batch_id: "done", counts: { completed: 1 }, jobs: [{ status: "completed" }] });
-    await h.flush();
-    h.requests[2].resolve("second");
-    await h.flush();
-    h.api.cancelInline("txt2img");
-    h.requests[3].json({ batch_id: "current", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
-    await h.flush();
-    assert.ok(h.requests[4].url.endsWith("/queue/current/cancel"));
-    h.requests[4].json({});
-    assert.equal(await pending, "已取消");
-    assert.equal(h.requests.length, 5);
-    assert.match(h.status(), /已完成 1/);
-});
-
-for (const outcome of ["error", "cancelled", "missing"]) {
-    test(`unlimited queue stops after ${outcome} without counting it as completed`, async () => {
-        const h = harness();
-        const pending = h.api.inlineOnce({ ...config, destination: "queue", count: 0 });
-        h.requests[0].resolve("scene");
-        await h.flush();
-        h.requests[1].json({ batch_id: "failed-cycle", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
-        await h.advance(1000);
-        h.requests[2].json({
-            counts: outcome === "missing" ? {} : { [outcome]: 1 },
-            jobs: outcome === "missing" ? [] : [{ status: outcome }],
+    for (const count of [0, 2]) {
+        test(`${sourceName} frontend queue count ${count} stops when source is empty`, async () => {
+            const h = harness();
+            await h.api.inlineOnce({ ...config, source: sourceName, destination: "queue", count });
+            await h.advance(250);
+            h.requests[0].records([]);
+            await h.advance(250);
+            assert.match(h.status(), /为空/);
+            assert.doesNotMatch(h.status(), /前端生图完成/);
+            assert.equal(h.submissions.length, 0);
+            assert.equal(h.requests.length, 1);
         });
-        await h.flush();
-        assert.match(h.status(), /操作已停止/);
-        assert.match(h.status(), /已完成 0/);
-        assert.match(await pending, outcome === "error" ? /失败/ : outcome === "cancelled" ? /取消/ : /不存在|消失/);
-        assert.equal(h.requests.length, 3, "failed cycle must not request another prompt");
-    });
+    }
 }
 
-test("queue destination submits composed prompts and renders images beside inline controls", async () => {
+test("frontend cancellation aborts pending prompt and never submits late results", async () => {
     const h = harness();
-    const pending = h.api.inlineOnce({ ...config, destination: "queue", count: 2 });
-    h.requests[0].resolve("forest");
-    await h.flush();
-    h.requests[1].resolve("beach");
-    await h.flush();
-    const enqueue = h.requests[2];
-    assert.ok(enqueue.url.endsWith("/v1/queue"));
-    assert.deepEqual(enqueue.body.requests, ["fixed subject, forest", "fixed subject, beach"]);
-    assert.equal(enqueue.body.config.direct_prompt, true);
-    assert.equal(enqueue.body.config.cache_result, false, "LLM results were cached already");
-    assert.equal(enqueue.body.target, "txt2img");
-    assert.ok(enqueue.body.config.generation_settings);
-    enqueue.json({ batch_id: "own-batch", status: "已完成 2", counts: { completed: 2 }, jobs: [
-        { position: 1, status: "completed", prompt: "fixed subject, forest", images: ["aGVsbG8="] },
-        { position: 2, status: "completed", prompt: "fixed subject, beach" },
-    ] });
-    await pending;
-    assert.equal(h.prompt(), "fixed subject");
+    await h.api.inlineOnce({ ...config, destination: "queue", count: 0 });
+    await h.advance(250);
+    const pending = h.requests[0];
+    h.api.cancelInline("txt2img");
+    assert.equal(pending.signal.aborted, true);
+    pending.resolve("late scenery");
+    await h.advance(250);
     assert.equal(h.submissions.length, 0);
-    assert.match(h.status(), /fixed subject, forest/);
-    assert.match(h.status(), /data:image\/png;base64,aGVsbG8=/);
+    assert.equal(h.interrupts.length, 0);
+    assert.match(h.status(), /已完成 0 轮/);
+    assert.doesNotMatch(h.status(), /前端生图完成/);
 });
 
-test("cancel during queue submission cancels only the returned batch and never changes native prompt", async () => {
+test("frontend stop interrupts owned generation without counting it completed", async () => {
     const h = harness();
-    const pending = h.api.inlineOnce({ ...config, destination: "queue" });
+    await h.api.inlineOnce({ ...config, destination: "queue", count: 2 });
+    await h.advance(250);
     h.requests[0].resolve("forest");
-    await h.flush();
+    await h.advance(250);
     h.api.cancelInline("txt2img");
-    h.requests[1].json({ batch_id: "late-owned-batch", jobs: [] });
-    await h.flush();
-    assert.ok(h.requests[2].url.endsWith("/queue/late-owned-batch/cancel"));
-    h.requests[2].json({});
-    assert.equal(await pending, "已取消");
+    assert.deepEqual(h.interrupts, ["txt2img"]);
+    h.requests[1].resolve("late beach");
+    await h.advance(250);
+    assert.equal(h.submissions.length, 1);
+    assert.match(h.status(), /已完成 0 轮/);
+    assert.match(h.status(), /已提交 1 轮/);
+    assert.doesNotMatch(h.status(), /前端生图完成/);
     assert.equal(h.prompt(), "fixed subject");
+});
+
+test("frontend launch failure never reports a completed round", async () => {
+    const h = harness({ submitDelay: null });
+    await h.api.inlineOnce({ ...config, destination: "queue", count: 1 });
+    await h.advance(250);
+    h.requests[0].resolve("forest");
+    await h.advance(31000);
+    assert.equal(h.submissions.length, 0);
+    assert.equal(h.requests.length, 1);
+    assert.doesNotMatch(h.status(), /前端生图完成|已完成 1 轮/);
+    assert.match(h.status(), /停止|失败|超时|启动/);
+});
+
+test("native Forge error log stops the frontend loop without counting a completed round", async () => {
+    const h = harness();
+    h.api.inlineOnce({ ...config, destination: "queue", count: 1 });
+    await h.advance(250);
+    h.requests[0].resolve("forest");
+    await h.advance(250);
+    assert.equal(h.submissions.length, 1);
+    h.finish("txt2img", "CUDA out of memory");
+    await h.advance(250);
+    assert.doesNotMatch(h.status(), /前端生图完成|已完成 1 轮/);
+    assert.match(h.status(), /停止|CUDA|memory/i);
+});
+
+test("native Forge progress disconnect without output does not count a completed round", async () => {
+    const h = harness();
+    h.api.inlineOnce({ ...config, destination: "queue", count: 1 });
+    await h.advance(250);
+    h.requests[0].resolve("forest");
+    await h.advance(250);
+    assert.equal(h.submissions.length, 1);
+    h.finish("txt2img", "", false, false);
+    await h.advance(2000);
+    assert.doesNotMatch(h.status(), /前端生图完成|已完成 1 轮/);
+    assert.match(h.status(), /停止|输出|中断/i);
+});
+
+test("frontend queue cannot start a second runner or interrupt unrelated Forge work", async () => {
+    const h = harness();
+    await h.api.inlineOnce({ ...config, destination: "queue", count: 0 });
+    await h.advance(250);
+    assert.match(await h.api.inlineOnce({ ...config, destination: "queue", count: 2 }), /已有任务/);
+    assert.match(h.api.startInlineLoop(config), /已有任务/);
+    assert.equal(h.requests.length, 1);
+    h.api.cancelInline("txt2img");
+    h.requests[0].resolve("late");
+    await h.advance(250);
+    h.nodes.get("txt2img_generate").click();
+    assert.doesNotMatch(await h.api.inlineOnce({ ...config, destination: "queue", count: 0 }), /已开始/);
+    h.api.cancelInline("txt2img");
     assert.equal(h.interrupts.length, 0);
+    assert.equal(h.requests.length, 1);
 });
 
 test("cancel cache generation preserves completed cache entries and does not enqueue late results", async () => {
@@ -989,25 +1052,7 @@ test("cancel cache generation preserves completed cache entries and does not enq
     assert.equal(await pending, "已取消");
     assert.equal(h.requests.length, 2);
     assert.equal(h.prompt(), "fixed subject");
-});
-
-
-test("queue cancellation while polling targets only its batch and ignores late progress", async () => {
-    const h = harness();
-    const pending = h.api.inlineOnce({ ...config, destination: "queue" });
-    h.requests[0].resolve("forest");
-    await h.flush();
-    h.requests[1].json({ batch_id: "only-owned", status: "处理中", counts: { pending: 1 }, jobs: [{ status: "pending" }] });
-    await h.advance(1000);
-    const poll = h.requests[2];
-    assert.ok(poll.url.endsWith("/queue/only-owned"));
-    h.api.cancelInline("txt2img");
-    assert.ok(h.requests[3].url.endsWith("/queue/only-owned/cancel"));
-    h.requests[3].json({});
-    poll.json({ status: "obsolete progress", counts: { completed: 1 }, jobs: [{ status: "completed" }] });
-    assert.equal(await pending, "已取消");
-    assert.doesNotMatch(h.status(), /obsolete progress/);
-    assert.equal(h.interrupts.length, 0);
+    assert.equal(h.submissions.length, 0);
 });
 
 test("cache-only ignores prompt insertion markers and rejects non-LLM cache copying", async () => {
@@ -1018,7 +1063,6 @@ test("cache-only ignores prompt insertion markers and rejects non-LLM cache copy
     assert.match(await h.api.inlineOnce({ ...config, source: "processed_cache", destination: "cache" }), /仅存缓存请使用/);
     assert.equal(h.requests.length, 1);
 });
-
 
 for (const lateFailure of [false, true]) {
     test(`Studio queue watcher ignores superseded ${lateFailure ? "errors" : "snapshots"} without cancelling jobs`, async () => {

@@ -51,7 +51,7 @@ def scenario(browser, keep_alive, start_hidden):
     }""", {"keepAlive": keep_alive, "hidden": start_hidden})
     page.add_script_tag(path=str(ROOT.parent.parent / "javascript/keepAlive.js"))
     page.add_script_tag(path=str(ROOT / "javascript/llm_prompt_studio_auto_loop.js"))
-    page.evaluate("window.llmPromptStudioAutoLoop.startInlineLoop({slot:'txt2img', request:'change scenery'})")
+    page.evaluate("window.llmPromptStudioAutoLoop.inlineOnce({slot:'txt2img', destination:'queue', count:0, request:'change scenery'})")
     if keep_alive:
         page.wait_for_function("window.submissions.length >= 3", timeout=10000)
         page.evaluate("window.llmPromptStudioAutoLoop.cancelInline('txt2img')")
