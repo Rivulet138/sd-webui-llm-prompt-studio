@@ -963,6 +963,7 @@
             config: normalizedConfig, basePrompt: promptRawValue(slot),
             lastWrittenPrompt: promptValue(slot), lastUsedPrompt: "", preparedPrompt: "", preparedSource: "",
             promptEdited: false, promptElement: null, promptListener: null, internalPromptWrite: false,
+            ignoredPromptValue: null,
             cacheCursorOverride: normalizedConfig.cacheCursor, cacheCursorSource: "", cacheCursor: 0,
             pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
             nextPromise: null, abortController: null, requestId: "", generationLoopPromise: null,
@@ -972,7 +973,12 @@
         };
         run.promptElement = input(`${slot}_prompt`);
         run.promptListener = () => {
-            if (!run.internalPromptWrite) run.promptEdited = true;
+            const current = promptRawValue(run.slot);
+            // Gradio may deliver the input/change event one tick after the
+            // setter returns. Match the value written by this run so that
+            // Forge synchronization is not mistaken for a user edit.
+            if (run.internalPromptWrite || current === run.ignoredPromptValue) return;
+            run.promptEdited = true;
         };
         run.promptElement?.addEventListener("input", run.promptListener);
         run.promptElement?.addEventListener("change", run.promptListener);
@@ -1071,6 +1077,7 @@
         if (!override) throw new Error("准备好的 Prompt 已过期，请重新生成");
         let restored = false;
         const writeTemporaryPrompt = (value) => {
+            run.ignoredPromptValue = String(value ?? "");
             run.internalPromptWrite = true;
             try {
                 setValue(`${slot}_prompt`, value, { emitChange: false });
