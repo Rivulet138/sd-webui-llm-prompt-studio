@@ -844,6 +844,9 @@ for (const sourceName of ["cache", "processed_cache"]) {
         await h.advance();
         assert.equal(h.submissions[0].prompt, "fixed subject, first scenery");
         assert.equal(h.prompt(), "fixed subject");
+        // Forge/Gradio can emit a synthetic change after the extension restores
+        // the visible base Prompt. It must not turn that value into a new base.
+        h.nodes.get("txt2img_prompt").child.dispatchEvent(new Event("input"));
         h.requests[1].records(rows);
         await h.advance(750);
         assert.equal(h.submissions.length, 1);

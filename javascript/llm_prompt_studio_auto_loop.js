@@ -972,12 +972,17 @@
             limit: normalizedConfig.destination === "queue" ? Number(normalizedConfig.count || 0) : 0,
         };
         run.promptElement = input(`${slot}_prompt`);
-        run.promptListener = () => {
+        run.promptListener = (event) => {
             const current = promptRawValue(run.slot);
             // Gradio may deliver the input/change event one tick after the
             // setter returns. Match the value written by this run so that
             // Forge synchronization is not mistaken for a user edit.
-            if (run.internalPromptWrite || current === run.ignoredPromptValue) return;
+            if (
+                run.internalPromptWrite
+                || current === run.ignoredPromptValue
+                || canonicalPrompt(current) === canonicalPrompt(run.ignoredPromptValue)
+                || event?.isTrusted === false
+            ) return;
             run.promptEdited = true;
         };
         run.promptElement?.addEventListener("input", run.promptListener);
