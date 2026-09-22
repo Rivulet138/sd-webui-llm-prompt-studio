@@ -207,6 +207,32 @@ test("each Forge round uses a fresh prompt and waits for completion while visibl
     h.api.cancelInline("txt2img");
 });
 
+test("linked Forge rounds combine each variation with the same fixed base", async () => {
+    const h = harness();
+    h.nodes.get("txt2img_prompt").child.value = "1";
+    h.api.startInlineLoop(config);
+    await h.advance();
+    h.requests[0].resolve("a");
+    await h.advance();
+    assert.deepEqual(h.submissions, [{ slot: "txt2img", prompt: "1, a" }]);
+    assert.equal(h.prompt(), "1");
+
+    h.requests[1].resolve("b");
+    h.finish();
+    await h.advance(250);
+    assert.equal(h.submissions[1].prompt, "1, b");
+    assert.doesNotMatch(h.submissions[1].prompt, /a/);
+    assert.equal(h.prompt(), "1");
+
+    h.requests[2].resolve("c");
+    h.finish();
+    await h.advance(250);
+    assert.equal(h.submissions[2].prompt, "1, c");
+    assert.doesNotMatch(h.submissions[2].prompt, /a|b/);
+    assert.equal(h.prompt(), "1");
+    h.api.cancelInline("txt2img");
+});
+
 test("stop aborts the matching pending request and ignores its late result after restart", async () => {
     const h = harness();
     h.api.startInlineLoop(config);

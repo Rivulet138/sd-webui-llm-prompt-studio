@@ -60,7 +60,7 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn("startInlineLoop", linked_source)
         self.assertNotIn("interceptForgeGenerate", self.browser_source)
         self.assertIn("await ensureLinkedPrompt(run)", linked_source)
-        self.assertIn("setValue(`${slot}_prompt`, original, { emitChange: false })", linked_source)
+        self.assertIn("writeTemporaryPrompt(run.basePrompt)", linked_source)
 
     def test_start_button_releases_gradio_before_running_the_loop(self):
         start = self.browser_source.index("function startInlineLoop")
@@ -81,8 +81,8 @@ class InfinitePromptContractTests(unittest.TestCase):
     def test_forge_start_has_short_watchdog_and_prompt_restore_does_not_emit_change(self):
         self.assertIn("const launchBudget = createTimeoutBudget(10000)", self.browser_source)
         self.assertIn("Forge 未启动生图任务", self.browser_source)
-        self.assertIn('setValue(`${slot}_prompt`, original, { emitChange: false })', self.browser_source)
-        self.assertIn('setValue(`${slot}_prompt`, override, { emitChange: false })', self.browser_source)
+        self.assertIn("writeTemporaryPrompt(run.basePrompt)", self.browser_source)
+        self.assertIn('setValue(`${slot}_prompt`, value, { emitChange: false })', self.browser_source)
 
     def test_background_generation_requires_forge_keep_alive_when_page_is_hidden(self):
         self.assertIn("window.opts.keep_alive !== true", self.browser_source)
@@ -95,8 +95,8 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertNotIn("forgeInfiniteBeforeGenerate", self.browser_source)
         self.assertIn("async function submitLinkedForgeGeneration", self.browser_source)
         self.assertIn("startLinkedGenerationLoop(run)", self.browser_source)
-        self.assertIn("setValue(`${slot}_prompt`, override, { emitChange: false })", self.browser_source)
-        self.assertIn("setValue(`${slot}_prompt`, original, { emitChange: false })", self.browser_source)
+        self.assertIn("setValue(`${slot}_prompt`, value, { emitChange: false })", self.browser_source)
+        self.assertIn("writeTemporaryPrompt(run.basePrompt)", self.browser_source)
         self.assertIn("source_tags: config.fixedPrompt ?? promptValue(slot)", self.browser_source)
         self.assertIn("removePromptOverlap", self.browser_source)
         self.assertIn("preservesImmutableTechnicalTokens", self.browser_source)

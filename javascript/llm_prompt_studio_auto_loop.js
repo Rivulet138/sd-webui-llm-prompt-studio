@@ -824,6 +824,10 @@
 
     function finishLinkedRun(run) {
         if (linkedRuns[run.slot] !== run) return;
+        if (run.promptElement && run.promptListener) {
+            run.promptElement.removeEventListener?.("input", run.promptListener);
+            run.promptElement.removeEventListener?.("change", run.promptListener);
+        }
         linkedRuns[run.slot] = null;
         setInlineLoopButtons(run.slot, false);
     }
@@ -840,7 +844,13 @@
         renderInline(run.slot, "warning", `正在准备第 ${run.count + 1} 条 ${inlineSourceName(run.config)} Prompt`, "Forge 会等待本轮 Prompt 准备完成");
         for (let attempt = 0; ; attempt += 1) {
             const current = promptValue(run.slot);
-            if (current !== run.lastWrittenPrompt) run.basePrompt = current;
+            // A user edit is a new fixed base. The previous generated override
+            // is temporary and must never become the next round's base.
+            if (run.promptEdited || (current !== run.lastWrittenPrompt && current !== run.lastUsedPrompt)) {
+                run.basePrompt = promptRawValue(run.slot);
+                run.lastWrittenPrompt = current;
+                run.promptEdited = false;
+            }
             const generated = await getInlinePromptWithRetry(run.config, run);
             assertActive(run);
             if (promptValue(run.slot) !== current) {
@@ -868,13 +878,20 @@
         }
         const run = {
             scope: "linked", slot, target: slot, cancelled: false, count: 0, completed: 0,
-            config: normalizedConfig, basePrompt: promptValue(slot),
+            config: normalizedConfig, basePrompt: promptRawValue(slot),
             lastWrittenPrompt: promptValue(slot), lastUsedPrompt: "", preparedPrompt: "", preparedSource: "",
+            promptEdited: false, promptElement: null, promptListener: null, internalPromptWrite: false,
             nextPromise: null, abortController: null, requestId: "", generationLoopPromise: null,
             // For the inline queue destination, generate through the native
             // Forge button. Zero means unlimited until the user presses Stop.
             limit: normalizedConfig.destination === "queue" ? Number(normalizedConfig.count || 0) : 0,
         };
+        run.promptElement = input(`${slot}_prompt`);
+        run.promptListener = () => {
+            if (!run.internalPromptWrite) run.promptEdited = true;
+        };
+        run.promptElement?.addEventListener("input", run.promptListener);
+        run.promptElement?.addEventListener("change", run.promptListener);
         linkedRuns[slot] = run;
         return run;
     }
@@ -963,20 +980,38 @@
         await ensureLinkedPrompt(run);
         assertActive(run);
         ensureForgeIdle(slot);
-        const original = String(input(`${slot}_prompt`).value || "");
+        const original = run.basePrompt;
         const override = consumeLinkedPrompt(slot);
         if (!override) throw new Error("准备好的 Prompt 已过期，请重新生成");
         let restored = false;
+        const writeTemporaryPrompt = (value) => {
+            run.internalPromptWrite = true;
+            try {
+                setValue(`${slot}_prompt`, value, { emitChange: false });
+            } finally {
+                run.internalPromptWrite = false;
+            }
+        };
         const restore = () => {
             if (restored) return;
             restored = true;
-            // Restore only our temporary value; preserve edits made while Forge starts.
-            if (promptRawValue(slot) === override) {
-                setValue(`${slot}_prompt`, original, { emitChange: false });
+            // Restore the fixed base unless an actual user input event happened
+            // during launch/rendering. This prevents generated text from
+            // becoming the next round's base while preserving LoRA edits.
+            const current = promptValue(run.slot);
+            const userEdited = run.promptEdited
+                || (current !== run.lastWrittenPrompt && current !== run.lastUsedPrompt);
+            if (userEdited) {
+                run.basePrompt = promptRawValue(run.slot);
+                run.lastWrittenPrompt = current;
+                run.promptEdited = false;
+            } else {
+                writeTemporaryPrompt(run.basePrompt);
+                run.lastWrittenPrompt = promptValue(run.slot);
             }
             scheduleNextLinkedPrompt(run);
         };
-        setValue(`${slot}_prompt`, override, { emitChange: false });
+        writeTemporaryPrompt(override);
         try {
             await runForgeGeneration(slot, run, generate, restore);
         } finally {
