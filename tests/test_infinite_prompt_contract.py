@@ -18,6 +18,8 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn('inline_cancel = gr.Button("停止"', self.ui_source)
         self.assertNotIn("inline_infinite", self.ui_source)
         self.assertIn('label="与当前 Prompt 合并方式"', self.ui_source)
+        self.assertIn('label="缓存读取序号（ID）"', self.ui_source)
+        self.assertIn("llm_prompt_studio_{slot}_inline_cache_cursor", self.ui_source)
         for value in ("append_end", "append_start", "replace", "marker"):
             self.assertIn(f'"{value}"', self.ui_source)
         self.assertIn("正面 Prompt 框保持不变", self.browser_source)
@@ -28,7 +30,7 @@ class InfinitePromptContractTests(unittest.TestCase):
         panel_source = self.ui_source[panel_start:panel_end]
         self.assertIn("前端连续生图（使用当前 txt2img 参数）", panel_source)
         self.assertIn("开始前端生图", self.ui_source)
-        self.assertIn("inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_destination, inline_count]", panel_source)
+        self.assertIn("inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_destination, inline_count, inline_cache_cursor]", panel_source)
         self.assertIn("source, destination, count", panel_source)
 
     def test_inline_generation_never_creates_server_queue_jobs(self):
@@ -36,6 +38,13 @@ class InfinitePromptContractTests(unittest.TestCase):
         end = self.browser_source.index("function writePrompt", start)
         self.assertNotIn("/v1/queue", self.browser_source[start:end])
         self.assertIn('if (config.destination === "queue") return startInlineLoop(config)', self.browser_source)
+
+    def test_cache_cursor_is_persisted_and_committed_after_success(self):
+        self.assertIn('llm_prompt_studio_cache_cursors_v1', self.browser_source)
+        self.assertIn('after_id=${afterId}', self.browser_source)
+        self.assertIn('commitInlineCacheCursor(run)', self.browser_source)
+        self.assertIn('cacheCursor', self.ui_source)
+        self.assertIn('syncCacheCursor', self.ui_source)
 
     def test_hidden_gradio_generation_bridge_is_removed(self):
         panel_start = self.ui_source.index("def _create_inline_panel")

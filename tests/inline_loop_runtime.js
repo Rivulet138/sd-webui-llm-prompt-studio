@@ -1024,6 +1024,23 @@ test("frontend launch failure never reports a completed round", async () => {
     assert.match(h.status(), /停止|失败|超时|启动/);
 });
 
+test("cache cursor resumes from persisted ID and advances only after a successful write", async () => {
+    const h = harness();
+    h.storage.set("llm_prompt_studio_cache_cursors_v1", JSON.stringify({ "txt2img:cache": 7 }));
+    const pending = h.api.inlineOnce({ ...config, source: "cache", writeMode: "replace" });
+    assert.equal(new URL(h.requests[0].url, "http://localhost").searchParams.get("after_id"), "7");
+    h.requests[0].records([{ id: 9, prompt: "resumed scene" }]);
+    await pending;
+    assert.equal(JSON.parse(h.storage.get("llm_prompt_studio_cache_cursors_v1"))["txt2img:cache"], 9);
+
+    const cancelled = h.api.inlineOnce({ ...config, source: "cache", writeMode: "replace" });
+    assert.equal(new URL(h.requests[1].url, "http://localhost").searchParams.get("after_id"), "9");
+    h.api.cancelInline("txt2img");
+    h.requests[1].records([{ id: 10, prompt: "cancelled scene" }]);
+    assert.equal(await cancelled, "已取消");
+    assert.equal(JSON.parse(h.storage.get("llm_prompt_studio_cache_cursors_v1"))["txt2img:cache"], 9);
+});
+
 test("native Forge error log stops the frontend loop without counting a completed round", async () => {
     const h = harness();
     h.api.inlineOnce({ ...config, destination: "queue", count: 1 });

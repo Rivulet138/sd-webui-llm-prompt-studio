@@ -36,6 +36,7 @@
     const linkedRuns = { txt2img: null, img2img: null };
     const inlineCacheCursors = { txt2img: 0, img2img: 0 };
     const processedCacheCursors = { txt2img: 0, img2img: 0 };
+    const CACHE_CURSOR_STORAGE_KEY = "llm_prompt_studio_cache_cursors_v1";
     const serverQueueWatchers = new Map();
     const CHOICE_ALIASES = Object.freeze({
         "Danbooru 标签": "Danbooru Tags",
@@ -346,6 +347,49 @@
         } catch {
             return "";
         }
+    }
+
+    function cacheCursorKey(slot, processed) {
+        return `${slot}:${processed ? "processed_cache" : "cache"}`;
+    }
+
+    function readCacheCursorState() {
+        try {
+            const value = JSON.parse(window.localStorage.getItem(CACHE_CURSOR_STORAGE_KEY) || "{}");
+            return value && typeof value === "object" ? value : {};
+        } catch {
+            return {};
+        }
+    }
+
+    function normalizeCacheCursor(value, fallback = 0) {
+        const number = Number(value);
+        return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+    }
+
+    function persistedCacheCursor(slot, processed) {
+        return normalizeCacheCursor(readCacheCursorState()[cacheCursorKey(slot, processed)], 0);
+    }
+
+    function saveCacheCursor(slot, processed, value) {
+        const cursor = normalizeCacheCursor(value, 0);
+        const state = readCacheCursorState();
+        state[cacheCursorKey(slot, processed)] = cursor;
+        try {
+            window.localStorage.setItem(CACHE_CURSOR_STORAGE_KEY, JSON.stringify(state));
+        } catch {
+            // Local storage is optional; the in-memory cursor still works for this page.
+        }
+        return cursor;
+    }
+
+    function showCacheCursor(slot, value) {
+        const element = input(`llm_prompt_studio_${slot}_inline_cache_cursor`);
+        if (!element) return;
+        const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : null;
+        const setter = prototype && Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+        if (setter) setter.call(element, String(value));
+        else element.value = String(value);
     }
 
     function currentForgeLog(tab) {
@@ -749,7 +793,21 @@
         const cursors = processed ? processedCacheCursors : inlineCacheCursors;
         const endpoint = processed ? "processed-cache" : "cache";
         const label = processed ? "处理结果库" : "原始缓存库";
-        let afterId = cursors[slot];
+        const sourceKey = cacheCursorKey(slot, processed);
+        if (run.cacheCursorSource !== sourceKey) {
+            const requested = run.cacheCursorOverride == null
+                ? -1
+                : normalizeCacheCursor(run.cacheCursorOverride, 0);
+            const initial = requested >= 0 ? requested : persistedCacheCursor(slot, processed);
+            cursors[slot] = initial;
+            run.cacheCursorSource = sourceKey;
+            run.cacheCursor = initial;
+            showCacheCursor(slot, initial);
+        }
+        // A linked run may prefetch the next record before the current Forge
+        // round finishes. Start after the record already assigned to the
+        // active round so prefetch never repeats it.
+        let afterId = normalizeCacheCursor(run.activeCacheCursor ?? run.cacheCursor, cursors[slot]);
         // Read by stable ID so large libraries, deletions and new records remain
         // reachable without loading every Prompt into the browser on each round.
         for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -771,10 +829,26 @@
             if (!Number.isSafeInteger(nextId) || nextId <= afterId || !prompt) {
                 throw new Error(`${label}返回无效记录，请更新插件并重启 Forge`);
             }
-            cursors[slot] = nextId;
+            run.pendingCacheCursor = nextId;
+            run.pendingCacheSource = sourceKey;
             return prompt;
         }
         throw new Error(processed ? "处理结果库为空，请先完成缓存处理" : "原始缓存库为空，请先生成或导入 Prompt");
+    }
+
+    function commitInlineCacheCursor(run) {
+        const sourceKey = run.activeCacheSource || run.pendingCacheSource;
+        const cursorValue = run.activeCacheCursor ?? run.pendingCacheCursor;
+        if (!sourceKey || !Number.isSafeInteger(cursorValue)) return;
+        const [slot, source] = sourceKey.split(":");
+        const processed = source === "processed_cache";
+        const cursors = processed ? processedCacheCursors : inlineCacheCursors;
+        const cursor = saveCacheCursor(slot, processed, cursorValue);
+        cursors[slot] = cursor;
+        run.cacheCursor = cursor;
+        showCacheCursor(slot, cursor);
+        run.activeCacheCursor = null;
+        run.activeCacheSource = "";
     }
 
     async function getInlinePrompt(config, run) {
@@ -815,6 +889,7 @@
             request: String(overrides.request || ""),
             variation: String(overrides.variation || ""),
             source: normalizeChoiceValue(overrides.source, "llm"),
+            cacheCursor: overrides.cacheCursor == null || overrides.cacheCursor === "" ? null : normalizeCacheCursor(overrides.cacheCursor, 0),
             preset: normalizeChoiceValue(sharedWorkflowValue("preset", overrides.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags"))),
             baseModel: normalizeChoiceValue(sharedWorkflowValue("base_model", overrides.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default"))),
             safety: normalizeChoiceValue(sharedWorkflowValue("safety", overrides.safety || componentValue(inlineId(slot, "safety"), "SFW"))),
@@ -863,6 +938,13 @@
             if (!next) continue;
             run.preparedPrompt = next;
             run.preparedSource = current;
+            if (Number.isSafeInteger(run.pendingCacheCursor)) {
+                run.preparedCacheCursor = run.pendingCacheCursor;
+                run.preparedCacheSource = run.pendingCacheSource;
+            } else {
+                run.preparedCacheCursor = null;
+                run.preparedCacheSource = "";
+            }
             run.lastWrittenPrompt = current;
             renderInline(run.slot, "success", `第 ${run.count + 1} 条 ${inlineSourceName(run.config)} Prompt 已就绪`, "等待本轮生图；正面 Prompt 框保持不变");
             return next;
@@ -881,6 +963,8 @@
             config: normalizedConfig, basePrompt: promptRawValue(slot),
             lastWrittenPrompt: promptValue(slot), lastUsedPrompt: "", preparedPrompt: "", preparedSource: "",
             promptEdited: false, promptElement: null, promptListener: null, internalPromptWrite: false,
+            cacheCursorOverride: normalizedConfig.cacheCursor, cacheCursorSource: "", cacheCursor: 0,
+            pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
             nextPromise: null, abortController: null, requestId: "", generationLoopPromise: null,
             // For the inline queue destination, generate through the native
             // Forge button. Zero means unlimited until the user presses Stop.
@@ -965,6 +1049,8 @@
             return null;
         }
         const prompt = run.preparedPrompt;
+        run.activeCacheCursor = run.preparedCacheCursor;
+        run.activeCacheSource = run.preparedCacheSource;
         run.preparedPrompt = "";
         run.preparedSource = "";
         run.lastUsedPrompt = prompt;
@@ -1026,6 +1112,7 @@
                 assertActive(run);
                 await submitLinkedForgeGeneration(run);
                 assertActive(run);
+                commitInlineCacheCursor(run);
                 run.completed += 1;
                 if (run.limit > 0 && run.count >= run.limit) {
                     finishLinkedRun(run);
@@ -1086,6 +1173,7 @@
         if (config.destination === "queue") return startInlineLoop(config);
         const run = beginInlineRun(slot, slot);
         if (!run) return "当前内嵌面板已有任务正在运行";
+        run.cacheCursorOverride = config.cacheCursor;
         try {
             const original = promptValue(slot);
             if (config.destination !== "prompt") {
@@ -1108,6 +1196,7 @@
             }
             const next = composeInlinePrompt(original, prompt, config);
             setValue(`${slot}_prompt`, next);
+            commitInlineCacheCursor(run);
             const message = `${sourceName} Prompt 已写入正面提示词`;
             renderInline(slot, "success", message, "");
             return message;
@@ -1141,6 +1230,14 @@
         }
         renderInline(normalizedSlot, "warning", "Prompt 任务已停止", run?.unlimited ? `无限 · 已完成 ${run.completed} 条` : "");
         return "Prompt 任务已停止";
+    }
+
+    function syncCacheCursor(slot, source) {
+        const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
+        if (source !== "cache" && source !== "processed_cache") return null;
+        const cursor = persistedCacheCursor(normalizedSlot, source === "processed_cache");
+        showCacheCursor(normalizedSlot, cursor);
+        return cursor;
     }
 
     function writePrompt(prompt, target, mode, basePrompt = "") {
@@ -1507,6 +1604,7 @@
         runStored,
         inlineOnce,
         cancelInline,
+        syncCacheCursor,
         watchServerQueue,
         clearQueue,
         selectAllRows,
