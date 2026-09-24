@@ -37,6 +37,9 @@ DB = StudioDB()
 RESULT_DB = StudioDB(PROCESSED_DB_PATH)
 CREDENTIALS = CredentialStore()
 LOGGER = logging.getLogger(__name__)
+_NATIVE_CACHE_CONTEXTS: dict[str, dict[str, Any]] = {}
+_NATIVE_CACHE_CONTEXT_LOCK = threading.RLock()
+_NATIVE_CACHE_CONTEXT_TTL = 30 * 60
 _STYLE_PATH = Path(__file__).resolve().parents[1] / "style.css"
 UI_CSS = _STYLE_PATH.read_text(encoding="utf-8") if _STYLE_PATH.is_file() else ""
 DEFAULT_LLM_SETTINGS = {
@@ -3365,6 +3368,183 @@ def _template_request(template_name):
     return GENERAL_CREATIVE_REQUEST_TEMPLATE
 
 
+def _native_cache_database(source: str) -> StudioDB:
+    source_key = str(source or "").strip()
+    if source_key == "cache":
+        return DB
+    if source_key == "processed_cache":
+        return RESULT_DB
+    raise ValueError("缓存 Prompt 生图必须选择原始缓存库或处理结果库")
+
+
+def _native_cache_merge_prompt(base_prompt: str, cached_prompt: str, write_mode: str, marker: str) -> str:
+    base = str(base_prompt or "").strip()
+    cached = str(cached_prompt or "").strip()
+    mode = str(write_mode or "append_end").strip()
+    if mode == "replace":
+        return cached
+    if mode == "marker":
+        token = str(marker or "{{LLM}}").strip() or "{{LLM}}"
+        if token not in base:
+            raise ValueError("当前 Prompt 中没有插入标记，请添加标记或更换写入方式")
+        return base.replace(token, cached)
+    if not base:
+        return cached
+    if not cached:
+        return base
+    if mode == "append_start":
+        return f"{cached}, {base}"
+    return f"{base}, {cached}"
+
+
+def _native_cache_cleanup_locked(now: float | None = None) -> None:
+    stamp = float(now if now is not None else time.time())
+    expired = [
+        token for token, context in _NATIVE_CACHE_CONTEXTS.items()
+        if stamp - float(context.get("created_at", stamp)) > _NATIVE_CACHE_CONTEXT_TTL
+    ]
+    for token in expired:
+        _NATIVE_CACHE_CONTEXTS.pop(token, None)
+
+
+def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
+    source = str(payload.get("source") or "").strip()
+    database = _native_cache_database(source)
+    try:
+        total_images = max(1, int(payload.get("total_images") or 1))
+        after_id = max(0, int(payload.get("after_id") or 0))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("缓存读取序号和本次图片数量必须是有效整数") from error
+    base_prompt = str(payload.get("base_prompt") or "")
+    write_mode = str(payload.get("write_mode") or "append_end").strip()
+    marker = str(payload.get("marker") or "{{LLM}}")
+    records: list[dict[str, Any]] = []
+    cursor = after_id
+    while len(records) < total_images:
+        page = database.list_prompts_after("", min(1000, total_images - len(records)), cursor)
+        if not page:
+            break
+        records.extend(page)
+        cursor = int(page[-1]["id"])
+    usable = [
+        {"id": int(record["id"]), "prompt": str(record.get("prompt") or "").strip()}
+        for record in records
+        if str(record.get("prompt") or "").strip()
+    ]
+    if len(usable) < total_images:
+        raise ValueError(
+            f"{('处理结果库' if source == 'processed_cache' else '原始缓存库')}剩余 {len(usable)} 条，"
+            f"本次需要 {total_images} 条；未启动生图，缓存读取位置未推进"
+        )
+    token = uuid.uuid4().hex
+    context = {
+        "token": token,
+        "slot": str(payload.get("slot") or "txt2img"),
+        "source": source,
+        "base_prompt": base_prompt,
+        "write_mode": write_mode,
+        "marker": marker,
+        "records": usable,
+        "next_cursor": usable[-1]["id"],
+        "created_at": time.time(),
+        "state": "pending",
+    }
+    with _NATIVE_CACHE_CONTEXT_LOCK:
+        _native_cache_cleanup_locked()
+        _NATIVE_CACHE_CONTEXTS[token] = context
+    return {
+        "token": token,
+        "count": total_images,
+        "next_cursor": context["next_cursor"],
+        "records": usable,
+    }
+
+
+def apply_native_cache_context(processing) -> str | None:
+    """Apply one prepared cache context to Forge's per-image prompt list.
+
+    The context is consumed by Forge's native processing hook, so the browser
+    Prompt textbox remains the user's fixed base Prompt for every native job.
+    """
+    existing = getattr(processing, "_llm_prompt_studio_native_cache_token", "")
+    if existing:
+        return str(existing)
+    slot = "img2img" if type(processing).__name__.lower().endswith("img2img") else "txt2img"
+    with _NATIVE_CACHE_CONTEXT_LOCK:
+        _native_cache_cleanup_locked()
+        context = next(
+            (
+                item for item in _NATIVE_CACHE_CONTEXTS.values()
+                if item.get("state") == "pending" and item.get("slot") == slot
+            ),
+            None,
+        )
+        if context is None:
+            return None
+        context["state"] = "active"
+    records = context["records"]
+    prompts = [
+        _native_cache_merge_prompt(
+            context["base_prompt"], record["prompt"], context["write_mode"], context["marker"],
+        )
+        for record in records
+    ]
+    batch_size = max(1, int(getattr(processing, "batch_size", 1) or 1))
+    negative = getattr(processing, "negative_prompt", "")
+    negative_prompts = negative if isinstance(negative, list) else [negative]
+    negative_prompts = [
+        negative_prompts[index % len(negative_prompts)] if negative_prompts else ""
+        for index in range(len(prompts))
+    ]
+    try:
+        from modules import shared
+        styles = getattr(processing, "styles", [])
+        prompts = [shared.prompt_styles.apply_styles_to_prompt(prompt, styles) for prompt in prompts]
+        negative_prompts = [
+            shared.prompt_styles.apply_negative_styles_to_prompt(prompt, styles)
+            for prompt in negative_prompts
+        ]
+    except (ImportError, AttributeError):
+        # Unit-test doubles and non-Forge callers do not provide prompt styles.
+        pass
+    processing.all_prompts = list(prompts)
+    processing.all_negative_prompts = list(negative_prompts)
+    processing.main_prompt = prompts[0]
+    processing.main_negative_prompt = negative_prompts[0]
+    if hasattr(processing, "hr_prompt"):
+        processing.hr_prompt = list(prompts)
+        processing.hr_negative_prompt = list(negative_prompts)
+        processing.all_hr_prompts = list(prompts)
+        processing.all_hr_negative_prompts = list(negative_prompts)
+    processing.n_iter = max(1, (len(prompts) + batch_size - 1) // batch_size)
+    setattr(processing, "_llm_prompt_studio_native_cache_token", context["token"])
+    LOGGER.info(
+        "Native cache Prompt injection applied: %s images, source=%s, cursor=%s",
+        len(prompts), context["source"], context["next_cursor"],
+    )
+    return context["token"]
+
+
+def _native_cache_release(token: str, commit: bool = False) -> dict[str, Any]:
+    key = str(token or "").strip()
+    if not key:
+        return {"released": False, "next_cursor": 0}
+    with _NATIVE_CACHE_CONTEXT_LOCK:
+        context = _NATIVE_CACHE_CONTEXTS.get(key)
+        if context is None:
+            return {"released": False, "next_cursor": 0}
+        if commit and context.get("state") != "active":
+            return {"released": False, "committed": False, "next_cursor": int(context.get("next_cursor") or 0)}
+        if commit:
+            context["state"] = "committed"
+        _NATIVE_CACHE_CONTEXTS.pop(key, None)
+        return {
+            "released": True,
+            "committed": bool(commit),
+            "next_cursor": int(context.get("next_cursor") or 0),
+        }
+
+
 def _set_default_template(template_name):
     key = str(template_name or "general").strip()
     valid = {value for _, value in BUILTIN_TEMPLATE_CHOICES} | {f"custom:{name}" for name in _custom_templates()}
@@ -4217,8 +4397,7 @@ def _inline_source_controls(source):
     name = names.get(source)
     return (
         gr.update(visible=name is None),
-        gr.update(value=f"读取{name}并写入 Prompt" if name else "生成一条并写入 Prompt"),
-        (f"{name}：勾选缓存注入后，Forge 每次原生 Generate 只读取一条；批次和无限生图由 Forge 控制。" if name else "使用 LLM 提示词工作室的模型与推理设置。"),
+        (f"{name}：勾选缓存注入后，Forge 每张图读取一条；Batch Count / Batch Size 和无限生图由 Forge 控制。" if name else "使用 LLM 提示词工作室的模型与推理设置。"),
         gr.update(visible=name is not None),
     )
 
@@ -4269,7 +4448,7 @@ def _create_inline_panel(slot, prompt_target):
             inline_cache_enabled = gr.Checkbox(
                 label="启用缓存 Prompt 注入（使用 Forge 原生 Generate）", value=False,
                 elem_id=f"llm_prompt_studio_{slot}_inline_cache_enabled",
-                info="勾选后，每次点击 Forge 原生 Generate 读取一条缓存；批次、无限生图和停止由 Forge 控件控制。",
+                info="勾选后，每张图读取一条缓存；基础 Prompt 不被改写，数量、批次、无限生图和停止由 Forge 控件控制。",
             )
             with gr.Row(elem_classes=["lps-form-row", "lps-inline-merge"]) as inline_merge:
                 inline_write_mode = gr.Dropdown(
@@ -4288,11 +4467,9 @@ def _create_inline_panel(slot, prompt_target):
                     placeholder="例如 {{LLM}}",
                     elem_id=f"llm_prompt_studio_{slot}_inline_marker",
                 )
-            with gr.Row(elem_classes=["lps-inline-actions"]):
-                inline_once = gr.Button("生成一条并写入 Prompt", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_once")
             inline_loop_status = gr.HTML("缓存注入关闭 · Forge 原生 Generate 保持原行为", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
             gr.HTML("", elem_id=f"llm_prompt_studio_{slot}_inline_queue_log", elem_classes=["lps-auto-loop-log"])
-            source_outputs = [llm_fields, inline_once, source_hint, inline_cache_cursor]
+            source_outputs = [llm_fields, source_hint, inline_cache_cursor]
             inline_source.change(_inline_source_controls, inputs=[inline_source], outputs=source_outputs, queue=False)
             inline_source.change(
                 fn=None, inputs=[inline_source], outputs=[inline_cache_cursor],
@@ -4300,13 +4477,6 @@ def _create_inline_panel(slot, prompt_target):
             )
             inline_write_mode.change(lambda mode: gr.update(visible=mode == "marker"), inputs=inline_write_mode, outputs=inline_marker, queue=False)
             inline_template_button.click(_template_request, inputs=inline_template_choice, outputs=request)
-            inline_once.click(
-                fn=None,
-                inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_cache_cursor],
-                outputs=inline_loop_status,
-                js=f"(writeMode, marker, request, variation, source, cacheCursor) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', writeMode, marker, request, variation, source, destination: 'prompt', count: 1, cacheCursor, preset: {json.dumps(workflow['preset'])}, baseModel: {json.dumps(workflow['base_model'])}, safety: {json.dumps(workflow['safety'])}}})",
-                queue=False,
-            )
 
 def _wd14_model_choices(directory="", current=""):
     choices, default = discover_local_models(directory)
@@ -5011,6 +5181,17 @@ def on_app_started(_, app):
                 return _api_inline_cancel(payload)
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.post("/llm-prompt-studio/v1/native-cache/prepare", dependencies=api_dependencies)
+        def prompt_studio_native_cache_prepare(payload: dict[str, Any]):
+            try:
+                return _native_cache_prepare(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.post("/llm-prompt-studio/v1/native-cache/release", dependencies=api_dependencies)
+        def prompt_studio_native_cache_release(payload: dict[str, Any]):
+            return _native_cache_release(payload.get("token", ""), bool(payload.get("commit")))
 
         @app.post("/llm-prompt-studio/v1/auto-loop-generate", dependencies=api_dependencies)
         def prompt_studio_auto_loop_generate(payload: dict[str, Any]):

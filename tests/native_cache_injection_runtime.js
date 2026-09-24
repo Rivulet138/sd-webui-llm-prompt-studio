@@ -8,7 +8,7 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../javascript/llm_prompt_studio_auto_loop.js"), "utf8");
 
-function harness() {
+function harness({batchSize = 1, batchCount = 1} = {}) {
     let now = 0;
     let timerId = 0;
     const timers = new Map();
@@ -16,7 +16,6 @@ function harness() {
     const nodes = new Map();
     const requests = [];
     const submissions = [];
-    const interrupts = [];
 
     class Element {
         constructor(value = "") {
@@ -38,7 +37,7 @@ function harness() {
             if (selector.includes("checkbox")) return this.child?.type === "checkbox" ? this.child : null;
             return this.child;
         }
-        addEventListener(type, callback) {
+        addEventListener(type, callback, _capture = false) {
             const callbacks = this.listeners.get(type) || [];
             callbacks.push(callback);
             this.listeners.set(type, callbacks);
@@ -86,19 +85,22 @@ function harness() {
             generate.disabled = true;
             interrupt.style.display = "block";
         };
-        interrupt.onClick = () => {
-            interrupts.push(slot);
-            finish(slot);
-        };
+        interrupt.onClick = () => finish(slot);
+        const size = new Element(String(batchSize));
+        size.type = "number";
+        add(`${slot}_batch_size`, size);
+        const count = new Element(String(batchCount));
+        count.type = "number";
+        add(`${slot}_batch_count`, count);
     }
     const enabled = add("llm_prompt_studio_txt2img_inline_cache_enabled");
     enabled.child = new Element();
     enabled.child.type = "checkbox";
-    const sourceHost = add("llm_prompt_studio_txt2img_inline_source");
-    sourceHost.child = new Element();
-    sourceHost.child.type = "radio";
-    sourceHost.child.value = "cache";
-    sourceHost.child.checked = true;
+    const sourceChoice = add("llm_prompt_studio_txt2img_inline_source");
+    sourceChoice.child = new Element();
+    sourceChoice.child.type = "radio";
+    sourceChoice.child.value = "cache";
+    sourceChoice.child.checked = true;
     const cursor = new Element();
     cursor.type = "number";
     add("llm_prompt_studio_txt2img_inline_cache_cursor", cursor);
@@ -139,10 +141,13 @@ function harness() {
             return id;
         },
         clearTimeout: (id) => timers.delete(id),
-        fetch(url) {
+        fetch(url, options = {}) {
             return new Promise((resolve) => requests.push({
                 url,
-                resolve(records) { resolve({ ok: true, status: 200, json: async () => ({ records }) }); },
+                body: options.body ? JSON.parse(options.body) : null,
+                resolve(data, ok = true) {
+                    resolve({ ok, status: ok ? 200 : 400, json: async () => data });
+                },
             }));
         },
     };
@@ -161,7 +166,7 @@ function harness() {
     vm.runInContext(source, context);
 
     async function flush() {
-        for (let index = 0; index < 60; index += 1) await Promise.resolve();
+        for (let index = 0; index < 80; index += 1) await Promise.resolve();
     }
     async function advance(milliseconds = 0) {
         await flush();
@@ -177,7 +182,20 @@ function harness() {
             await flush();
         }
     }
-    return { api: window.llmPromptStudioAutoLoop, nodes, requests, submissions, interrupts, storage, finish, advance };
+    return { nodes, requests, submissions, storage, finish, advance };
+}
+
+function prepareRequest(harnessState, token, nextCursor, count) {
+    const request = harnessState.requests.filter((item) => item.url.endsWith("/native-cache/prepare")).at(-1);
+    assert.ok(request, "native cache preparation request was not sent");
+    request.resolve({ token, next_cursor: nextCursor, count, records: [] });
+    return request;
+}
+
+function releaseRequest(harnessState, commit = true) {
+    const request = harnessState.requests.filter((item) => item.url.endsWith("/native-cache/release")).at(-1);
+    assert.ok(request, "native cache release request was not sent");
+    request.resolve({ released: true, committed: commit, next_cursor: 0 });
 }
 
 test("unchecked native Generate remains Forge-only", () => {
@@ -187,73 +205,71 @@ test("unchecked native Generate remains Forge-only", () => {
     assert.equal(h.requests.length, 0);
 });
 
-test("each native Generate consumes one cache record and restores the fixed base", async () => {
-    const h = harness();
+test("a Forge batch prepares one cache record per image without changing the Prompt textbox", async () => {
+    const h = harness({batchSize: 2, batchCount: 2});
     h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
-    assert.equal(h.nodes.get("txt2img_generate").listeners.get("click")?.length, 1);
     h.nodes.get("txt2img_generate").click();
     await h.advance();
     assert.equal(h.requests.length, 1);
-    h.requests[0].resolve([{ id: 1, prompt: "cache A" }]);
+    assert.equal(h.requests[0].body.total_images, 4);
+    assert.equal(h.requests[0].body.base_prompt, "fixed subject");
+    prepareRequest(h, "batch-1", 4, 4);
     await h.advance();
-    assert.deepEqual(h.submissions, [{ slot: "txt2img", prompt: "fixed subject, cache A" }]);
+    assert.deepEqual(h.submissions, [{ slot: "txt2img", prompt: "fixed subject" }]);
     h.finish();
     await h.advance(250);
+    releaseRequest(h, true);
+    await h.advance();
     assert.equal(h.nodes.get("txt2img_prompt").child.value, "fixed subject");
-
-    h.nodes.get("txt2img_generate").click();
-    await h.advance();
-    assert.equal(h.requests.length, 2);
-    h.requests[1].resolve([{ id: 2, prompt: "cache B" }]);
-    await h.advance();
-    assert.deepEqual(h.submissions[1], { slot: "txt2img", prompt: "fixed subject, cache B" });
-    assert.equal(h.submissions.some((item) => item.prompt.includes("cache A, cache B")), false);
 });
 
-test("failed native generation leaves the same cache record for retry", async () => {
+test("delayed synthetic Prompt events never turn cache A into the next base Prompt", async () => {
     const h = harness();
     h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
     h.nodes.get("txt2img_generate").click();
     await h.advance();
-    h.requests[0].resolve([{ id: 7, prompt: "retry me" }]);
+    assert.equal(h.requests[0].body.base_prompt, "fixed subject");
+    prepareRequest(h, "batch-1", 1, 1);
+    await h.advance();
+    h.finish();
+    await h.advance(250);
+    releaseRequest(h, true);
+    await h.advance();
+    const prompt = h.nodes.get("txt2img_prompt").child;
+    prompt.value = "fixed subject, cache A";
+    prompt.dispatchEvent({ type: "input", isTrusted: false });
+    h.nodes.get("txt2img_generate").click();
+    await h.advance();
+    const prepares = h.requests.filter((item) => item.url.endsWith("/native-cache/prepare"));
+    assert.equal(prepares.length, 2);
+    assert.equal(prepares[1].body.base_prompt, "fixed subject");
+});
+
+test("failed native generation releases the context without advancing the cursor", async () => {
+    const h = harness();
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+    h.nodes.get("txt2img_generate").click();
+    await h.advance();
+    prepareRequest(h, "batch-1", 7, 1);
     await h.advance();
     h.finish("txt2img", "error: gpu failed", false);
     await h.advance(250);
+    releaseRequest(h, false);
+    await h.advance();
+    assert.equal(h.nodes.get("txt2img_generate").disabled, false);
     h.nodes.get("txt2img_generate").click();
     await h.advance();
-    assert.equal(h.requests.length, 2);
-    h.requests[1].resolve([{ id: 7, prompt: "retry me" }]);
-    await h.advance();
-    assert.equal(h.submissions[1].prompt, "fixed subject, retry me");
+    const prepares = h.requests.filter((item) => item.url.endsWith("/native-cache/prepare"));
+    assert.equal(prepares.length, 2);
+    assert.equal(prepares[1].body.after_id, 0);
 });
 
-test("a native click arriving at Forge completion is replayed after restoration", async () => {
-    const h = harness();
-    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
-    h.nodes.get("txt2img_generate").click();
-    await h.advance();
-    h.requests[0].resolve([{ id: 1, prompt: "cache A" }]);
-    await h.advance();
-    assert.equal(h.submissions.length, 1);
-    h.nodes.get("txt2img_generate").click();
-    await h.advance();
-    assert.equal(h.requests.length, 1);
-    h.finish();
-    await h.advance(250);
-    assert.equal(h.requests.length, 2);
-    h.requests[1].resolve([{ id: 2, prompt: "cache B" }]);
-    await h.advance();
-    assert.deepEqual(h.submissions[1], { slot: "txt2img", prompt: "fixed subject, cache B" });
-});
-
-test("the processed cache source uses the same native click contract", async () => {
+test("processed cache uses the same native batch contract", async () => {
     const h = harness();
     h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
     h.nodes.get("llm_prompt_studio_txt2img_inline_source").child.value = "processed_cache";
     h.nodes.get("txt2img_generate").click();
     await h.advance();
-    assert.match(h.requests[0].url, /processed-cache/);
-    h.requests[0].resolve([{ id: 3, prompt: "processed C" }]);
-    await h.advance();
-    assert.deepEqual(h.submissions[0], { slot: "txt2img", prompt: "fixed subject, processed C" });
+    const request = h.requests.find((item) => item.url.endsWith("/native-cache/prepare"));
+    assert.equal(request.body.source, "processed_cache");
 });

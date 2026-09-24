@@ -11,11 +11,14 @@ class InfinitePromptContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.browser_source = (ROOT / "javascript" / "llm_prompt_studio_auto_loop.js").read_text(encoding="utf-8")
         cls.ui_source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
+        cls.native_source = (ROOT / "scripts" / "prompt_studio_native.py").read_text(encoding="utf-8")
         cls.entry_source = (ROOT / "scripts" / "llm_prompt_studio.py").read_text(encoding="utf-8")
 
     def test_inline_panel_exposes_native_cache_checkbox_and_merge_positions(self):
         self.assertIn('label="启用缓存 Prompt 注入（使用 Forge 原生 Generate）"', self.ui_source)
         self.assertIn('llm_prompt_studio_{slot}_inline_cache_enabled', self.ui_source)
+        self.assertNotIn('inline_once = gr.Button', self.ui_source)
+        self.assertNotIn('生成一条并写入 Prompt', self.ui_source)
         self.assertNotIn('inline_start = gr.Button', self.ui_source)
         self.assertNotIn('inline_cancel = gr.Button', self.ui_source)
         self.assertNotIn("inline_infinite", self.ui_source)
@@ -25,6 +28,8 @@ class InfinitePromptContractTests(unittest.TestCase):
         for value in ("append_end", "append_start", "replace", "marker"):
             self.assertIn(f'"{value}"', self.ui_source)
         self.assertIn("nativeGenerateBypass", self.browser_source)
+        self.assertIn("/llm-prompt-studio/v1/native-cache/prepare", self.browser_source)
+        self.assertIn("apply_native_cache_context", self.ui_source)
 
     def test_inline_generation_uses_native_controls_without_plugin_count(self):
         panel_start = self.ui_source.index("def _create_inline_panel")
@@ -34,6 +39,7 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertNotIn("inline_destination", panel_source)
         self.assertNotIn("inline_count", panel_source)
         self.assertNotIn("开始前端生图", panel_source)
+        self.assertNotIn("inline_once", panel_source)
 
     def test_inline_generation_never_creates_server_queue_jobs(self):
         start = self.browser_source.index("async function runInlineDestination")
@@ -45,7 +51,8 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn('llm_prompt_studio_cache_cursors_v1', self.browser_source)
         self.assertIn('after_id=${afterId}', self.browser_source)
         self.assertIn('commitInlineCacheCursor(run)', self.browser_source)
-        self.assertIn('cacheCursor', self.ui_source)
+        self.assertIn('after_id', self.ui_source)
+        self.assertIn('native-cache/prepare', self.ui_source)
         self.assertIn('syncCacheCursor', self.ui_source)
 
     def test_hidden_gradio_generation_bridge_is_removed(self):
@@ -66,9 +73,15 @@ class InfinitePromptContractTests(unittest.TestCase):
     def test_native_generate_interceptor_reads_one_cache_record_per_click(self):
         self.assertIn("function installNativeGenerateInterceptors", self.browser_source)
         self.assertIn("event.stopImmediatePropagation()", self.browser_source)
-        self.assertIn("await getInlinePromptWithRetry(config, run)", self.browser_source)
         self.assertIn("commitInlineCacheCursor(run)", self.browser_source)
+        self.assertIn("requestNativeCacheContext(config, run)", self.browser_source)
+        self.assertIn("每张图读取一条缓存", self.ui_source)
         self.assertNotIn("startLinkedGenerationLoop", self.browser_source)
+
+    def test_native_bridge_injects_after_forge_prompt_setup(self):
+        self.assertIn("def process(self, p, *args):", self.native_source)
+        self.assertIn("create_group = False", self.native_source)
+        self.assertNotIn("def before_process(self, p, *args):", self.native_source)
 
     def test_native_generate_is_not_bound_to_a_plugin_start_button(self):
         panel_start = self.ui_source.index("def _create_inline_panel")
@@ -81,8 +94,8 @@ class InfinitePromptContractTests(unittest.TestCase):
     def test_forge_start_has_short_watchdog_and_prompt_restore_does_not_emit_change(self):
         self.assertIn("const launchBudget = createTimeoutBudget(10000)", self.browser_source)
         self.assertIn("Forge 未启动生图任务", self.browser_source)
-        self.assertIn("writeNativePrompt(run, run.basePrompt)", self.browser_source)
-        self.assertIn('setValue(`${run.slot}_prompt`, value, { emitChange: false })', self.browser_source)
+        self.assertIn("event?.isTrusted !== true", self.browser_source)
+        self.assertNotIn("writeNativePrompt(run, run.basePrompt)", self.browser_source)
 
     def test_background_generation_requires_forge_keep_alive_when_page_is_hidden(self):
         self.assertIn("window.opts.keep_alive !== true", self.browser_source)
@@ -127,12 +140,10 @@ class InfinitePromptContractTests(unittest.TestCase):
     def test_prefetched_prompt_is_bound_to_current_source_and_configuration(self):
         self.assertIn("nativeCacheConfig", self.browser_source)
         self.assertIn("run.basePrompt", self.browser_source)
-        for field in ("preset", "baseModel", "safety"):
-            self.assertIn(field, self.browser_source)
-        self.assertIn("preset: {json.dumps(workflow['preset'])}", self.ui_source)
-        self.assertIn('"template"', self.ui_source)
-        self.assertIn('template:', self.browser_source)
-        self.assertIn("cache_result: Boolean(config.cacheResult)", self.browser_source)
+        self.assertIn("base_prompt: run.basePrompt", self.browser_source)
+        self.assertIn("write_mode: config.writeMode", self.browser_source)
+        self.assertIn("marker: config.marker", self.browser_source)
+        self.assertIn("native-cache/prepare", self.ui_source)
 
     def test_legacy_browser_batch_controls_are_removed_but_runtime_is_preserved(self):
         panel_start = self.ui_source.index("def _create_inline_panel")

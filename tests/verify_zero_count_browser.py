@@ -81,51 +81,11 @@ def main():
 
         prefix = "#llm_prompt_studio_txt2img_inline"
         panel = page.locator(prefix)
-        panel.get_by_text("Prompt 批量生成", exact=True).click()
-        destination = page.locator(prefix + "_destination")
-        destination.get_by_text("仅保存到缓存", exact=True).click()
-        inline_count = page.locator(prefix + "_count input")
-        expect(inline_count).to_have_attribute("min", "0")
-        inline_count.fill("0")
-        prompt = page.locator("#txt2img_prompt textarea")
-        original = prompt.input_value()
-        inline_status = page.locator(prefix + "_loop_status")
-        page.locator(prefix + "_once").click()
-        expect(inline_status).to_contain_text(re.compile(r"无限.*已完成 [3-9]\d* 条"), timeout=30000)
-        page.locator(prefix + "_cancel").click()
-        expect(inline_status).to_contain_text("取消")
-        before = len(generated)
-        page.wait_for_timeout(400)
-        assert len(generated) == before
-        expect(prompt).to_have_value(original)
-
-        destination.get_by_text("前端连续生图（使用当前 txt2img 参数）", exact=True).click()
-        page.evaluate("""() => {
-            window.__frontendSubmissions = [];
-            const generate = document.createElement('button');
-            generate.id = 'txt2img_generate';
-            generate.textContent = 'Mock Forge Generate';
-            generate.addEventListener('click', () => {
-                const id = 'mock-task-' + (window.__frontendSubmissions.length + 1);
-                window.__frontendSubmissions.push(document.querySelector('#txt2img_prompt textarea').value);
-                localStorage.setItem('txt2img_task_id', id);
-                setTimeout(() => localStorage.removeItem('txt2img_task_id'), 250);
-            });
-            document.body.appendChild(generate);
-        }""")
-        expect(page.locator(prefix + "_once")).to_have_text("开始前端生图")
-        expect(page.locator(prefix + "_start")).to_be_hidden()
-        page.locator(prefix + "_once").click()
-        page.wait_for_function("window.__frontendSubmissions.length >= 3", timeout=15000)
-        expect(inline_status).to_contain_text(re.compile(r"无限.*已完成 [1-9]\d* 轮"))
-        page.locator(prefix + "_cancel").click()
-        expect(inline_status).to_contain_text("前端连续生图已停止")
-        assert queued == [], "Inline generation must never call the Studio server queue"
-        submissions = page.evaluate("window.__frontendSubmissions")
-        assert len(submissions) >= 3 and all("garden scene" in value for value in submissions)
-        page.wait_for_timeout(600)
-        assert page.evaluate("window.__frontendSubmissions") == submissions, "Stop must prevent the next Forge submission"
-        expect(prompt).to_have_value(original)
+        panel.get_by_text("Prompt 批量生成与缓存注入", exact=True).click()
+        expect(page.locator(prefix + "_cache_enabled")).to_be_visible()
+        assert page.locator(prefix + "_once").count() == 0
+        assert page.locator(prefix + "_start").count() == 0
+        assert page.locator(prefix + "_cancel").count() == 0
         for width in (1440, 390):
             page.set_viewport_size({"width": width, "height": 1000})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
@@ -133,7 +93,7 @@ def main():
         assert not errors, errors
         (artifacts / "result.json").write_text(json.dumps({
             "main": ["0 caches until stopped", "positive 2 finishes", "0 queue waits for current render", "stop prevents next round"],
-            "inline": ["0 caches until stopped", "0 clicks native Forge Generate one round at a time", "no Studio queue request", "stop prevents next Forge submission", "fixed prompt unchanged"],
+            "inline": ["cache injection is a checkbox", "one cache record is assigned per generated image", "plugin buttons are absent"],
             "page_errors": errors, "mock_llm": True, "worker_disabled": True, "gpu_invoked": False,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         browser.close()

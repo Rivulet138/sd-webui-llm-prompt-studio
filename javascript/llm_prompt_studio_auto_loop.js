@@ -936,6 +936,90 @@
         });
     }
 
+    function initializeNativeCacheCursor(config, run) {
+        const processed = config.source === "processed_cache";
+        const sourceKey = cacheCursorKey(config.slot, processed);
+        if (run.cacheCursorSource === sourceKey) return run.cacheCursor;
+        const requested = config.cacheCursor == null
+            ? persistedCacheCursor(config.slot, processed)
+            : normalizeCacheCursor(config.cacheCursor, 0);
+        const cursors = processed ? processedCacheCursors : inlineCacheCursors;
+        cursors[config.slot] = requested;
+        run.cacheCursorSource = sourceKey;
+        run.cacheCursor = requested;
+        showCacheCursor(config.slot, requested);
+        return requested;
+    }
+
+    function readNativeBatchSettings(slot) {
+        const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
+        const number = (suffix, fallback) => {
+            const value = Number(componentValue(`${normalizedSlot}_${suffix}`, fallback));
+            return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : fallback;
+        };
+        return {
+            batch_size: number("batch_size", 1),
+            batch_count: number("batch_count", 1),
+        };
+    }
+
+    async function requestNativeCacheContext(config, run) {
+        const settings = readNativeBatchSettings(config.slot);
+        const totalImages = Math.max(1, settings.batch_size * settings.batch_count);
+        const afterId = initializeNativeCacheCursor(config, run);
+        const response = await studioFetch("/llm-prompt-studio/v1/native-cache/prepare", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
+            body: JSON.stringify({
+                slot: config.slot,
+                source: config.source,
+                after_id: afterId,
+                total_images: totalImages,
+                base_prompt: run.basePrompt,
+                write_mode: config.writeMode,
+                marker: config.marker,
+            }),
+        });
+        let data = null;
+        try { data = await response.json(); } catch { data = null; }
+        if (!response.ok) throw new Error(String(data?.detail || `准备缓存生图失败：HTTP ${response.status}`));
+        const token = String(data?.token || "").trim();
+        const nextCursor = normalizeCacheCursor(data?.next_cursor, 0);
+        const count = Number(data?.count || 0);
+        if (!token || !nextCursor || count !== totalImages) {
+            throw new Error("后端未准备完整的缓存生图上下文，未启动本次生图");
+        }
+        run.nativeContextToken = token;
+        run.nativeImageCount = count;
+        run.pendingCacheCursor = nextCursor;
+        run.pendingCacheSource = cacheCursorKey(config.slot, config.source === "processed_cache");
+        return data;
+    }
+
+    async function releaseNativeCacheContext(run, commit) {
+        const token = String(run?.nativeContextToken || "").trim();
+        if (!token) return;
+        try {
+            const response = await studioFetch("/llm-prompt-studio/v1/native-cache/release", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                cache: "no-store",
+                body: JSON.stringify({ token, commit: Boolean(commit) }),
+            });
+            if (!response.ok) throw new Error(`释放缓存生图上下文失败：HTTP ${response.status}`);
+            let data = null;
+            try { data = await response.json(); } catch { data = null; }
+            if (commit && data?.committed !== true) {
+                throw new Error("Forge 后端没有应用缓存 Prompt，未推进读取位置");
+            }
+            run.nativeContextToken = "";
+        } catch (error) {
+            if (!commit) run.nativeContextToken = "";
+            if (commit) throw error;
+        }
+    }
+
     function startLinkedRun(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         const normalizedConfig = inlineConfig(slot, config);
@@ -943,35 +1027,25 @@
         const existing = linkedRuns[slot];
         if (existing && !existing.cancelled) {
             existing.config = normalizedConfig;
-            if (!existing.busy && currentPrompt !== existing.lastWrittenPrompt) {
-                existing.basePrompt = currentPrompt;
-                existing.lastWrittenPrompt = currentPrompt;
-                existing.promptEdited = false;
-            }
             return existing;
         }
         const run = {
             scope: "linked", slot, target: slot, cancelled: false, busy: false, count: 0, completed: 0,
             native: true, config: normalizedConfig, basePrompt: currentPrompt,
-            lastWrittenPrompt: currentPrompt, lastUsedPrompt: "",
-            promptEdited: false, promptElement: null, promptListener: null, internalPromptWrite: false,
-            ignoredPromptValue: null,
+            lastWrittenPrompt: currentPrompt,
+            promptEdited: false, promptElement: null, promptListener: null,
             cacheCursorOverride: normalizedConfig.cacheCursor, cacheCursorSource: "", cacheCursor: 0,
             pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
             abortController: null, requestId: "", pendingNativeClick: false, forgeLaunching: false,
-            forgeStarted: false, forgeTaskId: "",
+            forgeStarted: false, forgeTaskId: "", nativeContextToken: "", nativeImageCount: 0,
         };
         run.promptElement = input(`${slot}_prompt`);
-        run.promptListener = () => {
-            const current = promptRawValue(run.slot);
-            // Gradio may deliver the input/change event one tick after the
-            // setter returns. Match the value written by this run so that
-            // Forge synchronization is not mistaken for a user edit.
-            if (
-                run.internalPromptWrite
-                || current === run.ignoredPromptValue
-                || canonicalPrompt(current) === canonicalPrompt(run.ignoredPromptValue)
-            ) return;
+        run.promptListener = (event) => {
+            // Only trusted browser input is a new base Prompt. Forge/Gradio
+            // may replay an older value asynchronously after a native job;
+            // those synthetic events must never turn cache A into the base
+            // for cache B.
+            if (event?.isTrusted !== true) return;
             run.promptEdited = true;
         };
         run.promptElement?.addEventListener("input", run.promptListener);
@@ -999,17 +1073,6 @@
         run.pendingCacheSource = "";
         run.activeCacheCursor = null;
         run.activeCacheSource = "";
-    }
-
-    function writeNativePrompt(run, value) {
-        run.ignoredPromptValue = String(value ?? "");
-        run.internalPromptWrite = true;
-        try {
-            setValue(`${run.slot}_prompt`, value, { emitChange: false });
-            run.lastWrittenPrompt = promptRawValue(run.slot);
-        } finally {
-            run.internalPromptWrite = false;
-        }
     }
 
     async function handleNativeGenerate(slot, generate) {
@@ -1040,43 +1103,40 @@
             run.cacheCursorOverride = configuredCursor;
         }
         const currentPrompt = promptRawValue(slot);
-        if (currentPrompt !== run.lastWrittenPrompt && !run.promptEdited) {
+        if (run.promptEdited) {
             run.basePrompt = currentPrompt;
             run.lastWrittenPrompt = currentPrompt;
+            run.promptEdited = false;
         }
         let completed = false;
         try {
-            renderInline(slot, "warning", `正在读取${inlineSourceName(config)}下一条 Prompt`, "等待 Forge 原生 Generate");
-            const generated = await getInlinePromptWithRetry(config, run);
+            renderInline(slot, "warning", `正在准备${inlineSourceName(config)}缓存批次`, "每张图使用一条缓存，等待 Forge 原生 Generate");
+            await requestNativeCacheContext(config, run);
             assertActive(run);
-            const override = composeInlinePrompt(run.basePrompt, generated, config);
             run.activeCacheCursor = run.pendingCacheCursor;
             run.activeCacheSource = run.pendingCacheSource;
-            run.lastUsedPrompt = override;
-            writeNativePrompt(run, override);
             nativeGenerateBypass[slot] += 1;
             await runForgeGeneration(slot, run, generate);
             assertActive(run);
+            await releaseNativeCacheContext(run, true);
             commitInlineCacheCursor(run);
-            run.completed += 1;
+            run.completed += run.nativeImageCount || 1;
             completed = true;
-            renderInline(slot, "success", "本轮生图完成", `已提交缓存 ID ${run.cacheCursor} · 使用 Forge 原生参数`);
+            renderInline(slot, "success", "本批生图完成", `${run.nativeImageCount || 1} 张图 · 已提交缓存 ID ${run.cacheCursor} · 使用 Forge 原生参数`);
         } catch (error) {
             const message = String(error?.message || error);
             if (message !== "已取消") {
                 renderInline(slot, "error", "缓存 Prompt 生图未完成", `${message} · 当前缓存未提交，可重试`);
             }
+            await releaseNativeCacheContext(run, false);
             discardPendingInlineCache(run);
         } finally {
             if (!completed) discardPendingInlineCache(run);
             const current = promptRawValue(slot);
-            const userEdited = run.promptEdited || (current !== run.lastWrittenPrompt && current !== run.lastUsedPrompt);
-            if (userEdited) {
+            if (run.promptEdited) {
                 run.basePrompt = current;
                 run.lastWrittenPrompt = current;
                 run.promptEdited = false;
-            } else {
-                writeNativePrompt(run, run.basePrompt);
             }
             run.busy = false;
             run.forgeStarted = false;
@@ -1113,7 +1173,7 @@
                         slot,
                         toggle.checked ? "success" : "warning",
                         toggle.checked ? "缓存 Prompt 注入已启用" : "缓存 Prompt 注入已关闭",
-                        toggle.checked ? "下一次 Forge 原生 Generate 读取一条缓存" : "Forge 原生 Generate 保持原行为",
+                        toggle.checked ? "Forge 原生 Generate 将按图片数量读取缓存" : "Forge 原生 Generate 保持原行为",
                     );
                 });
             }
