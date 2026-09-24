@@ -5140,6 +5140,18 @@ def on_app_started(_, app):
         from modules import shared
         from secrets import compare_digest
 
+        # Local Forge sessions should keep native Generate/Generate forever
+        # alive when the browser is minimized. Do not change shared or remote
+        # sessions, where the owner may intentionally control this setting.
+        cmd_opts = getattr(shared, "cmd_opts", None)
+        runtime_opts = getattr(shared, "opts", None)
+        if (
+            runtime_opts is not None
+            and not bool(getattr(cmd_opts, "webui_is_non_local", False))
+            and isinstance(getattr(runtime_opts, "data", None), dict)
+        ):
+            runtime_opts.data["keep_alive"] = True
+
         configured_auth = str(getattr(shared.cmd_opts, "api_auth", "") or "").strip()
         security = HTTPBasic(auto_error=False)
         credentials = dict(item.split(":", 1) for item in configured_auth.split(",") if ":" in item)

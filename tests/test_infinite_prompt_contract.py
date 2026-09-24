@@ -99,6 +99,8 @@ class InfinitePromptContractTests(unittest.TestCase):
 
     def test_background_generation_requires_forge_keep_alive_when_page_is_hidden(self):
         self.assertIn("window.opts.keep_alive !== true", self.browser_source)
+        self.assertIn('runtime_opts.data["keep_alive"] = True', self.ui_source)
+        self.assertIn('webui_is_non_local', self.ui_source)
         self.assertIn("Forge 未启用后台继续生成", self.browser_source)
         self.assertIn("currentForgeLog", self.browser_source)
         self.assertIn("out of memory|traceback|exception|cuda", self.browser_source)
