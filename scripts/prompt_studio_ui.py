@@ -4218,27 +4218,9 @@ def _inline_source_controls(source):
     return (
         gr.update(visible=name is None),
         gr.update(value=f"读取{name}并写入 Prompt" if name else "生成一条并写入 Prompt"),
-        (f"{name}：按记录 ID 顺序读取；会保存已完成的读取位置，下次自动继续。" if name else "使用 LLM 提示词工作室的模型与推理设置。"),
+        (f"{name}：勾选缓存注入后，Forge 每次原生 Generate 只读取一条；批次和无限生图由 Forge 控制。" if name else "使用 LLM 提示词工作室的模型与推理设置。"),
         gr.update(visible=name is not None),
     )
-
-
-def _inline_destination_controls(source, destination):
-    choices = [("写入 Prompt", "prompt")]
-    if source == "llm":
-        choices.append(("仅保存到缓存", "cache"))
-    # Keep the wire value ``queue`` for compatibility with the browser loop,
-    # but make the user-facing behavior explicit: this path clicks Forge's
-    # native txt2img button and uses the current front-end controls.
-    choices.append(("前端连续生图（使用当前 txt2img 参数）", "queue"))
-    if destination not in {value for _, value in choices}:
-        destination = "prompt"
-    llm_fields, button, hint, cursor = _inline_source_controls(source)
-    if destination != "prompt":
-        button = gr.update(value="生成到缓存" if destination == "cache" else "开始前端生图")
-    return (llm_fields, button, hint, gr.update(choices=choices, value=destination),
-            gr.update(visible=destination != "prompt"), gr.update(visible=destination == "prompt"),
-            gr.update(visible=destination != "cache"), cursor)
 
 
 def _create_inline_panel(slot, prompt_target):
@@ -4246,7 +4228,7 @@ def _create_inline_panel(slot, prompt_target):
     # Keep the txt2img injection focused on optional prompt batch generation.
     # Cache processing is rendered in the Studio tab so it has one canonical UI.
     with gr.Column(elem_id=f"llm_prompt_studio_{slot}_inline", elem_classes=["lps-inline-workbench"]):
-        with gr.Accordion("Prompt 批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline_batch"):
+        with gr.Accordion("Prompt 批量生成与缓存注入", open=False, elem_id=f"llm_prompt_studio_{slot}_inline_batch"):
             inline_source = gr.Radio(
                 label="Prompt 来源", choices=[
                     ("LLM 自动生成", "llm"),
@@ -4284,13 +4266,11 @@ def _create_inline_panel(slot, prompt_target):
                 _INLINE_TEMPLATE_EDITORS[slot] = _create_template_editor(
                     f"llm_prompt_studio_{slot}_inline", inline_template_choice,
                 )
-            with gr.Row(elem_classes=["lps-generation-destination"]):
-                inline_destination = gr.Radio(
-                    label="本次操作", choices=[("写入 Prompt", "prompt"), ("仅保存到缓存", "cache"), ("前端连续生图（使用当前 txt2img 参数）", "queue")],
-                    value="prompt", elem_id=f"llm_prompt_studio_{slot}_inline_destination", scale=3,
-                )
-                inline_count = gr.Number(label="数量（0 = 无限）", value=1, minimum=0, maximum=200, precision=0, visible=False,
-                                         elem_id=f"llm_prompt_studio_{slot}_inline_count", scale=1)
+            inline_cache_enabled = gr.Checkbox(
+                label="启用缓存 Prompt 注入（使用 Forge 原生 Generate）", value=False,
+                elem_id=f"llm_prompt_studio_{slot}_inline_cache_enabled",
+                info="勾选后，每次点击 Forge 原生 Generate 读取一条缓存；批次、无限生图和停止由 Forge 控件控制。",
+            )
             with gr.Row(elem_classes=["lps-form-row", "lps-inline-merge"]) as inline_merge:
                 inline_write_mode = gr.Dropdown(
                     label="与当前 Prompt 合并方式",
@@ -4310,36 +4290,22 @@ def _create_inline_panel(slot, prompt_target):
                 )
             with gr.Row(elem_classes=["lps-inline-actions"]):
                 inline_once = gr.Button("生成一条并写入 Prompt", variant="primary", elem_id=f"llm_prompt_studio_{slot}_inline_once")
-                inline_start = gr.Button("开始前端连续生图", elem_id=f"llm_prompt_studio_{slot}_inline_start")
-                inline_cancel = gr.Button("停止", variant="stop", elem_id=f"llm_prompt_studio_{slot}_inline_cancel")
-            inline_loop_status = gr.HTML("单次写入不生图；前端连续生图使用当前 txt2img 参数并保留 Prompt 框。", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+            inline_loop_status = gr.HTML("缓存注入关闭 · Forge 原生 Generate 保持原行为", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
             gr.HTML("", elem_id=f"llm_prompt_studio_{slot}_inline_queue_log", elem_classes=["lps-auto-loop-log"])
-            destination_outputs = [llm_fields, inline_once, source_hint, inline_destination, inline_count, inline_start, inline_merge, inline_cache_cursor]
-            inline_source.change(_inline_destination_controls, inputs=[inline_source, inline_destination], outputs=destination_outputs, queue=False)
+            source_outputs = [llm_fields, inline_once, source_hint, inline_cache_cursor]
+            inline_source.change(_inline_source_controls, inputs=[inline_source], outputs=source_outputs, queue=False)
             inline_source.change(
                 fn=None, inputs=[inline_source], outputs=[inline_cache_cursor],
                 js=f"(source) => window.llmPromptStudioAutoLoop.syncCacheCursor('{slot}', source)", queue=False,
             )
-            inline_destination.input(_inline_destination_controls, inputs=[inline_source, inline_destination], outputs=destination_outputs, queue=False)
             inline_write_mode.change(lambda mode: gr.update(visible=mode == "marker"), inputs=inline_write_mode, outputs=inline_marker, queue=False)
             inline_template_button.click(_template_request, inputs=inline_template_choice, outputs=request)
             inline_once.click(
                 fn=None,
-                inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_destination, inline_count, inline_cache_cursor],
+                inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_cache_cursor],
                 outputs=inline_loop_status,
-                js=f"(writeMode, marker, request, variation, source, destination, count, cacheCursor) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', writeMode, marker, request, variation, source, destination, count, cacheCursor, preset: {json.dumps(workflow['preset'])}, baseModel: {json.dumps(workflow['base_model'])}, safety: {json.dumps(workflow['safety'])}}})",
+                js=f"(writeMode, marker, request, variation, source, cacheCursor) => window.llmPromptStudioAutoLoop.inlineOnce({{slot: '{slot}', writeMode, marker, request, variation, source, destination: 'prompt', count: 1, cacheCursor, preset: {json.dumps(workflow['preset'])}, baseModel: {json.dumps(workflow['base_model'])}, safety: {json.dumps(workflow['safety'])}}})",
                 queue=False,
-            )
-            inline_start.click(
-                fn=None,
-                inputs=[inline_write_mode, inline_marker, request, inline_variation, inline_source, inline_destination, inline_count, inline_cache_cursor],
-                outputs=inline_loop_status,
-                js=f"(writeMode, marker, request, variation, source, destination, count, cacheCursor) => window.llmPromptStudioAutoLoop.startInlineLoop({{slot: '{slot}', writeMode, marker, request, variation, source, destination, count, cacheCursor, preset: {json.dumps(workflow['preset'])}, baseModel: {json.dumps(workflow['base_model'])}, safety: {json.dumps(workflow['safety'])}}})",
-                queue=False,
-            )
-            inline_cancel.click(
-                fn=None, outputs=inline_loop_status,
-                js=f"() => window.llmPromptStudioAutoLoop.cancelInline('{slot}')", queue=False,
             )
 
 def _wd14_model_choices(directory="", current=""):

@@ -8,9 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InlineLoopRuntimeTests(unittest.TestCase):
-    def test_button_loop_runtime(self):
+    def test_native_cache_injection_runtime(self):
         result = subprocess.run(
-            ["node", "--test", str(ROOT / "tests" / "inline_loop_runtime.js")],
+            ["node", "--test", str(ROOT / "tests" / "native_cache_injection_runtime.js")],
             cwd=ROOT,
             capture_output=True,
             text=True,

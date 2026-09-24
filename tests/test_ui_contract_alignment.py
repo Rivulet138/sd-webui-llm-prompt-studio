@@ -77,7 +77,7 @@ class ChoiceContractTests(unittest.TestCase):
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")
         inline = source[source.index("def _create_inline_panel"):source.index("def _wd14_interrogate")]
         self.assertIn('with gr.Column(elem_id=f"llm_prompt_studio_{slot}_inline", elem_classes=["lps-inline-workbench"])', inline)
-        self.assertIn('with gr.Accordion("Prompt 批量生成", open=False, elem_id=f"llm_prompt_studio_{slot}_inline_batch")', inline)
+        self.assertIn('with gr.Accordion("Prompt 批量生成与缓存注入", open=False, elem_id=f"llm_prompt_studio_{slot}_inline_batch")', inline)
         studio = source[source.index("def on_ui_tabs"):source.index("workflow_inputs = [")]
         self.assertIn('with gr.Column(elem_id="llm_prompt_studio_cache_processing"', studio)
         self.assertIn('_create_inline_cache_panel("txt2img", _PROMPT_TARGETS.get("txt2img"), result_queue_controls)', studio)

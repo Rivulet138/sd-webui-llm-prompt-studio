@@ -34,6 +34,7 @@
     };
     const inlineRuns = { txt2img: null, img2img: null };
     const linkedRuns = { txt2img: null, img2img: null };
+    const nativeGenerateBypass = { txt2img: 0, img2img: 0 };
     const inlineCacheCursors = { txt2img: 0, img2img: 0 };
     const processedCacheCursors = { txt2img: 0, img2img: 0 };
     const CACHE_CURSOR_STORAGE_KEY = "llm_prompt_studio_cache_cursors_v1";
@@ -93,6 +94,12 @@
         if (checked && checked.type !== "checkbox") return normalizeChoiceValue(checked.value, fallback);
         const element = host.querySelector("textarea, input, select");
         return element ? normalizeChoiceValue(element.value, fallback) : fallback;
+    }
+
+    function componentChecked(id, fallback = false) {
+        const host = find(id);
+        const element = host?.querySelector('input[type="checkbox"]');
+        return element ? Boolean(element.checked) : fallback;
     }
 
     function readTxt2imgSettings() {
@@ -284,7 +291,7 @@
         const tone = kind === "success" ? "success" : kind === "error" ? "error" : "warning";
         const run = linkedRuns[normalizedSlot];
         if (run && !run.cancelled) {
-            detail = [`${run.limit ? `计划 ${run.limit} 轮` : "无限"} · 已完成 ${run.completed} 轮`, detail].filter(Boolean).join(" · ");
+            detail = [`${run.busy ? "正在处理" : "已启用缓存注入"} · 已完成 ${run.completed} 轮`, detail].filter(Boolean).join(" · ");
         }
         host.innerHTML = `<div class="lps-status lps-status--${tone}" role="status" aria-live="polite"><strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</div>`;
     }
@@ -904,75 +911,58 @@
             run.promptElement.removeEventListener?.("change", run.promptListener);
         }
         linkedRuns[run.slot] = null;
-        setInlineLoopButtons(run.slot, false);
     }
 
-    function setInlineLoopButtons(slot, running) {
-        for (const suffix of ["start", "once"]) {
-            const button = findButton(inlineId(slot, suffix));
-            if (button) button.disabled = running;
-        }
+    function nativeCacheEnabled(slot) {
+        if (!componentChecked(inlineId(slot, "cache_enabled"), false)) return false;
+        const source = normalizeChoiceValue(componentValue(inlineId(slot, "source"), ""));
+        return source === "cache" || source === "processed_cache";
     }
 
-    async function prepareLinkedPrompt(run) {
-        assertActive(run);
-        renderInline(run.slot, "warning", `正在准备第 ${run.count + 1} 条 ${inlineSourceName(run.config)} Prompt`, "Forge 会等待本轮 Prompt 准备完成");
-        for (let attempt = 0; ; attempt += 1) {
-            const current = promptValue(run.slot);
-            // A user edit is a new fixed base. The previous generated override
-            // is temporary and must never become the next round's base.
-            if (run.promptEdited || (current !== run.lastWrittenPrompt && current !== run.lastUsedPrompt)) {
-                run.basePrompt = promptRawValue(run.slot);
-                run.lastWrittenPrompt = current;
-                run.promptEdited = false;
-            }
-            const generated = await getInlinePromptWithRetry(run.config, run);
-            assertActive(run);
-            if (promptValue(run.slot) !== current) {
-                run.preparedPrompt = "";
-                run.preparedSource = "";
-                renderInline(run.slot, "warning", "正面 Prompt 已变化，正在重新准备", "旧请求结果已丢弃");
-                continue;
-            }
-            const next = composeInlinePrompt(run.basePrompt, generated, run.config);
-            if (!next) continue;
-            run.preparedPrompt = next;
-            run.preparedSource = current;
-            if (Number.isSafeInteger(run.pendingCacheCursor)) {
-                run.preparedCacheCursor = run.pendingCacheCursor;
-                run.preparedCacheSource = run.pendingCacheSource;
-            } else {
-                run.preparedCacheCursor = null;
-                run.preparedCacheSource = "";
-            }
-            run.lastWrittenPrompt = current;
-            renderInline(run.slot, "success", `第 ${run.count + 1} 条 ${inlineSourceName(run.config)} Prompt 已就绪`, "等待本轮生图；正面 Prompt 框保持不变");
-            return next;
+    function nativeCacheConfig(slot) {
+        if (!nativeCacheEnabled(slot)) return null;
+        const source = normalizeChoiceValue(componentValue(inlineId(slot, "source"), "cache"));
+        if (source !== "cache" && source !== "processed_cache") {
+            throw new Error("启用缓存 Prompt 注入时，请选择原始缓存库或处理结果库");
         }
+        return inlineConfig(slot, {
+            source,
+            destination: "prompt",
+            writeMode: componentValue(inlineId(slot, "write_mode"), "append_end"),
+            marker: componentValue(inlineId(slot, "marker"), "{{LLM}}"),
+            cacheCursor: componentValue(inlineId(slot, "cache_cursor"), ""),
+            request: componentValue(inlineId(slot, "request"), ""),
+            variation: componentValue(inlineId(slot, "variation"), ""),
+        });
     }
 
     function startLinkedRun(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         const normalizedConfig = inlineConfig(slot, config);
-        if (linkedRuns[slot]) {
-            linkedRuns[slot].config = normalizedConfig;
-            return linkedRuns[slot];
+        const currentPrompt = promptRawValue(slot);
+        const existing = linkedRuns[slot];
+        if (existing && !existing.cancelled) {
+            existing.config = normalizedConfig;
+            if (!existing.busy && currentPrompt !== existing.lastWrittenPrompt) {
+                existing.basePrompt = currentPrompt;
+                existing.lastWrittenPrompt = currentPrompt;
+                existing.promptEdited = false;
+            }
+            return existing;
         }
         const run = {
-            scope: "linked", slot, target: slot, cancelled: false, count: 0, completed: 0,
-            config: normalizedConfig, basePrompt: promptRawValue(slot),
-            lastWrittenPrompt: promptValue(slot), lastUsedPrompt: "", preparedPrompt: "", preparedSource: "",
+            scope: "linked", slot, target: slot, cancelled: false, busy: false, count: 0, completed: 0,
+            native: true, config: normalizedConfig, basePrompt: currentPrompt,
+            lastWrittenPrompt: currentPrompt, lastUsedPrompt: "",
             promptEdited: false, promptElement: null, promptListener: null, internalPromptWrite: false,
             ignoredPromptValue: null,
             cacheCursorOverride: normalizedConfig.cacheCursor, cacheCursorSource: "", cacheCursor: 0,
             pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
-            nextPromise: null, abortController: null, requestId: "", generationLoopPromise: null,
-            // For the inline queue destination, generate through the native
-            // Forge button. Zero means unlimited until the user presses Stop.
-            limit: normalizedConfig.destination === "queue" ? Number(normalizedConfig.count || 0) : 0,
+            abortController: null, requestId: "", pendingNativeClick: false, forgeLaunching: false,
+            forgeStarted: false, forgeTaskId: "",
         };
         run.promptElement = input(`${slot}_prompt`);
-        run.promptListener = (event) => {
+        run.promptListener = () => {
             const current = promptRawValue(run.slot);
             // Gradio may deliver the input/change event one tick after the
             // setter returns. Match the value written by this run so that
@@ -981,7 +971,6 @@
                 run.internalPromptWrite
                 || current === run.ignoredPromptValue
                 || canonicalPrompt(current) === canonicalPrompt(run.ignoredPromptValue)
-                || event?.isTrusted === false
             ) return;
             run.promptEdited = true;
         };
@@ -991,17 +980,6 @@
         return run;
     }
 
-    async function ensureLinkedPrompt(run) {
-        assertActive(run);
-        if (run.preparedPrompt && run.preparedSource === promptValue(run.slot)) return run.preparedPrompt;
-        run.preparedPrompt = "";
-        run.preparedSource = "";
-        if (!run.nextPromise) {
-            run.nextPromise = prepareLinkedPrompt(run).finally(() => { run.nextPromise = null; });
-        }
-        return run.nextPromise;
-    }
-
     function stopLinkedRun(slot, interruptForge = false) {
         const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
         const run = linkedRuns[normalizedSlot];
@@ -1009,140 +987,109 @@
         cancelInlineRequest(run);
         run.cancelled = true;
         run.abortController?.abort();
-        if (!run.forgeLaunching) finishLinkedRun(run);
+        run.pendingNativeClick = false;
+        discardPendingInlineCache(run);
         if (interruptForge && ownsActiveForgeTask(run)) findButton(`${normalizedSlot}_interrupt`)?.click();
-        renderInline(normalizedSlot, "warning", "前端连续生图已停止", `已完成 ${run.completed} 轮 · 已提交 ${run.count} 轮`);
+        renderInline(normalizedSlot, "warning", "缓存 Prompt 生图已停止", `已完成 ${run.completed} 轮 · 当前缓存未提交`);
+        if (!run.busy) finishLinkedRun(run);
     }
 
-    function failLinkedRun(run, error) {
-        if (linkedRuns[run.slot] !== run) return;
-        stopLinkedRun(run.slot);
-        renderInline(run.slot, "error", "前端连续生图已停止", `已完成 ${run.completed} 轮 · ${String(error?.message || error)}`);
+    function discardPendingInlineCache(run) {
+        run.pendingCacheCursor = null;
+        run.pendingCacheSource = "";
+        run.activeCacheCursor = null;
+        run.activeCacheSource = "";
     }
 
-    function startInlineLoop(config) {
-        const slot = config.slot === "img2img" ? "img2img" : "txt2img";
-        if (linkedRuns[slot] || inlineRuns[slot]) return "当前内嵌面板已有任务正在运行";
-        if (config.destination === "cache") return "仅保存到缓存请使用生成到缓存按钮";
+    function writeNativePrompt(run, value) {
+        run.ignoredPromptValue = String(value ?? "");
+        run.internalPromptWrite = true;
         try {
-            ensureForgeIdle(slot);
-            if (!findButton(`${slot}_generate`) || !input(`${slot}_prompt`)) {
-                throw new Error(`未找到 ${slot} 生图控件`);
-            }
+            setValue(`${run.slot}_prompt`, value, { emitChange: false });
+            run.lastWrittenPrompt = promptRawValue(run.slot);
+        } finally {
+            run.internalPromptWrite = false;
+        }
+    }
+
+    async function handleNativeGenerate(slot, generate) {
+        let config;
+        try {
+            config = nativeCacheConfig(slot);
         } catch (error) {
-            return String(error?.message || error);
+            renderInline(slot, "error", "缓存 Prompt 注入未执行", String(error?.message || error));
+            return;
         }
+        if (!config) return;
         const run = startLinkedRun(config);
-        setInlineLoopButtons(slot, true);
-        const log = find(inlineId(slot, "queue_log"));
-        if (log) log.innerHTML = "";
-        // Let Gradio finish the button event before starting the long-running loop.
-        window.setTimeout(() => {
-            if (linkedRuns[slot] === run) startLinkedGenerationLoop(run);
-        }, 0);
-        return `前端连续生图已开始（${run.limit ? `${run.limit} 轮` : "无限"}），使用当前 ${slot} 参数`;
-    }
-
-    function scheduleNextLinkedPrompt(run) {
-        window.setTimeout(() => {
-            if (run.cancelled || linkedRuns[run.slot] !== run || (run.limit > 0 && run.count >= run.limit)) return;
-            ensureLinkedPrompt(run).catch((error) => failLinkedRun(run, error));
-        }, 0);
-    }
-
-    function consumeLinkedPrompt(tab) {
-        const slot = tab === "img2img" ? "img2img" : "txt2img";
-        const run = linkedRuns[slot];
-        if (!run?.preparedPrompt) return null;
-        if (run.preparedSource !== promptValue(slot)) {
-            run.preparedPrompt = "";
-            run.preparedSource = "";
-            return null;
+        if (run.busy) {
+            run.pendingNativeClick = true;
+            renderInline(slot, "warning", "当前 Forge 生图完成后继续读取缓存", "已记住下一次原生 Generate");
+            return;
         }
-        const prompt = run.preparedPrompt;
-        run.activeCacheCursor = run.preparedCacheCursor;
-        run.activeCacheSource = run.preparedCacheSource;
-        run.preparedPrompt = "";
-        run.preparedSource = "";
-        run.lastUsedPrompt = prompt;
-        run.count += 1;
-        renderInline(slot, "warning", `前端生图：正在提交第 ${run.count} 轮`, "使用当前 Forge 参数");
-        return prompt;
-    }
-
-    async function submitLinkedForgeGeneration(run) {
-        const slot = run.slot;
-        const generate = findButton(`${slot}_generate`);
-        if (!generate) throw new Error(`未找到 ${slot} 生成按钮`);
-        await ensureLinkedPrompt(run);
-        assertActive(run);
-        ensureForgeIdle(slot);
-        const original = run.basePrompt;
-        const override = consumeLinkedPrompt(slot);
-        if (!override) throw new Error("准备好的 Prompt 已过期，请重新生成");
-        let restored = false;
-        const writeTemporaryPrompt = (value) => {
-            run.ignoredPromptValue = String(value ?? "");
-            run.internalPromptWrite = true;
-            try {
-                setValue(`${slot}_prompt`, value, { emitChange: false });
-            } finally {
-                run.internalPromptWrite = false;
+        if (isForgeBusy(slot)) {
+            renderInline(slot, "warning", "正在等待当前 Forge 生图完成", "本次点击不会读取新的缓存");
+            return;
+        }
+        run.cancelled = false;
+        run.busy = true;
+        run.config = config;
+        const configuredCursor = config.cacheCursor;
+        if (run.cacheCursorSource && Number.isSafeInteger(configuredCursor) && configuredCursor !== run.cacheCursor) {
+            run.cacheCursorSource = "";
+            run.cacheCursorOverride = configuredCursor;
+        }
+        const currentPrompt = promptRawValue(slot);
+        if (currentPrompt !== run.lastWrittenPrompt && !run.promptEdited) {
+            run.basePrompt = currentPrompt;
+            run.lastWrittenPrompt = currentPrompt;
+        }
+        let completed = false;
+        try {
+            renderInline(slot, "warning", `正在读取${inlineSourceName(config)}下一条 Prompt`, "等待 Forge 原生 Generate");
+            const generated = await getInlinePromptWithRetry(config, run);
+            assertActive(run);
+            const override = composeInlinePrompt(run.basePrompt, generated, config);
+            run.activeCacheCursor = run.pendingCacheCursor;
+            run.activeCacheSource = run.pendingCacheSource;
+            run.lastUsedPrompt = override;
+            writeNativePrompt(run, override);
+            nativeGenerateBypass[slot] += 1;
+            await runForgeGeneration(slot, run, generate);
+            assertActive(run);
+            commitInlineCacheCursor(run);
+            run.completed += 1;
+            completed = true;
+            renderInline(slot, "success", "本轮生图完成", `已提交缓存 ID ${run.cacheCursor} · 使用 Forge 原生参数`);
+        } catch (error) {
+            const message = String(error?.message || error);
+            if (message !== "已取消") {
+                renderInline(slot, "error", "缓存 Prompt 生图未完成", `${message} · 当前缓存未提交，可重试`);
             }
-        };
-        const restore = () => {
-            if (restored) return;
-            restored = true;
-            // Restore the fixed base unless an actual user input event happened
-            // during launch/rendering. This prevents generated text from
-            // becoming the next round's base while preserving LoRA edits.
-            const current = promptValue(run.slot);
-            const userEdited = run.promptEdited
-                || (current !== run.lastWrittenPrompt && current !== run.lastUsedPrompt);
+            discardPendingInlineCache(run);
+        } finally {
+            if (!completed) discardPendingInlineCache(run);
+            const current = promptRawValue(slot);
+            const userEdited = run.promptEdited || (current !== run.lastWrittenPrompt && current !== run.lastUsedPrompt);
             if (userEdited) {
-                run.basePrompt = promptRawValue(run.slot);
+                run.basePrompt = current;
                 run.lastWrittenPrompt = current;
                 run.promptEdited = false;
             } else {
-                writeTemporaryPrompt(run.basePrompt);
-                run.lastWrittenPrompt = promptValue(run.slot);
+                writeNativePrompt(run, run.basePrompt);
             }
-            scheduleNextLinkedPrompt(run);
-        };
-        writeTemporaryPrompt(override);
-        try {
-            await runForgeGeneration(slot, run, generate, restore);
-        } finally {
-            restore();
+            run.busy = false;
+            run.forgeStarted = false;
+            run.forgeTaskId = "";
+            if (run.pendingNativeClick) {
+                run.pendingNativeClick = false;
+                if (!run.cancelled && nativeCacheEnabled(slot)) {
+                    window.setTimeout(() => handleNativeGenerate(slot, generate), 0);
+                }
+            }
         }
     }
 
-    function startLinkedGenerationLoop(run) {
-        if (run.generationLoopPromise) return run.generationLoopPromise;
-        run.generationLoopPromise = (async () => {
-            while (linkedRuns[run.slot] === run) {
-                assertActive(run);
-                await submitLinkedForgeGeneration(run);
-                assertActive(run);
-                commitInlineCacheCursor(run);
-                run.completed += 1;
-                if (run.limit > 0 && run.count >= run.limit) {
-                    finishLinkedRun(run);
-                    renderInline(run.slot, "success", `前端生图完成，共 ${run.completed} 轮`, "结果显示在 Forge 图库");
-                    break;
-                }
-                renderInline(run.slot, "success", "本轮前端生图已完成", "正在准备下一轮");
-            }
-        })().catch((error) => {
-            if (String(error?.message || error) !== "已取消") {
-                failLinkedRun(run, error);
-            }
-        }).finally(() => {
-            run.generationLoopPromise = null;
-            if (run.cancelled) finishLinkedRun(run);
-        });
-        return run.generationLoopPromise;
-    }
 
     function installForgeInterruptHandlers() {
         for (const slot of ["txt2img", "img2img"]) {
@@ -1156,10 +1103,39 @@
         }
     }
 
+    function installNativeGenerateInterceptors() {
+        for (const slot of ["txt2img", "img2img"]) {
+            const toggle = find(inlineId(slot, "cache_enabled"))?.querySelector('input[type="checkbox"]');
+            if (toggle && toggle.dataset.llmPromptStudioNativeCacheStatus !== "true") {
+                toggle.dataset.llmPromptStudioNativeCacheStatus = "true";
+                toggle.addEventListener("change", () => {
+                    renderInline(
+                        slot,
+                        toggle.checked ? "success" : "warning",
+                        toggle.checked ? "缓存 Prompt 注入已启用" : "缓存 Prompt 注入已关闭",
+                        toggle.checked ? "下一次 Forge 原生 Generate 读取一条缓存" : "Forge 原生 Generate 保持原行为",
+                    );
+                });
+            }
+            const generate = findButton(`${slot}_generate`);
+            if (!generate || generate.dataset.llmPromptStudioNativeCache === "true") continue;
+            generate.dataset.llmPromptStudioNativeCache = "true";
+            generate.addEventListener("click", (event) => {
+                if (nativeGenerateBypass[slot] > 0) {
+                    nativeGenerateBypass[slot] -= 1;
+                    return;
+                }
+                if (!nativeCacheEnabled(slot)) return;
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                void handleNativeGenerate(slot, generate);
+            }, true);
+        }
+    }
+
     async function runInlineDestination(config, run, original) {
-        // The inline cache action only stores prompts.  Browser generation is
-        // handled by startLinkedGenerationLoop, which clicks Forge's native
-        // button and therefore receives the complete current txt2img state.
+        // The inline cache action only stores prompts. Browser generation is
+        // handled by the native Generate interceptor below.
         if (config.destination !== "cache") throw new Error("未知的 Prompt 去向");
         if (config.source !== "llm") throw new Error("仅存缓存请使用 LLM 自动生成来源");
         const prompts = [];
@@ -1182,7 +1158,6 @@
         config = inlineConfig(slot, config);
         // Forge snapshots all current native controls; do not serialize a
         // partial settings list or create a Studio server queue job here.
-        if (config.destination === "queue") return startInlineLoop(config);
         const run = beginInlineRun(slot, slot);
         if (!run) return "当前内嵌面板已有任务正在运行";
         run.cacheCursorOverride = config.cacheCursor;
@@ -1238,7 +1213,7 @@
         }
         if (linked) {
             stopLinkedRun(normalizedSlot, true);
-            return `前端连续生图已停止 · 已完成 ${linked.completed} 轮 · 已提交 ${linked.count} 轮`;
+            return `缓存 Prompt 生图已停止 · 已完成 ${linked.completed} 轮 · 当前缓存未提交`;
         }
         renderInline(normalizedSlot, "warning", "Prompt 任务已停止", run?.unlimited ? `无限 · 已完成 ${run.completed} 条` : "");
         return "Prompt 任务已停止";
@@ -1607,7 +1582,11 @@
         });
     }
     installForgeInterruptHandlers();
-    if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(installForgeInterruptHandlers);
+    installNativeGenerateInterceptors();
+    if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(() => {
+        installForgeInterruptHandlers();
+        installNativeGenerateInterceptors();
+    });
     loadQueue();
     window.setTimeout(renderQueue, 1000);
     window.llmPromptStudioAutoLoop = {
@@ -1622,7 +1601,6 @@
         selectAllRows,
         clearSelectedRows,
         writeSelectedToPositive,
-        startInlineLoop,
         navigate: navigateStudioTab,
         focusHandoff,
         cancel,
