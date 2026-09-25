@@ -71,6 +71,20 @@ class NativeCacheBackendTests(unittest.TestCase):
         self.assertEqual(processing.all_negative_prompts, ["bad anatomy"] * 3)
         self.assertEqual(processing.n_iter, 2)
 
+    def test_hires_prompt_scalar_remains_compatible_with_forge_comment_cleanup(self):
+        prepared = ui._native_cache_prepare({
+            "source": "cache", "after_id": 0, "total_images": 1,
+            "base_prompt": "fixed", "write_mode": "append_end",
+        })
+        processing = types.SimpleNamespace(
+            prompt="fixed", negative_prompt="", batch_size=1, n_iter=1,
+            hr_prompt="", hr_negative_prompt="",
+        )
+        ui.apply_native_cache_context(processing)
+        self.assertIsInstance(processing.hr_prompt, str)
+        self.assertEqual(processing.hr_prompt, "fixed, cache A")
+        self.assertEqual(processing.all_hr_prompts, ["fixed, cache A"])
+
     def test_processed_cache_and_merge_modes_are_independent(self):
         prepared = ui._native_cache_prepare({
             "source": "processed_cache",

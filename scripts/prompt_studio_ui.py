@@ -3512,8 +3512,10 @@ def apply_native_cache_context(processing) -> str | None:
     processing.main_prompt = prompts[0]
     processing.main_negative_prompt = negative_prompts[0]
     if hasattr(processing, "hr_prompt"):
-        processing.hr_prompt = list(prompts)
-        processing.hr_negative_prompt = list(negative_prompts)
+        # Forge's comments script treats hr_prompt as a scalar string. Keep
+        # that public field scalar while the per-image list lives in all_hr_*.
+        processing.hr_prompt = prompts[0]
+        processing.hr_negative_prompt = negative_prompts[0]
         processing.all_hr_prompts = list(prompts)
         processing.all_hr_negative_prompts = list(negative_prompts)
     processing.n_iter = max(1, (len(prompts) + batch_size - 1) // batch_size)
