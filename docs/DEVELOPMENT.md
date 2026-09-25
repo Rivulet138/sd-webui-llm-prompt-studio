@@ -20,7 +20,7 @@
 
 ```powershell
 python -m unittest discover -s tests -p "test_*.py"
-node --test tests/inline_loop_runtime.js
+node --test tests/native_cache_injection_runtime.js
 python -m compileall -q scripts tests
 node --check javascript/llm_prompt_studio_auto_loop.js
 node --check javascript/llm_prompt_studio_png_batch.js
