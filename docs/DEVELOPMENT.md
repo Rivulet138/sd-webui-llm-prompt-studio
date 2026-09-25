@@ -14,45 +14,6 @@
 | `javascript/llm_prompt_studio_png_batch.js` | PNG 批次桥接与结果写入 |
 | `style.css` | 工作室及内嵌面板样式 |
 
-## 本地检查
-
-以下命令从扩展根目录运行。使用具备相应依赖的 Python 环境；真实页面回调检查使用 Forge 自己的 Python。JavaScript 测试需要支持 `node --test` 的 Node.js。
-
-```powershell
-python -m unittest discover -s tests -p "test_*.py"
-node --test tests/native_cache_injection_runtime.js
-python -m compileall -q scripts tests
-node --check javascript/llm_prompt_studio_auto_loop.js
-node --check javascript/llm_prompt_studio_png_batch.js
-git diff --check
-```
-
-测试覆盖缓存修改、批次导入、共享推理设置、模板同步、队列作用域、模型文件发现、图片批量任务和持续生成。LLM、模型推理与生图使用替身；通过这些测试不等于已验证真实服务商或 GPU 输出。
-
-Forge 默认 Windows 虚拟环境下的回调检查：
-
-```powershell
-..\..\venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'tests'); from test_extension_imports import run_probe; print(run_probe(real_gradio=True))"
-```
-
-该检查覆盖 Forge 恢复模块搜索路径后的延迟回调，以及加载界面时不启动生图 worker。
-
-## 浏览器检查
-
-`tests/studio_browser_harness.py` 使用真实 Gradio、临时数据库和凭据，禁用生图 worker。可在独立终端启动模拟 LLM 的界面：
-
-```powershell
-..\..\venv\Scripts\python.exe tests/studio_browser_harness.py --port 7868 --inline --mock-llm --mock-delay .15
-```
-
-在已安装 Playwright 和 Chromium 的测试环境中，使用另一终端检查数量为零的流程：
-
-```powershell
-python tests/verify_zero_count_browser.py --url http://127.0.0.1:7868
-```
-
-完成后在测试服务终端按 `Ctrl + C`。其他 `verify_*_browser.py` 的运行条件见各脚本；部分需要不同的 harness 或预置缓存，不能直接混用端口和数据。截图与验证结果保存在被 Git 忽略的 `user/` 内。
-
 ## 修改边界
 
 - 入口名称、页面职责和操作流程以 [README](../README.md) 为准；调整工作流时同步更新。
