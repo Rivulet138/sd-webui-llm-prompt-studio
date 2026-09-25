@@ -1036,7 +1036,7 @@
             promptEdited: false, promptElement: null, promptListener: null,
             cacheCursorOverride: normalizedConfig.cacheCursor, cacheCursorSource: "", cacheCursor: 0,
             pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
-            abortController: null, requestId: "", pendingNativeClick: false, forgeLaunching: false,
+            abortController: null, requestId: "", pendingNativeClick: false, nativeRetryTimer: null, forgeLaunching: false,
             forgeStarted: false, forgeTaskId: "", nativeContextToken: "", nativeImageCount: 0,
         };
         run.promptElement = input(`${slot}_prompt`);
@@ -1062,6 +1062,10 @@
         run.cancelled = true;
         run.abortController?.abort();
         run.pendingNativeClick = false;
+        if (run.nativeRetryTimer != null) {
+            window.clearTimeout?.(run.nativeRetryTimer);
+            run.nativeRetryTimer = null;
+        }
         discardPendingInlineCache(run);
         if (interruptForge && ownsActiveForgeTask(run)) findButton(`${normalizedSlot}_interrupt`)?.click();
         renderInline(normalizedSlot, "warning", "缓存 Prompt 生图已停止", `已完成 ${run.completed} 轮 · 当前缓存未提交`);
@@ -1073,6 +1077,27 @@
         run.pendingCacheSource = "";
         run.activeCacheCursor = null;
         run.activeCacheSource = "";
+    }
+
+    function scheduleNativeRetry(slot, generate, run) {
+        if (!run || run.nativeRetryTimer != null) return;
+        const retry = () => {
+            run.nativeRetryTimer = null;
+            if (run.cancelled || !nativeCacheEnabled(slot) || !run.pendingNativeClick) {
+                run.pendingNativeClick = false;
+                return;
+            }
+            if (run.busy || isForgeBusy(slot)) {
+                scheduleNativeRetry(slot, generate, run);
+                return;
+            }
+            // Consume exactly one queued native click. Additional clicks that
+            // arrived while Forge was busy are coalesced into this generation;
+            // this keeps Generate forever from launching overlapping batches.
+            run.pendingNativeClick = false;
+            void handleNativeGenerate(slot, generate);
+        };
+        run.nativeRetryTimer = window.setTimeout(retry, 100);
     }
 
     async function handleNativeGenerate(slot, generate) {
@@ -1091,7 +1116,9 @@
             return;
         }
         if (isForgeBusy(slot)) {
-            renderInline(slot, "warning", "正在等待当前 Forge 生图完成", "本次点击不会读取新的缓存");
+            run.pendingNativeClick = true;
+            scheduleNativeRetry(slot, generate, run);
+            renderInline(slot, "warning", "正在等待当前 Forge 生图完成", "已记住下一次原生 Generate，空闲后自动继续");
             return;
         }
         run.cancelled = false;

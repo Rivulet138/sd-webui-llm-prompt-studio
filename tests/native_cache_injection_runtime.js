@@ -273,3 +273,50 @@ test("processed cache uses the same native batch contract", async () => {
     const request = h.requests.find((item) => item.url.endsWith("/native-cache/prepare"));
     assert.equal(request.body.source, "processed_cache");
 });
+
+test("Generate forever clicks continue across repeated Forge rounds", async () => {
+    const h = harness();
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+
+    for (let round = 1; round <= 4; round += 1) {
+        h.nodes.get("txt2img_generate").click();
+        await h.advance();
+        const prepares = h.requests.filter((item) => item.url.endsWith("/native-cache/prepare"));
+        assert.equal(prepares.length, round, `round ${round} should prepare one cache context`);
+        prepareRequest(h, `batch-${round}`, round, 1);
+        await h.advance();
+        assert.equal(h.submissions.length, round, `round ${round} should reach Forge`);
+
+        // Forge's Generate forever menu can issue more than one click while
+        // the previous task is switching its interrupt/generate controls.
+        h.nodes.get("txt2img_generate").click();
+        h.nodes.get("txt2img_generate").click();
+        h.finish();
+        await h.advance(250);
+        releaseRequest(h, true);
+        await h.advance();
+    }
+
+    assert.equal(h.submissions.length, 4);
+    assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/release")).length, 4);
+});
+
+test("a native click captured during an unrelated Forge task is retried after idle", async () => {
+    const h = harness();
+    // Start a normal Forge task before enabling cache injection.
+    h.nodes.get("txt2img_generate").click();
+    assert.equal(h.submissions.length, 1);
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+
+    // This is the transition window where the old code discarded the click.
+    h.nodes.get("txt2img_generate").click();
+    await h.advance(100);
+    assert.equal(h.requests.length, 0);
+
+    h.finish();
+    await h.advance(100);
+    assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/prepare")).length, 1);
+    prepareRequest(h, "retry-batch", 1, 1);
+    await h.advance();
+    assert.equal(h.submissions.length, 2);
+});
