@@ -72,6 +72,9 @@ class ChoiceContractTests(unittest.TestCase):
         self.assertIn('gr.Accordion("缓存 Prompt 处理", open=False', cache_panel)
         self.assertIn('"继续处理未完成"', cache_panel)
         self.assertIn('"将已处理结果加入生图队列"', cache_panel)
+        self.assertIn("_select_cache_row_from_view", source)
+        self.assertNotIn("table.select(_select_cache_row, inputs=table", source)
+        self.assertNotIn("results.select(select_result, inputs=results", source)
 
     def test_txt2img_prompt_batch_is_separate_from_studio_cache_processing(self):
         source = (ROOT / "scripts" / "prompt_studio_ui.py").read_text(encoding="utf-8")

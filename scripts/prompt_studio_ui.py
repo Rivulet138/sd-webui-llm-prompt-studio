@@ -1367,6 +1367,23 @@ def _select_cache_row(rows, evt: gr.SelectData):
     return gr.update(value=[record_id] if record_id else []), *loaded
 
 
+def _select_cache_row_from_view(page, query, min_score, output_mode, base_model, evt: gr.SelectData):
+    """Resolve a cache-row click without sending Dataframe state through Gradio."""
+    try:
+        page_number = max(1, int(page or 1))
+    except (TypeError, ValueError, OverflowError):
+        page_number = 1
+    records = _cache_records(query, min_score, output_mode, base_model)
+    visible = records[(page_number - 1) * CACHE_PAGE_SIZE:page_number * CACHE_PAGE_SIZE]
+    index = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+    try:
+        record_id = str(visible[int(index)]["id"])
+    except (TypeError, ValueError, IndexError, KeyError):
+        record_id = ""
+    loaded = _load_record(record_id)
+    return gr.update(value=[record_id] if record_id else []), *loaded
+
+
 def _load_selected_record(selected_ids):
     values = _selected_values(selected_ids)
     if len(values) != 1:
@@ -4332,9 +4349,14 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
             rows, ident, text, actual_page = _inline_cache_result_view(s, p)
             return gr.update(value=rows, visible=bool(rows)), ident, text, actual_page
 
-        def select_result(rows, evt: gr.SelectData):
-            ident = _table_row_id(rows, evt.index[0])
-            return int(ident or 0), rows[evt.index[0]][2] if ident else ""
+        def select_result(stage_value, page_value, evt: gr.SelectData):
+            rows = _inline_cache_result_rows(stage_value, page_value)
+            try:
+                row = rows[int(evt.index[0])]
+            except (TypeError, ValueError, IndexError):
+                return 0, ""
+            ident = _table_row_id([row], 0)
+            return int(ident or 0), row[2] if ident and len(row) > 2 else ""
 
         def save_current(s, i, r, p, record, source_text):
             return save_view(s, "当前结果", i, r, p, record, source_text)
@@ -4365,7 +4387,7 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
         )
         cancel.click(_cancel_png_batch, inputs=cancel_id, outputs=status, queue=False)
         result_page.submit(result_browse, inputs=[stage, result_page], outputs=[results, result_id, result, result_page])
-        results.select(select_result, inputs=results, outputs=[result_id, result])
+        results.select(select_result, inputs=[stage, result_page], outputs=[result_id, result])
         save_inputs = [stage, result_id, result, result_page, selected, source]
         save_outputs = [stage, status, results, result_id, result, result_page, selected, source, result_panel]
         def refresh_saved(q, f, m, p, record):
@@ -6024,7 +6046,11 @@ def on_ui_tabs():
         cache_edit_event = edit_apply.click(_apply_cache_edit, inputs=[edit_snapshot, *edit_inputs], outputs=[cache_status, table, selected_records, edit_snapshot]).then(lambda: 1, outputs=cache_page, queue=False)
         record_outputs = [record_id, record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, cache_status]
         cache_edit_event.then(lambda current_id: _load_record(current_id)[:-1], inputs=record_id, outputs=record_outputs[:-1])
-        table.select(_select_cache_row, inputs=table, outputs=[selected_records, *record_outputs])
+        table.select(
+            _select_cache_row_from_view,
+            inputs=[cache_page, *cache_filter_inputs],
+            outputs=[selected_records, *record_outputs],
+        )
         selected_records.input(_load_selected_record, inputs=selected_records, outputs=record_outputs)
         load_selected.click(_load_selected_record, inputs=selected_records, outputs=record_outputs)
         preview_selected.click(_preview_selected, inputs=selected_records, outputs=[selection_preview, delete_preview_state])
