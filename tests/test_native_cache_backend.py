@@ -108,6 +108,23 @@ class NativeCacheBackendTests(unittest.TestCase):
         self.assertEqual(prepared["next_cursor"], 1005)
         self.assertEqual(len(prepared["records"]), 1005)
 
+    def test_native_cycle_wraps_at_end_of_cache(self):
+        prepared = ui._native_cache_prepare({
+            "source": "cache", "after_id": 2, "total_images": 4,
+            "base_prompt": "fixed", "allow_wrap": True,
+        })
+        self.assertEqual([record["id"] for record in prepared["records"]], [3, 1, 2, 3])
+        self.assertEqual(prepared["next_cursor"], 3)
+        self.assertTrue(prepared["wrapped"])
+
+    def test_native_cycle_still_rejects_empty_cache(self):
+        self.raw.records = []
+        with self.assertRaisesRegex(ValueError, "需要 1 条"):
+            ui._native_cache_prepare({
+                "source": "cache", "after_id": 0, "total_images": 1,
+                "base_prompt": "fixed", "allow_wrap": True,
+            })
+
     def test_insufficient_cache_does_not_create_context(self):
         with self.assertRaisesRegex(ValueError, "需要 4 条"):
             ui._native_cache_prepare({

@@ -133,6 +133,8 @@ class InfinitePromptContractTests(unittest.TestCase):
         self.assertIn("await runForgeGeneration(slot, run, generate)", self.browser_source)
         self.assertIn("void handleNativeGenerate", self.browser_source)
         self.assertIn("interrupt.addEventListener", self.browser_source)
+        self.assertIn("allow_wrap: true", self.browser_source)
+        self.assertIn("taskId = currentForgeTaskId(tab)", self.browser_source)
 
     def test_inline_source_contains_fixed_prompt_and_variation_request(self):
         self.assertIn("INLINE VARIATION REQUEST:", self.ui_source)

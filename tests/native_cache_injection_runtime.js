@@ -8,7 +8,7 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../javascript/llm_prompt_studio_auto_loop.js"), "utf8");
 
-function harness({batchSize = 1, batchCount = 1} = {}) {
+function harness({batchSize = 1, batchCount = 1, asyncTaskId = false} = {}) {
     let now = 0;
     let timerId = 0;
     const timers = new Map();
@@ -81,7 +81,9 @@ function harness({batchSize = 1, batchCount = 1} = {}) {
         interrupt.style.display = "none";
         generate.onClick = () => {
             submissions.push({ slot, prompt: prompt.value });
-            storage.set(`${slot}_task_id`, `task-${submissions.length}`);
+            const taskId = `task-${submissions.length}`;
+            if (asyncTaskId) window.setTimeout(() => storage.set(`${slot}_task_id`, taskId), 25);
+            else storage.set(`${slot}_task_id`, taskId);
             generate.disabled = true;
             interrupt.style.display = "block";
         };
@@ -212,6 +214,7 @@ test("a Forge batch prepares one cache record per image without changing the Pro
     await h.advance();
     assert.equal(h.requests.length, 1);
     assert.equal(h.requests[0].body.total_images, 4);
+    assert.equal(h.requests[0].body.allow_wrap, true);
     assert.equal(h.requests[0].body.base_prompt, "fixed subject");
     prepareRequest(h, "batch-1", 4, 4);
     await h.advance();
@@ -319,4 +322,56 @@ test("a native click captured during an unrelated Forge task is retried after id
     prepareRequest(h, "retry-batch", 1, 1);
     await h.advance();
     assert.equal(h.submissions.length, 2);
+});
+
+test("native rounds wait for a fresh asynchronous Forge task id", async () => {
+    const h = harness({asyncTaskId: true});
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+
+    for (let round = 1; round <= 3; round += 1) {
+        h.nodes.get("txt2img_generate").click();
+        await h.advance();
+        prepareRequest(h, `async-batch-${round}`, round, 1);
+        await h.advance(25);
+        assert.equal(h.submissions.length, round);
+        h.finish();
+        await h.advance(250);
+        releaseRequest(h, true);
+        await h.advance();
+        if (round < 3) {
+            // Keep the previous ID around for the next click. Forge replaces
+            // it asynchronously when the next Gradio submit callback runs.
+            h.storage.set("txt2img_task_id", `task-${round}`);
+        }
+    }
+
+    assert.equal(h.submissions.length, 3);
+    assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/prepare")).length, 3);
+});
+
+test("Generate forever does not deadlock when its menu script marks interrupt busy after an intercepted click", async () => {
+    const h = harness();
+    const generate = h.nodes.get("txt2img_generate");
+    const interrupt = h.nodes.get("txt2img_interrupt");
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+
+    // First round starts through the plugin and completes normally.
+    generate.click();
+    await h.advance();
+    prepareRequest(h, "batch-1", 1, 1);
+    await h.advance();
+    h.finish();
+    await h.advance(250);
+    releaseRequest(h, true);
+    await h.advance();
+
+    // Forge's contextMenus.js Generate forever callback does this immediately
+    // after generate.click(). The plugin intercepts the click, so no Forge
+    // callback resets interrupt.style.display back to "none".
+    generate.click();
+    interrupt.style.display = "block";
+    await h.advance(500);
+
+    const prepares = h.requests.filter((item) => item.url.endsWith("/native-cache/prepare"));
+    assert.equal(prepares.length, 2, "the intercepted second click must still prepare the next cache record");
 });

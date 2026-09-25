@@ -772,14 +772,16 @@
             }
             generate.click();
             taskId = currentForgeTaskId(tab);
-            if (typeof afterClick === "function") {
-                // Gradio snapshots inputs on a later animation frame; submit() then assigns the task ID.
-                const launchBudget = createTimeoutBudget(10000);
-                while (!taskId || taskId === previousTaskId) {
-                    if (launchBudget.expired()) throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
-                    await wait(25);
-                    taskId = currentForgeTaskId(tab);
-                }
+            // Forge's Gradio submit callback can run on a later animation
+            // frame. Always wait for a fresh task ID, including native
+            // Generate calls; otherwise the next Generate forever round can
+            // observe the previous task ID and be rejected as task ownership
+            // changing when that ID is replaced.
+            const launchBudget = createTimeoutBudget(10000);
+            while (!taskId || taskId === previousTaskId) {
+                if (launchBudget.expired()) throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
+                await wait(25);
+                taskId = currentForgeTaskId(tab);
             }
             run.forgeStarted = true;
             run.forgeTaskId = taskId;
@@ -979,6 +981,7 @@
                 base_prompt: run.basePrompt,
                 write_mode: config.writeMode,
                 marker: config.marker,
+                allow_wrap: true,
             }),
         });
         let data = null;

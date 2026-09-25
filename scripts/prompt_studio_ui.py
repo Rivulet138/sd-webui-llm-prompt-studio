@@ -3435,14 +3435,25 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     base_prompt = str(payload.get("base_prompt") or "")
     write_mode = str(payload.get("write_mode") or "append_end").strip()
     marker = str(payload.get("marker") or "{{LLM}}")
+    # Native Forge Generate forever is a cycling consumer. Once it reaches
+    # the end of a cache library, start again from the first record so the
+    # browser's native loop remains infinite. The API keeps strict exhaustion
+    # behavior unless the caller explicitly opts into cycling.
+    allow_wrap = bool(payload.get("allow_wrap", False))
     records: list[dict[str, Any]] = []
     cursor = after_id
+    wrapped = False
     while len(records) < total_images:
         page = database.list_prompts_after("", min(1000, total_images - len(records)), cursor)
-        if not page:
-            break
-        records.extend(page)
-        cursor = int(page[-1]["id"])
+        if page:
+            records.extend(page)
+            cursor = int(page[-1]["id"])
+            continue
+        if allow_wrap and cursor > 0:
+            cursor = 0
+            wrapped = True
+            continue
+        break
     usable = [
         {"id": int(record["id"]), "prompt": str(record.get("prompt") or "").strip()}
         for record in records
@@ -3474,6 +3485,7 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
         "count": total_images,
         "next_cursor": context["next_cursor"],
         "records": usable,
+        "wrapped": wrapped,
     }
 
 
