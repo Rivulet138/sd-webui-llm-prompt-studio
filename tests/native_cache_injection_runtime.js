@@ -8,7 +8,7 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../javascript/llm_prompt_studio_auto_loop.js"), "utf8");
 
-function harness({batchSize = 1, batchCount = 1, asyncTaskId = false, hidden = false, keepAlive = true} = {}) {
+function harness({batchSize = 1, batchCount = 1, asyncTaskId = false, fastTask = false, hidden = false, keepAlive = true} = {}) {
     let now = 0;
     let timerId = 0;
     const timers = new Map();
@@ -86,6 +86,7 @@ function harness({batchSize = 1, batchCount = 1, asyncTaskId = false, hidden = f
             else storage.set(`${slot}_task_id`, taskId);
             generate.disabled = true;
             interrupt.style.display = "block";
+            if (fastTask) finish(slot, "completed");
         };
         interrupt.onClick = () => finish(slot);
         const size = new Element(String(batchSize));
@@ -431,4 +432,19 @@ test("a hidden-page launch failure does not leak a native bypass into the next c
     h.nodes.get("txt2img_generate").click();
     await h.advance();
     assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/prepare")).length, 2);
+});
+
+test("a very fast Forge round is accepted when its task marker is missed", async () => {
+    const h = harness({fastTask: true});
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+
+    h.nodes.get("txt2img_generate").click();
+    await h.advance();
+    prepareRequest(h, "fast-round", 1, 1);
+    await h.advance();
+    assert.equal(h.submissions.length, 1);
+    await h.advance(250);
+    releaseRequest(h, true);
+    await h.advance();
+    assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/release")).length, 1);
 });

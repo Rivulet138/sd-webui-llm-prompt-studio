@@ -538,9 +538,9 @@
         return true;
     }
 
-    async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000, beforeLog = "", beforeOutput = "") {
+    async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000, beforeLog = "", beforeOutput = "", launchObserved = false) {
         const statusHost = find(`${tab}_status`);
-        let sawBusy = Boolean(taskId);
+        let sawBusy = Boolean(taskId) || launchObserved;
         let noOutputSince = 0;
         const budget = createTimeoutBudget(timeoutMs);
         const launchBudget = createTimeoutBudget(10000);
@@ -780,7 +780,9 @@
         const beforeLog = currentForgeLog(tab);
         const beforeOutput = currentForgeOutput(tab);
         const previousTaskId = currentForgeTaskId(tab);
+        const wasGenerateDisabled = Boolean(generate.disabled);
         let taskId = "";
+        let launchObserved = false;
         try {
             run.forgeLaunching = typeof afterClick === "function";
             if (document.hidden && window.opts && window.opts.keep_alive !== true) {
@@ -799,6 +801,18 @@
             // changing when that ID is replaced.
             const launchBudget = createTimeoutBudget(10000);
             while (!taskId || taskId === previousTaskId) {
+                const launchEvidence = (!wasGenerateDisabled && Boolean(generate.disabled))
+                    || String(find(`${tab}_status`)?.textContent || "") !== beforeStatus
+                    || currentForgeLog(tab) !== beforeLog
+                    || currentForgeOutput(tab) !== beforeOutput;
+                if (launchEvidence) {
+                    // A very fast Forge task may create and remove its task ID
+                    // between two samples. The changed native controls/output
+                    // still prove that this click was submitted.
+                    launchObserved = true;
+                    taskId = "";
+                    break;
+                }
                 if (launchBudget.expired()) throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
                 await wait(25);
                 taskId = currentForgeTaskId(tab);
@@ -809,7 +823,7 @@
             if (run.cancelled && ownsActiveForgeTask(run)) findButton(`${tab}_interrupt`)?.click();
             if (typeof afterClick === "function") afterClick();
             assertActive(run);
-            await waitForForgeGeneration(tab, run, beforeStatus, taskId, 1800000, beforeLog, beforeOutput);
+            await waitForForgeGeneration(tab, run, beforeStatus, taskId, 1800000, beforeLog, beforeOutput, launchObserved);
         } finally {
             run.forgeLaunching = false;
             if (typeof afterClick === "function") afterClick();
