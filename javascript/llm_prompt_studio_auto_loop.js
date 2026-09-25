@@ -35,6 +35,11 @@
     const inlineRuns = { txt2img: null, img2img: null };
     const linkedRuns = { txt2img: null, img2img: null };
     const nativeGenerateBypass = { txt2img: 0, img2img: 0 };
+    // Forge keeps its task marker in localStorage for a short period while
+    // the progress callback is switching the controls back to idle. Keep the
+    // last task completed by Studio per tab so a new run can distinguish that
+    // stale marker from an actually active Forge task.
+    const lastCompletedForgeTaskIds = { txt2img: "", img2img: "" };
     const inlineCacheCursors = { txt2img: 0, img2img: 0 };
     const processedCacheCursors = { txt2img: 0, img2img: 0 };
     const CACHE_CURSOR_STORAGE_KEY = "llm_prompt_studio_cache_cursors_v1";
@@ -342,10 +347,21 @@
         return style.display !== "none";
     }
 
-    function isForgeBusy(tab) {
-        return isControlShown(find(`${tab}_interrupt`))
+    function isForgeBusy(tab, run = null) {
+        // contextMenus.js sets interrupt.style.display = "block" immediately
+        // after every Generate click. When Studio intercepts that click while
+        // the previous round is finishing, the style can remain visible even
+        // though Forge has no active task. Use Forge's task marker and the
+        // actual disabled/interrupting controls as the busy signal so this
+        // stale visual marker cannot deadlock the next round.
+        const taskId = currentForgeTaskId(tab);
+        const lastCompletedTaskId = String(
+            run?.lastCompletedForgeTaskId || lastCompletedForgeTaskIds[tab] || "",
+        );
+        const interruptShown = isControlShown(find(`${tab}_interrupt`));
+        return Boolean(findButton(`${tab}_generate`)?.disabled)
             || isControlShown(find(`${tab}_interrupting`))
-            || Boolean(findButton(`${tab}_generate`)?.disabled);
+            || Boolean(taskId && interruptShown && taskId !== lastCompletedTaskId);
     }
 
     function currentForgeTaskId(tab) {
@@ -415,7 +431,7 @@
     function ownsActiveForgeTask(run) {
         if (!run?.forgeStarted || !run.target) return false;
         if (run.forgeTaskId) return currentForgeTaskId(run.target) === run.forgeTaskId;
-        return isForgeBusy(run.target);
+        return isForgeBusy(run.target, run);
     }
 
     async function beginRun(phase, target = null) {
@@ -533,7 +549,7 @@
             const currentTaskId = currentForgeTaskId(tab);
             const taskTracked = Boolean(taskId) && currentTaskId === taskId;
             const taskReplaced = Boolean(taskId) && Boolean(currentTaskId) && currentTaskId !== taskId;
-            const busy = taskId ? taskTracked : isForgeBusy(tab);
+            const busy = taskId ? taskTracked : isForgeBusy(tab, run);
             sawBusy ||= busy;
             const currentStatus = String(statusHost?.textContent || "");
             const currentLog = currentForgeLog(tab);
@@ -569,8 +585,8 @@
         throw new Error(`${tab} generation timeout; prompt returned to pending`);
     }
 
-    function ensureForgeIdle(target) {
-        if (isForgeBusy(target)) throw new Error(`${target} 当前已有生图任务`);
+    function ensureForgeIdle(target, run = null) {
+        if (isForgeBusy(target, run)) throw new Error(`${target} 当前已有生图任务`);
     }
 
     function inlineId(slot, suffix) {
@@ -795,6 +811,10 @@
             if (typeof afterClick === "function") afterClick();
             run.forgeStarted = false;
             run.forgeTaskId = "";
+            if (taskId) {
+                run.lastCompletedForgeTaskId = taskId;
+                lastCompletedForgeTaskIds[tab] = taskId;
+            }
         }
     }
 
@@ -1040,7 +1060,7 @@
             cacheCursorOverride: normalizedConfig.cacheCursor, cacheCursorSource: "", cacheCursor: 0,
             pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
             abortController: null, requestId: "", pendingNativeClick: false, nativeRetryTimer: null, forgeLaunching: false,
-            forgeStarted: false, forgeTaskId: "", nativeContextToken: "", nativeImageCount: 0,
+            forgeStarted: false, forgeTaskId: "", lastCompletedForgeTaskId: lastCompletedForgeTaskIds[slot], nativeContextToken: "", nativeImageCount: 0,
         };
         run.promptElement = input(`${slot}_prompt`);
         run.promptListener = (event) => {
@@ -1090,7 +1110,7 @@
                 run.pendingNativeClick = false;
                 return;
             }
-            if (run.busy || isForgeBusy(slot)) {
+            if (run.busy || isForgeBusy(slot, run)) {
                 scheduleNativeRetry(slot, generate, run);
                 return;
             }
@@ -1118,7 +1138,7 @@
             renderInline(slot, "warning", "当前 Forge 生图完成后继续读取缓存", "已记住下一次原生 Generate");
             return;
         }
-        if (isForgeBusy(slot)) {
+        if (isForgeBusy(slot, run)) {
             run.pendingNativeClick = true;
             scheduleNativeRetry(slot, generate, run);
             renderInline(slot, "warning", "正在等待当前 Forge 生图完成", "已记住下一次原生 Generate，空闲后自动继续");
@@ -1437,7 +1457,7 @@
         try {
             for (const row of pending) {
                 assertActive(run);
-                ensureForgeIdle(target);
+                ensureForgeIdle(target, run);
                 currentRow = row;
                 row.status = STATUS.running;
                 renderQueue();

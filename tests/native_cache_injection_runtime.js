@@ -375,3 +375,42 @@ test("Generate forever does not deadlock when its menu script marks interrupt bu
     const prepares = h.requests.filter((item) => item.url.endsWith("/native-cache/prepare"));
     assert.equal(prepares.length, 2, "the intercepted second click must still prepare the next cache record");
 });
+
+test("Generate forever continues through repeated idle transitions without dropping a round", async () => {
+    const h = harness();
+    const generate = h.nodes.get("txt2img_generate");
+    const interrupt = h.nodes.get("txt2img_interrupt");
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+
+    // This models contextMenus.js: every time Forge exposes Generate again,
+    // its forever loop clicks Generate and immediately marks the interrupt
+    // control busy. The click can therefore arrive while the plugin is still
+    // releasing the prior native-cache context.
+    const foreverTick = () => {
+        if (interrupt.style.display === "none") {
+            generate.click();
+            interrupt.style.display = "block";
+        }
+    };
+
+    for (let round = 1; round <= 6; round += 1) {
+        foreverTick();
+        await h.advance();
+        const prepares = h.requests.filter((item) => item.url.endsWith("/native-cache/prepare"));
+        assert.equal(prepares.length, round, `round ${round} should prepare exactly one context`);
+        prepareRequest(h, `forever-${round}`, round, 1);
+        await h.advance();
+        assert.equal(h.submissions.length, round, `round ${round} should submit exactly one Forge task`);
+
+        // Forge becomes idle before the plugin's release request resolves;
+        // the next forever tick must be retained and replayed afterwards.
+        h.finish();
+        foreverTick();
+        await h.advance(250);
+        releaseRequest(h, true);
+        await h.advance();
+    }
+
+    assert.equal(h.submissions.length, 6);
+    assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/release")).length, 6);
+});
