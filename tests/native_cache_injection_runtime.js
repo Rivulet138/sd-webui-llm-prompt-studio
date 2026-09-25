@@ -8,7 +8,7 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../javascript/llm_prompt_studio_auto_loop.js"), "utf8");
 
-function harness({batchSize = 1, batchCount = 1, asyncTaskId = false} = {}) {
+function harness({batchSize = 1, batchCount = 1, asyncTaskId = false, hidden = false, keepAlive = true} = {}) {
     let now = 0;
     let timerId = 0;
     const timers = new Map();
@@ -131,7 +131,7 @@ function harness({batchSize = 1, batchCount = 1, asyncTaskId = false} = {}) {
         addEventListener() {},
         performance: { now: () => now },
         getComputedStyle: (element) => element.style,
-        opts: { keep_alive: true },
+        opts: { keep_alive: keepAlive },
         localStorage: {
             getItem: (key) => storage.get(key) ?? null,
             setItem: (key, value) => storage.set(key, String(value)),
@@ -155,7 +155,7 @@ function harness({batchSize = 1, batchCount = 1, asyncTaskId = false} = {}) {
     };
     const context = vm.createContext({
         window,
-        document: { ...root, hidden: false },
+        document: { ...root, hidden },
         gradioApp: () => root,
         HTMLTextAreaElement: Element,
         HTMLInputElement: Element,
@@ -413,4 +413,22 @@ test("Generate forever continues through repeated idle transitions without dropp
 
     assert.equal(h.submissions.length, 6);
     assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/release")).length, 6);
+});
+
+test("a hidden-page launch failure does not leak a native bypass into the next click", async () => {
+    const h = harness({hidden: true, keepAlive: false});
+    h.nodes.get("llm_prompt_studio_txt2img_inline_cache_enabled").child.checked = true;
+
+    h.nodes.get("txt2img_generate").click();
+    await h.advance();
+    prepareRequest(h, "hidden-failure", 1, 1);
+    await h.advance();
+    releaseRequest(h, false);
+    await h.advance();
+
+    // The failed launch must leave the next Generate click intercepted so it
+    // can retry cache preparation after keep_alive is enabled.
+    h.nodes.get("txt2img_generate").click();
+    await h.advance();
+    assert.equal(h.requests.filter((item) => item.url.endsWith("/native-cache/prepare")).length, 2);
 });

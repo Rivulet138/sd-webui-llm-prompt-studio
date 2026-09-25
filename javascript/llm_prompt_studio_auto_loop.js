@@ -786,6 +786,10 @@
             if (document.hidden && window.opts && window.opts.keep_alive !== true) {
                 throw new Error("Forge 未启用后台继续生成，请开启 keep_alive 后刷新页面");
             }
+            // Consume this bypass only for the native click that is about to
+            // be dispatched. Keep it after the hidden-page guard so a failed
+            // launch cannot leak a bypass into the next user click.
+            nativeGenerateBypass[tab] += 1;
             generate.click();
             taskId = currentForgeTaskId(tab);
             // Forge's Gradio submit callback can run on a later animation
@@ -1165,7 +1169,6 @@
             assertActive(run);
             run.activeCacheCursor = run.pendingCacheCursor;
             run.activeCacheSource = run.pendingCacheSource;
-            nativeGenerateBypass[slot] += 1;
             await runForgeGeneration(slot, run, generate);
             assertActive(run);
             await releaseNativeCacheContext(run, true);
