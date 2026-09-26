@@ -130,7 +130,9 @@ git -C extensions clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio
 
 ## 后台运行与停止
 
-**最小化浏览器或切到桌面继续生图**：开启 Forge 设置中的 `Keep generating even when the WebUI browser tab is not in focus`（`keep_alive`，即浏览器失去焦点时仍继续生成），应用设置并刷新页面。浏览器页面、Forge 进程和电脑须保持运行。
+**LLM Prompt Studio 内嵌连续生图**：点击「开始前端生图」后，插件会自动启用自己的后台 Worker 调度，即使浏览器页面失去焦点或窗口最小化也会继续提交下一轮。浏览器页面、Forge 进程和电脑须保持运行。
+
+Forge 原生右键菜单的 **Generate forever** 仍由 Forge 自己控制；如果要单独使用该入口，请开启 Forge 设置中的 `Keep generating even when the WebUI browser tab is not in focus`（`keep_alive`），应用设置并刷新页面。
 
 已经提交的服务端生图任务在关闭页面后仍可由 Forge 执行。依赖页面的连续生成在关闭页面后不会继续创建下一轮；启动 Forge、打开或刷新页面不会自动开始生图，也不会自动续跑上次未完成任务。
 
