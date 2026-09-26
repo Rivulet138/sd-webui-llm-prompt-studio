@@ -165,6 +165,9 @@
         keepAliveBridge = createKeepAliveBridge();
         if (!keepAliveBridge) return false;
         const { native } = keepAliveBridge;
+        // Older Forge builds only keep requestAnimationFrame alive. Route all
+        // page timers through the plugin worker while hidden so Gradio's
+        // progress callbacks and the next native Generate are not throttled.
         window.setTimeout = function (callback, delay, ...args) {
             return document.hidden && keepAliveBridge
                 ? keepAliveBridge.scheduleTimeout(callback, delay, args)
