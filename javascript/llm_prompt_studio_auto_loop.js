@@ -347,6 +347,22 @@
         return style.display !== "none";
     }
 
+    function forgeOptions() {
+        let options = null;
+        try {
+            if (typeof opts !== "undefined" && opts && typeof opts === "object") options = opts;
+        } catch {
+            options = null;
+        }
+        if (!options && window.opts && typeof window.opts === "object") options = window.opts;
+        return options && Object.keys(options).length ? options : null;
+    }
+
+    function forgeKeepAliveEnabled() {
+        const options = forgeOptions();
+        return Boolean(options?.keep_alive || window.__forgeKeepAliveActive);
+    }
+
     function isForgeBusy(tab, run = null) {
         // contextMenus.js sets interrupt.style.display = "block" immediately
         // after every Generate click. When Studio intercepts that click while
@@ -359,9 +375,13 @@
             run?.lastCompletedForgeTaskId || lastCompletedForgeTaskIds[tab] || "",
         );
         const interruptShown = isControlShown(find(`${tab}_interrupt`));
-        return Boolean(findButton(`${tab}_generate`)?.disabled)
-            || isControlShown(find(`${tab}_interrupting`))
-            || Boolean(taskId && interruptShown && taskId !== lastCompletedTaskId);
+        if (Boolean(findButton(`${tab}_generate`)?.disabled)) return true;
+        if (isControlShown(find(`${tab}_interrupting`))) return true;
+        // A Generate-forever click can leave the interrupt button visible for
+        // one UI update after Studio intercepted the click. A task marker is
+        // only meaningful while that control is visible and is not the round
+        // Studio just completed.
+        return Boolean(taskId && interruptShown && taskId !== lastCompletedTaskId);
     }
 
     function currentForgeTaskId(tab) {
@@ -785,7 +805,7 @@
         let launchObserved = false;
         try {
             run.forgeLaunching = typeof afterClick === "function";
-            if (document.hidden && window.opts && window.opts.keep_alive !== true) {
+            if (document.hidden && forgeOptions() && !forgeKeepAliveEnabled()) {
                 throw new Error("Forge 未启用后台继续生成，请开启 keep_alive 后刷新页面");
             }
             // Consume this bypass only for the native click that is about to
@@ -829,9 +849,16 @@
             if (typeof afterClick === "function") afterClick();
             run.forgeStarted = false;
             run.forgeTaskId = "";
-            if (taskId) {
-                run.lastCompletedForgeTaskId = taskId;
-                lastCompletedForgeTaskIds[tab] = taskId;
+            const completedTaskId = taskId || currentForgeTaskId(tab) || (launchObserved ? previousTaskId : "");
+            if (completedTaskId) {
+                run.lastCompletedForgeTaskId = completedTaskId;
+                lastCompletedForgeTaskIds[tab] = completedTaskId;
+            }
+            const generateControl = findButton(`${tab}_generate`);
+            const interrupting = find(`${tab}_interrupting`);
+            if (generateControl && !generateControl.disabled && !isControlShown(interrupting)) {
+                const interrupt = find(`${tab}_interrupt`);
+                if (interrupt) interrupt.style.display = "none";
             }
         }
     }
@@ -1104,7 +1131,7 @@
         run.abortController?.abort();
         run.pendingNativeClick = false;
         if (run.nativeRetryTimer != null) {
-            window.clearTimeout?.(run.nativeRetryTimer);
+            run.nativeRetryTimer.cancelled = true;
             run.nativeRetryTimer = null;
         }
         discardPendingInlineCache(run);
@@ -1123,7 +1150,6 @@
     function scheduleNativeRetry(slot, generate, run) {
         if (!run || run.nativeRetryTimer != null) return;
         const retry = () => {
-            run.nativeRetryTimer = null;
             if (run.cancelled || !nativeCacheEnabled(slot) || !run.pendingNativeClick) {
                 run.pendingNativeClick = false;
                 return;
@@ -1138,7 +1164,13 @@
             run.pendingNativeClick = false;
             void handleNativeGenerate(slot, generate);
         };
-        run.nativeRetryTimer = window.setTimeout(retry, 100);
+        const timer = { cancelled: false };
+        run.nativeRetryTimer = timer;
+        wait(100).then(() => {
+            if (timer.cancelled || run.nativeRetryTimer !== timer) return;
+            run.nativeRetryTimer = null;
+            retry();
+        });
     }
 
     async function handleNativeGenerate(slot, generate) {
@@ -1211,7 +1243,12 @@
             if (run.pendingNativeClick) {
                 run.pendingNativeClick = false;
                 if (!run.cancelled && nativeCacheEnabled(slot)) {
-                    window.setTimeout(() => handleNativeGenerate(slot, generate), 0);
+                    const pendingRun = run;
+                    wait(0).then(() => {
+                        if (linkedRuns[slot] === pendingRun && !pendingRun.cancelled) {
+                            void handleNativeGenerate(slot, generate);
+                        }
+                    });
                 }
             }
         }
