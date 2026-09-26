@@ -74,6 +74,150 @@
         "森林秘境场景", "未来都市场景", "温馨居家场景",
     ];
     let backgroundTimer = undefined;
+    let keepAliveBridge = null;
+
+    function createKeepAliveBridge() {
+        if (
+            typeof window.Worker !== "function"
+            || typeof window.Blob !== "function"
+            || typeof window.URL?.createObjectURL !== "function"
+        ) return null;
+        try {
+            const source = [
+                "const timers = new Map();",
+                "self.onmessage = function(event) {",
+                "  const message = event.data || {};",
+                "  if (message.type === 'interval') timers.set(message.id, setInterval(() => self.postMessage({id: message.id}), message.delay));",
+                "  if (message.type === 'timeout') timers.set(message.id, setTimeout(() => { self.postMessage({id: message.id}); timers.delete(message.id); }, message.delay));",
+                "  if (message.type === 'stop') { const timer = timers.get(message.id); clearInterval(timer); clearTimeout(timer); timers.delete(message.id); }",
+                "};",
+            ].join("\n");
+            const url = window.URL.createObjectURL(new window.Blob([source], { type: "text/javascript" }));
+            const worker = new window.Worker(url);
+            window.URL.revokeObjectURL(url);
+            const timers = new Map();
+            let sequence = 1 << 24;
+            const native = {
+                setTimeout: window.setTimeout.bind(window),
+                clearTimeout: window.clearTimeout.bind(window),
+                setInterval: window.setInterval.bind(window),
+                clearInterval: window.clearInterval.bind(window),
+                requestAnimationFrame: typeof window.requestAnimationFrame === "function"
+                    ? window.requestAnimationFrame.bind(window)
+                    : null,
+                cancelAnimationFrame: typeof window.cancelAnimationFrame === "function"
+                    ? window.cancelAnimationFrame.bind(window)
+                    : null,
+            };
+            const bridge = { native, failed: false };
+            const schedule = (type, callback, delay, args = []) => {
+                if (typeof callback !== "function") return native[type === "interval" ? "setInterval" : "setTimeout"](callback, delay, ...args);
+                if (bridge.failed) return native[type === "interval" ? "setInterval" : "setTimeout"](callback, delay, ...args);
+                const id = sequence++;
+                timers.set(id, { callback, args, repeat: type === "interval" });
+                worker.postMessage({
+                    type,
+                    id,
+                    delay: Math.max(type === "interval" ? 16 : 0, Number(delay) || 0),
+                });
+                return id;
+            };
+            const clear = (id, type) => {
+                const timer = timers.get(id);
+                if (!timer) {
+                    native[type === "interval" ? "clearInterval" : "clearTimeout"](id);
+                    return;
+                }
+                timers.delete(id);
+                if (bridge.failed) {
+                    native[type === "interval" ? "clearInterval" : "clearTimeout"](timer.nativeId);
+                } else {
+                    worker.postMessage({ type: "stop", id });
+                }
+            };
+            worker.onmessage = (event) => {
+                const timer = timers.get(event.data?.id);
+                if (!timer) return;
+                if (!timer.repeat) timers.delete(event.data.id);
+                timer.callback(...timer.args);
+            };
+            worker.onerror = () => {
+                bridge.failed = true;
+                for (const timer of timers.values()) {
+                    const fallback = timer.repeat ? native.setInterval : native.setTimeout;
+                    timer.nativeId = fallback(timer.callback, timer.repeat ? 500 : 0, ...timer.args);
+                }
+                worker.terminate();
+                window.__llmPromptStudioKeepAlive = false;
+            };
+            return {
+                ...bridge,
+                scheduleTimeout: (callback, delay, args) => schedule("timeout", callback, delay, args),
+                scheduleInterval: (callback, delay, args) => schedule("interval", callback, delay, args),
+                clearTimeout: (id) => clear(id, "timeout"),
+                clearInterval: (id) => clear(id, "interval"),
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    function enablePluginKeepAlive() {
+        if (keepAliveBridge) return !keepAliveBridge.failed;
+        keepAliveBridge = createKeepAliveBridge();
+        if (!keepAliveBridge) return false;
+        const { native } = keepAliveBridge;
+        window.setTimeout = function (callback, delay, ...args) {
+            return document.hidden && keepAliveBridge
+                ? keepAliveBridge.scheduleTimeout(callback, delay, args)
+                : native.setTimeout(callback, delay, ...args);
+        };
+        window.clearTimeout = function (id) {
+            if (keepAliveBridge) keepAliveBridge.clearTimeout(id);
+            else native.clearTimeout(id);
+        };
+        window.setInterval = function (callback, delay, ...args) {
+            return document.hidden && keepAliveBridge
+                ? keepAliveBridge.scheduleInterval(callback, delay, args)
+                : native.setInterval(callback, delay, ...args);
+        };
+        window.clearInterval = function (id) {
+            if (keepAliveBridge) keepAliveBridge.clearInterval(id);
+            else native.clearInterval(id);
+        };
+        if (native.requestAnimationFrame && native.cancelAnimationFrame) {
+            const pendingFrames = new Map();
+            let frameId = 1 << 24;
+            window.requestAnimationFrame = function (callback) {
+                if (!document.hidden) return native.requestAnimationFrame(callback);
+                const id = frameId++;
+                const channel = new MessageChannel();
+                channel.port1.onmessage = () => {
+                    if (!pendingFrames.delete(id)) return;
+                    callback(typeof window.performance?.now === "function" ? window.performance.now() : Date.now());
+                };
+                pendingFrames.set(id, channel);
+                channel.port2.postMessage(null);
+                return id;
+            };
+            window.cancelAnimationFrame = function (id) {
+                const channel = pendingFrames.get(id);
+                if (channel) {
+                    pendingFrames.delete(id);
+                    channel.port1.close();
+                    channel.port2.close();
+                    return;
+                }
+                native.cancelAnimationFrame(id);
+            };
+        }
+        try {
+            if (typeof opts !== "undefined" && opts && typeof opts === "object") opts.keep_alive = true;
+            if (window.opts && typeof window.opts === "object") window.opts.keep_alive = true;
+        } catch { /* Forge may expose opts as a non-writable global. */ }
+        window.__llmPromptStudioKeepAlive = true;
+        return true;
+    }
 
     function root() {
         return typeof gradioApp === "function" ? gradioApp() : document;
@@ -360,7 +504,8 @@
 
     function forgeKeepAliveEnabled() {
         const options = forgeOptions();
-        return Boolean(options?.keep_alive || window.__forgeKeepAliveActive);
+        if (window.__llmPromptStudioKeepAlive === false) return Boolean(window.__forgeKeepAliveActive);
+        return Boolean(options?.keep_alive || window.__forgeKeepAliveActive || window.__llmPromptStudioKeepAlive);
     }
 
     function isForgeBusy(tab, run = null) {
@@ -805,7 +950,8 @@
         let launchObserved = false;
         try {
             run.forgeLaunching = typeof afterClick === "function";
-            if (document.hidden && forgeOptions() && !forgeKeepAliveEnabled()) {
+            const keepAliveReady = enablePluginKeepAlive();
+            if (document.hidden && !keepAliveReady && !forgeKeepAliveEnabled()) {
                 throw new Error("Forge 未启用后台继续生成，请开启 keep_alive 后刷新页面");
             }
             // Consume this bypass only for the native click that is about to
