@@ -150,13 +150,11 @@
                 worker.terminate();
                 window.__llmPromptStudioKeepAlive = false;
             };
-            return {
-                ...bridge,
-                scheduleTimeout: (callback, delay, args) => schedule("timeout", callback, delay, args),
-                scheduleInterval: (callback, delay, args) => schedule("interval", callback, delay, args),
-                clearTimeout: (id) => clear(id, "timeout"),
-                clearInterval: (id) => clear(id, "interval"),
-            };
+            bridge.scheduleTimeout = (callback, delay, args) => schedule("timeout", callback, delay, args);
+            bridge.scheduleInterval = (callback, delay, args) => schedule("interval", callback, delay, args);
+            bridge.clearTimeout = (id) => clear(id, "timeout");
+            bridge.clearInterval = (id) => clear(id, "interval");
+            return bridge;
         } catch {
             return null;
         }
