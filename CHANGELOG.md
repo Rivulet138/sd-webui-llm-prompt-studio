@@ -2,6 +2,13 @@
 
 ## 2026-10-25
 
+### 前端清理
+
+- 删除 JS 里已无入口的“工作室前端提示词队列”分支（约 420 行）：`render` / `renderQueue`、队列存储与迁移、行选择与写回、驱动它的批量运行器（`generateBatch` / `runStored` / `generateAndRun`）、`cancel` 及 `beginRun` / `finishRun` / `ensureForgeIdle`。
+- 该分支早已无界面入口：Python 侧没有任何 `js=` 调用指向它，`llm_prompt_studio_auto_loop_status` / `_log` 两个 `elem_id` 在 Python 中从未定义，行选择函数也无调用方。
+- 保留内嵌面板共用的辅助函数（`waitForForgeGeneration`、`runForgeGeneration`、`isRejectedPrompt`、`promptRetryDelay`）与仍被调用的 API（`inlineOnce`、`cancelInline`、`syncCacheCursor`、`watchServerQueue`、`navigate`、`focusHandoff`、`readTxt2imgSettings`）。
+- `tests/test_auto_loop.cjs` 精简为仍有效的 4 组：定时器不被替换、隐藏页 Worker 调度、可见页原生调度、服务端队列渲染。
+
 ### 提示词页（新增）
 
 - 新增顶层「提示词」页：六层结构说明、批量多样性参数（配方开关与维度数、去重重试次数、内容相似度阈值、跨批次记忆、温度下限、自动折叠重复输入）、系统提示词预览、缓存库多样性统计。

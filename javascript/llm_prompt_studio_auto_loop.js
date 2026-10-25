@@ -1,9 +1,6 @@
 (function () {
     "use strict";
 
-    const QUEUE_KEY = "llm_prompt_studio_auto_loop_queue_v1";
-    const MAX_LOG_ROWS = 100;
-    const STATUS = Object.freeze({ pending: "pending", running: "running", completed: "completed" });
     const FAILURE_PATTERN = /fail|error|timeout|refused|interrupted|失败|错误|超时|拒绝|中断/i;
     const SUCCESS_PATTERN = /completed|finished|done|success|生成完成|已完成/i;
     const CONTENT_BLOCK_PATTERN = /(SFW|NSFW|安全|成人|内容).*(拦截|拒绝|阻止|blocked|safety)|blocked.*(SFW|safety)/i;
@@ -22,15 +19,8 @@
         return Math.min(500 * (2 ** Math.min(attempt, 4)), 5000);
     }
     const state = {
-        queue: [],
-        requestIds: new Set(),
         active: null,
         sequence: 0,
-        persistent: true,
-        lastSaveFailure: "",
-        lastBatchRowIds: [],
-        selectedRowIds: new Set(),
-        dispatchBusy: false,
     };
     const inlineRuns = { txt2img: null, img2img: null };
     const linkedRuns = { txt2img: null, img2img: null };
@@ -242,63 +232,12 @@
         return String(value ?? "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
     }
 
-    function normalizeStatus(value) {
-        return /completed|已完成/i.test(String(value || "")) ? STATUS.completed : STATUS.pending;
-    }
-
     function createId(prefix) {
         state.sequence += 1;
         return `${prefix}-${Date.now().toString(36)}-${state.sequence.toString(36)}`;
     }
 
-    function migrateQueue(stored) {
-        if (stored !== null && !Array.isArray(stored) && !Array.isArray(stored?.rows)) {
-            throw new Error("历史 Prompt 队列格式无效；原始存储已保留");
-        }
-        const sourceRows = Array.isArray(stored) ? stored : stored?.rows;
-        const preserveDistinctRows = !Array.isArray(stored) && Number(stored?.version || 0) >= 2;
-        const requestIds = new Set(Array.isArray(stored?.requestIds) ? stored.requestIds.map(canonicalPrompt).filter(Boolean) : []);
-        const rows = [];
-        const positions = new Map();
-        let duplicateCount = 0;
-        let emptyCount = 0;
-        for (const source of Array.isArray(sourceRows) ? sourceRows : []) {
-            const prompt = typeof source?.prompt === "string" ? source.prompt.trim() : "";
-            const promptKey = canonicalPrompt(prompt);
-            if (!promptKey) {
-                emptyCount += 1;
-                continue;
-            }
-            const requestId = canonicalPrompt(source.requestId);
-            if (requestId) requestIds.add(requestId);
-            const status = normalizeStatus(source.status);
-            if (!preserveDistinctRows && positions.has(promptKey)) {
-                duplicateCount += 1;
-                const existing = rows[positions.get(promptKey)];
-                if (status === STATUS.completed) existing.status = STATUS.completed;
-                if (!existing.requestId && requestId) existing.requestId = requestId;
-                continue;
-            }
-            if (!preserveDistinctRows) positions.set(promptKey, rows.length);
-            rows.push({
-                index: rows.length + 1,
-                id: String(source.id || createId("row")),
-                batchId: String(source.batchId || ""),
-                requestId,
-                prompt,
-                status,
-                selected: source.selected !== false,
-            });
-        }
-        return { rows, requestIds, duplicateCount, emptyCount };
-    }
 
-    function render(kind, headline, detail = "") {
-        const host = find("llm_prompt_studio_auto_loop_status");
-        if (!host) return;
-        const tone = kind === "success" ? "success" : kind === "error" ? "error" : "warning";
-        host.innerHTML = `<div class="lps-status lps-status--${tone}" role="status" aria-live="polite"><strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</div>`;
-    }
 
     function renderInline(slot, kind, headline, detail = "") {
         const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
@@ -312,64 +251,8 @@
         host.innerHTML = `<div class="lps-status lps-status--${tone}" role="status" aria-live="polite"><strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</div>`;
     }
 
-    function renderQueue() {
-        const host = find("llm_prompt_studio_auto_loop_log");
-        if (!host) return;
-        const rows = state.queue.slice(-MAX_LOG_ROWS);
-        const selected = state.queue.filter((row) => row.selected !== false).length;
-        const pending = state.queue.filter((row) => row.status !== STATUS.completed).length;
-        const summary = `<div class="lps-queue-summary" role="status" aria-live="polite"><strong>队列 ${state.queue.length} 条</strong><span>已选 ${selected} · 待生图 ${pending}</span></div>`;
-        host.innerHTML = rows.length
-            ? summary + rows.map((row) => `<label class="lps-auto-loop-row"><input type="checkbox" class="lps-auto-loop-select" data-row-id="${escapeHtml(row.id)}" ${row.selected !== false ? "checked" : ""}><span>${row.index}</span><span>${escapeHtml(row.status)}</span><code>${escapeHtml(row.prompt)}</code></label>`).join("")
-            : summary + '<div class="lps-auto-loop-empty">暂无已保存 Prompt。</div>';
-        host.querySelectorAll(".lps-auto-loop-select").forEach((checkbox) => {
-            checkbox.addEventListener("change", () => {
-                const row = state.queue.find((item) => item.id === checkbox.dataset.rowId);
-                if (row) row.selected = Boolean(checkbox.checked);
-                saveQueue();
-            });
-        });
-    }
 
-    function saveQueue() {
-        const payload = {
-            version: 2,
-            rows: state.queue,
-            requestIds: Array.from(state.requestIds),
-        };
-        try {
-            window.localStorage.setItem(QUEUE_KEY, JSON.stringify(payload));
-            state.persistent = true;
-            state.lastSaveFailure = "";
-            return true;
-        } catch (error) {
-            state.persistent = false;
-            state.lastSaveFailure = String(error?.name || "storage");
-            return false;
-        }
-    }
 
-    function loadQueue() {
-        try {
-            const storedValue = window.localStorage.getItem(QUEUE_KEY);
-            const migrated = migrateQueue(storedValue ? JSON.parse(storedValue) : null);
-            state.queue = migrated.rows;
-            state.requestIds = migrated.requestIds;
-            state.persistent = true;
-            state.lastSaveFailure = "";
-            renderQueue();
-            if (migrated.duplicateCount || migrated.emptyCount) {
-                render("warning", "历史 Prompt 队列已恢复", `已忽略 ${migrated.emptyCount} 条空记录，合并 ${migrated.duplicateCount} 条旧版重复记录`);
-            }
-        } catch (error) {
-            state.queue = [];
-            state.requestIds = new Set();
-            state.persistent = false;
-            state.lastSaveFailure = "invalid";
-            renderQueue();
-            render("error", "历史 Prompt 队列恢复失败", String(error?.message || error));
-        }
-    }
 
     function isControlShown(element) {
         if (!element) return false;
@@ -484,16 +367,6 @@
         return isForgeBusy(run.target, run);
     }
 
-    async function beginRun(phase, target = null) {
-        if (state.active) return null;
-        const run = {
-            id: createId("run"), phase, target, cancelled: false, forgeStarted: false, forgeTaskId: "",
-            basePrompts: Object.create(null), abortController: null,
-        };
-        state.active = run;
-        saveQueue();
-        return run;
-    }
 
     function assertActive(run) {
         const isCurrent = run.scope === "inline"
@@ -504,12 +377,6 @@
         if (run.cancelled || !isCurrent) throw new Error("已取消");
     }
 
-    function finishRun(run) {
-        if (state.active === run) {
-            state.active = null;
-            saveQueue();
-        }
-    }
 
     function beginInlineRun(slot, target) {
         if (inlineRuns[slot] || linkedRuns[slot]) return null;
@@ -532,61 +399,10 @@
         return run.basePrompts[target];
     }
 
-    function selectedRowIds() {
-        return state.queue.filter((row) => row.selected !== false).map((row) => row.id);
-    }
 
-    function selectAllRows() {
-        state.queue.forEach((row) => { row.selected = true; });
-        saveQueue();
-        renderQueue();
-        render("success", "已勾选全部 Prompt", "现在可以写入固定正面 Prompt 或投入队列生图");
-        return "已勾选全部 Prompt";
-    }
 
-    function clearSelectedRows() {
-        state.queue.forEach((row) => { row.selected = false; });
-        saveQueue();
-        renderQueue();
-        render("warning", "已清空 Prompt 勾选", "队列内容仍保留");
-        return "已清空 Prompt 勾选";
-    }
 
-    function writeSelectedToPositive() {
-        const ids = selectedRowIds();
-        if (!ids.length) return "请先勾选 Prompt";
-        const rows = state.queue.filter((row) => ids.includes(row.id) && row.status !== STATUS.completed);
-        if (!rows.length) return "所选 Prompt 已使用";
-        const targetInput = root().querySelector("#txt2img_prompt textarea, #txt2img_prompt input");
-        if (!targetInput) return "未找到固定正面 Prompt 框";
-        const text = rows.map((row) => row.prompt).join(", ");
-        setValue("txt2img_prompt", text);
-        // Writing a prompt is separate from running Forge, so keep the row
-        // pending and only clear the explicit selection.
-        rows.forEach((row) => { row.selected = false; });
-        saveQueue();
-        renderQueue();
-        return `已写入 ${rows.length} 条到正面 Prompt`;
-    }
 
-    function enqueuePrompt(prompt, request = "") {
-        const value = String(prompt || "").trim();
-        if (!value) throw new Error("LLM 未返回可用 Prompt");
-        const row = {
-            index: state.queue.length + 1,
-            id: createId("row"),
-            batchId: createId("batch"),
-            requestId: canonicalPrompt(request),
-            prompt: value,
-            status: STATUS.pending,
-            selected: true,
-        };
-        state.queue.push(row);
-        state.lastBatchRowIds.push(row.id);
-        saveQueue();
-        renderQueue();
-        return true;
-    }
 
     async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000, beforeLog = "", beforeOutput = "", launchObserved = false) {
         const statusHost = find(`${tab}_status`);
@@ -635,9 +451,6 @@
         throw new Error(`${tab} generation timeout; prompt returned to pending`);
     }
 
-    function ensureForgeIdle(target, run = null) {
-        if (isForgeBusy(target, run)) throw new Error(`${target} 当前已有生图任务`);
-    }
 
     function inlineId(slot, suffix) {
         return `llm_prompt_studio_${slot}_inline_${suffix}`;
@@ -1457,209 +1270,9 @@
         return `请围绕${topic}创作一条完整、可直接生图的单图 Prompt；主动补足动作、表情、服装、道具、环境、构图、镜头、时间天气和光线；本轮变化标识 ${nonce}`;
     }
 
-    async function generateBatch(config, parentRun = null) {
-        if (state.active && state.active !== parentRun) return "已有队列任务正在运行";
-            const parsed = parseRequests(config.request);
-            if (!parsed.requests.length) {
-                parsed.requests.push(randomInspirationRequest());
-                parsed.generatedInspiration = true;
-            }
-        const run = parentRun || await beginRun("llm");
-        if (!run) return "已有队列任务正在运行";
-        run.phase = "llm";
-        run.target = null;
-        const batchId = createId("batch");
-        state.lastBatchRowIds = [];
-        try {
-            for (const request of parsed.requests) {
-                assertActive(run);
-                const requestId = canonicalPrompt(request);
-                let prompt = "";
-                let accepted = false;
-                for (let attempt = 0; attempt < 3; attempt += 1) {
-                    const attemptRequest = parsed.generatedInspiration && attempt
-                        ? randomInspirationRequest(request)
-                        : request;
-                    try {
-                        prompt = await generateAutoLoopPrompt({ ...config, request: attemptRequest }, run);
-                    } catch (error) {
-                        assertActive(run);
-                        if (!config.continuous || !isRejectedPrompt(error)) throw error;
-                        render("warning", attempt < 2 ? "当前 Prompt 未通过校验，正在自动重试" : "当前请求已跳过，继续下一条",
-                            String(error?.message || error));
-                        await wait(promptRetryDelay(attempt));
-                        continue;
-                    }
-                    assertActive(run);
-                    accepted = true;
-                    break;
-                }
-                if (!accepted) continue;
-                state.requestIds.add(requestId);
-                const row = {
-                    index: state.queue.length + 1,
-                    id: createId("row"),
-                    batchId,
-                    requestId,
-                    prompt: prompt.trim(),
-                    status: STATUS.pending,
-                };
-                state.queue.push(row);
-                state.lastBatchRowIds.push(row.id);
-                saveQueue();
-                renderQueue();
-            }
-            const added = state.lastBatchRowIds.length;
-            const persistence = state.persistent ? "" : "；当前队列未持久化 (not persistent)";
-            const message = `Prompt 批量生成完成，新增 ${added} 条${persistence}`;
-            render("success", message, "所有非空结果均已保留");
-            return message;
-        } catch (error) {
-            const message = String(error?.message || error);
-            render(message === "已取消" ? "warning" : "error", "Prompt 批量生成已停止", message);
-            return message;
-        } finally {
-            if (!parentRun) finishRun(run);
-        }
-    }
 
-    async function runStored(config, rowIds = null, parentRun = null) {
-        if (state.active && state.active !== parentRun) return "已有队列任务正在运行";
-        const selectedIds = rowIds ? new Set(rowIds) : new Set(selectedRowIds());
-        const pending = state.queue.filter((row) => row.status !== STATUS.completed && selectedIds.has(row.id));
-        if (!pending.length) return "请先勾选待使用的 Prompt";
-        const target = config?.target === "img2img" ? "img2img" : "txt2img";
-        const mode = config.writeMode === "append" ? "append" : "replace";
-        const targetInput = root().querySelector(`#${target}_prompt textarea, #${target}_prompt input`);
-        if (!targetInput) throw new Error(`未找到 ${target} Prompt 输入框`);
-        const run = parentRun || await beginRun("forge", target);
-        if (!run) return "已有队列任务正在运行";
-        run.phase = "forge";
-        run.target = target;
-        const basePrompt = freezeBasePrompt(run, target, targetInput);
-        let currentRow = null;
-        let completed = 0;
-        try {
-            for (const row of pending) {
-                assertActive(run);
-                ensureForgeIdle(target, run);
-                currentRow = row;
-                row.status = STATUS.running;
-                renderQueue();
-                writePrompt(row.prompt, target, mode, basePrompt);
-                const generate = findButton(`${target}_generate`);
-                if (!generate) throw new Error(`未找到 ${target} 生图按钮`);
-                let forgeError = null;
-                for (let attempt = 1; attempt <= 3; attempt += 1) {
-                    try { await runForgeGeneration(target, run, generate); forgeError = null; break; }
-                    catch (error) {
-                        forgeError = error;
-                        const message = String(error?.message || error);
-                        const blocked = isContentBlocked(message);
-                        if (!blocked || attempt >= 3) break;
-                        render("warning", `内容拦截，自动重试第 ${attempt + 1} 次`, message);
-                        await new Promise((resolve) => setTimeout(resolve, 500));
-                        assertActive(run);
-                    }
-                }
-                if (forgeError) {
-                    const message = String(forgeError?.message || forgeError);
-                    const blocked = isContentBlocked(message);
-                    if (blocked) {
-                        row.status = STATUS.completed; row.selected = false; currentRow = null;
-                        saveQueue(); renderQueue(); render("warning", "内容被拦截，已跳过并继续", message); continue;
-                    }
-                    throw forgeError;
-                }
-                assertActive(run);
-                row.status = STATUS.completed;
-                row.selected = false;
-                currentRow = null;
-                completed += 1;
-                saveQueue();
-                renderQueue();
-            }
-            const message = `队列生图完成，共 ${completed} 条${state.persistent ? "" : "；状态未持久化 (not persistent)"}`;
-            render("success", message);
-            return message;
-        } catch (error) {
-            const message = String(error?.message || error);
-            render(message === "已取消" ? "warning" : "error", "队列生图已停止", message);
-            return message;
-        } finally {
-            if (currentRow?.status === STATUS.running) {
-                currentRow.status = STATUS.pending;
-                saveQueue();
-                renderQueue();
-            }
-            if (!parentRun) finishRun(run);
-        }
-    }
 
-    async function generateAndRun(config) {
-        if (state.active || state.dispatchBusy) return "已有队列任务正在运行";
-        state.dispatchBusy = true;
-        const run = await beginRun("llm");
-        if (!run) { state.dispatchBusy = false; return "已有队列任务正在运行"; }
-        const continuous = Boolean(config.continuous);
-        const parsedCycles = Number(config.cycles);
-        // Continuous mode accepts a finite 1-100 cycle count or an empty/zero value for
-        // unattended generation until the user presses Stop.
-        const cycleLimit = continuous
-            ? (Number.isFinite(parsedCycles) && parsedCycles > 0 ? Math.min(100, Math.floor(parsedCycles)) : null)
-            : 1;
-        let completedCycles = 0;
-        try {
-            while (cycleLimit === null || completedCycles < cycleLimit) {
-                assertActive(run);
-                const generated = await generateBatch({
-                    ...config,
-                    allowRepeat: true,
-                    allowDuplicateOutput: false,
-                }, run);
-                if (!String(generated).startsWith("Prompt 批量生成完成")) {
-                    return generated;
-                }
-                const rowIds = state.lastBatchRowIds.slice();
-                if (!rowIds.length) {
-                    if (!continuous) return "本轮没有新增 Prompt";
-                    render("warning", "本轮没有可用 Prompt，已跳过", "继续下一轮");
-                    await wait(500);
-                    assertActive(run);
-                }
-                if (rowIds.length && continuous && !config.promptOnly) {
-                    const forgeResult = await runStored(
-                        { target: config.target || "txt2img", writeMode: config.writeMode || "append" },
-                        rowIds,
-                        run,
-                    );
-                    if (!String(forgeResult).startsWith("队列生图完成")) return forgeResult;
-                }
-                completedCycles += 1;
-                if (continuous) render("success", `持续 Prompt 生成已完成 ${completedCycles} 轮`, cycleLimit === null ? "点击停止结束" : `计划 ${cycleLimit} 轮`);
-            }
-            return continuous ? `持续 Prompt 生成完成，共 ${completedCycles} 轮` : `Prompt 生成完成，共 ${completedCycles} 轮`;
-        } catch (error) {
-            const message = String(error?.message || error);
-            render(message === "已取消" ? "warning" : "error", "持续 Prompt 生成已停止", message);
-            return message;
-        } finally {
-            finishRun(run);
-            state.dispatchBusy = false;
-        }
-    }
 
-    function clearQueue() {
-        if (state.active) return "运行中不能清空队列";
-        state.queue = [];
-        state.requestIds.clear();
-        state.lastBatchRowIds = [];
-        const persisted = saveQueue();
-        renderQueue();
-        const message = persisted ? "已清空待生图队列" : "已清空内存队列；未持久化 (not persistent)";
-        render(persisted ? "success" : "warning", message);
-        return message;
-    }
 
     function navigateStudioTab(tabId) {
         const scope = root();
@@ -1744,49 +1357,20 @@
         return String(find("llm_prompt_studio_server_queue_status")?.textContent || "服务端队列已结束");
     }
 
-    function cancel() {
-        const run = state.active;
-        if (!run) return "当前没有运行中的任务";
-        run.cancelled = true;
-        run.abortController?.abort();
-        if (run.phase === "forge" && run.target) {
-            const interrupt = find(`${run.target}_interrupt`);
-            if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
-        }
-        render("warning", "正在取消当前阶段", "迟到结果不会写入队列");
-        return "正在取消当前阶段";
-    }
 
-    if (typeof window.addEventListener === "function") {
-        window.addEventListener("storage", (event) => {
-            if (event.key !== QUEUE_KEY || state.active) return;
-            loadQueue();
-        });
-    }
     installForgeInterruptHandlers();
     installNativeGenerateInterceptors();
     if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(() => {
         installForgeInterruptHandlers();
         installNativeGenerateInterceptors();
     });
-    loadQueue();
-    window.setTimeout(renderQueue, 1000);
     window.llmPromptStudioAutoLoop = {
-        generateBatch,
-        generateAndRun,
-        runStored,
         inlineOnce,
         cancelInline,
         syncCacheCursor,
         watchServerQueue,
-        clearQueue,
-        selectAllRows,
-        clearSelectedRows,
-        writeSelectedToPositive,
         navigate: navigateStudioTab,
         focusHandoff,
-        cancel,
-        start: generateBatch,
         readTxt2imgSettings,
     };
 })();
