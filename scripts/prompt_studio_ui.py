@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import html
 import ipaddress
+import itertools
 import json
 import logging
 import random
@@ -23,6 +23,12 @@ from prompt_studio_wd14 import (
 )
 from prompt_studio_tagger_models import MODEL_CATALOG, download_links, download_model, model_directory
 from prompt_studio_image_batch import ImageBatchJob
+from prompt_studio_diversity import (
+    CONCEPT_ALIASES as _DIVERSITY_CONCEPT_ALIASES,
+    SKELETON_WORDS as _DIVERSITY_SKELETON_WORDS,
+    STOP_TOKENS as _DIVERSITY_STOP_TOKENS,
+    duplicate_clusters as _duplicate_clusters,
+)
 
 from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, MODEL_QUALITY_GUIDANCE, PRESETS, PROCESSED_DB_PATH, PROVIDER_PROFILES, CredentialStore, StudioDB,
@@ -42,6 +48,24 @@ _NATIVE_CACHE_CONTEXT_LOCK = threading.RLock()
 _NATIVE_CACHE_CONTEXT_TTL = 30 * 60
 _STYLE_PATH = Path(__file__).resolve().parents[1] / "style.css"
 UI_CSS = _STYLE_PATH.read_text(encoding="utf-8") if _STYLE_PATH.is_file() else ""
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    """Parse JSON/form booleans without treating the string ``false`` as true."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().casefold()
+    if text in {"true", "1", "yes", "y", "on", "是", "启用", "开启"}:
+        return True
+    if text in {"false", "0", "no", "n", "off", "否", "禁用", "关闭", ""}:
+        return False
+    return bool(default)
+
+
 DEFAULT_LLM_SETTINGS = {
     "provider": "OpenAI Compatible",
     "endpoint": "http://127.0.0.1:1234/v1",
@@ -63,30 +87,36 @@ DEFAULT_LLM_SETTINGS = {
     "model_version": "",
 }
 LLM_CONNECTION_SETTINGS_VERSION = 7
+HANDOFF_INFERENCE_SETTINGS_VERSION = 1
+PROCESSED_CACHE_INFERENCE_SETTINGS_VERSION = 1
+MAX_SERVER_QUEUE_REQUESTS = 5000
 GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创作一条全新、独立成图的日系插画方向。
 
-保留主体身份、用户明确固定特征、LoRA/权重和内容限制；场景、动作、构图、服装、道具、时间、天气和光线由模型自由选择。批量结果应自然地彼此不同，避免只改同义词、颜色、质量词或标签顺序；不要套用固定场景清单，也不要强行改变用户明确指定的元素。静态词库只作参考，用于补充兼容且可见的词汇，不要堆砌无关元素。
-
-本要求只定义内容方向，不定义输出语言、标签/自然语言格式、字段顺序或结构化协议。以上格式与目标模型适配完全遵循当前选中的 System Prompt 预设。"""
+必须保留：主体身份、用户明确固定的特征与限制，以及固定 Prompt 里的权重与技术标记。
+可自由选择：场景、动作、构图、服装、道具、时间、天气、光线与配色。
+每条只写一个画面：不写分镜、拼图、多面板，也不写备选方案。
+批量要求：各条在场景/动作/道具/光线上明显不同，不要只改同义词、颜色或标签顺序，也不要套用固定场景清单。
+长度与格式：遵守当前输出预设规定的字数和字段顺序；不新增风格、媒介、画质或艺术家词。
+静态词库只作参考，仅在贴合画面时取用，不要堆砌无关元素。"""
 KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 生成一组可直接用于扩散模型的兽耳幼态可爱角色单图 Prompt。
 
-参考图共同方向：每条只包含一个单个可见角色和一个完整瞬间。保持自然头身比例、精致大眼、柔和表情、清晰兽耳、蓬松尾巴、完整得体的服装与配饰。明确描写角色外观、服装、动作、表情、地点、关键道具及互动、前景/中景/背景、空间层次、镜头、时间或天气、光照和主色彩；动作、姿态、手脚、耳朵、尾巴、视线、道具和环境必须相互协调，背景只服务于主体和空间感。保留用户明确的 LoRA 或触发词。
-
-批次规划：批次中的每条至少改变三项高层因素（至少三类高层因素：地点、动作、服装、道具、时间/天气、镜头或色彩），形成不同的生活化事件；避免只改颜色、耳型、地点名或同义词，避免重复构图和道具组合。静态词库仅在符合画面时选用。
-
-固定 Prompt、用户要求和安全限制优先，新增内容不得覆盖或改变它们。禁止输出分镜、拼图、多面板；每条都是完整得体的单图 Prompt。"""
-KREA_ANIMA_POLISH_ROLE = """Role: Krea2 & Anima extreme-detail expansion prompt engineer for Japanese light-novel illustrations.
+共同方向：每条只包含一个可见角色和一个完整瞬间；保持自然头身比例、精致大眼、柔和表情、清晰兽耳、蓬松尾巴、完整得体的服装与配饰。
+每条写清：外观、服装、动作、表情、地点、关键道具及互动、前景/中景/背景、空间层次、镜头、时间或天气、光照与主色彩；动作、姿态、手脚、耳尾、视线、道具与环境必须相互协调，背景只服务于主体与空间感。
+批次规划：每条至少在三类高层因素上不同（地点、动作、服装、道具、时间/天气、镜头、色彩），形成不同的生活化事件；避免只改颜色、耳型、地点名或同义词，避免重复构图与道具组合。
+优先级：固定 Prompt、用户要求与安全限制优先，新增内容不得覆盖或改变它们。
+只写单图：禁止分镜、拼图、多面板；遵守当前输出预设的字数与格式；不新增风格、媒介、画质或艺术家词。"""
+KREA_ANIMA_POLISH_ROLE = """Role: Krea 2 / Anima detail-expansion prompt editor. Turn the input into one complete image prompt by decomposing visible elements instead of summarising them.
 
 Task: From the user's text, tags, or reference image description, produce one complete image prompt in the selected output language. Detail is the highest priority. Actively decompose every useful visible element instead of giving a short summary.
 
 Core requirements:
 - Describe hair movement, hair strands, head accessories, facial details, clothing layers, ornaments, handheld objects, floating objects, material surfaces, highlights, shadows, and spatial relationships.
 - Distinguish tactile materials such as smooth satin, soft lace, plush fur, brushed fabric, polished metal, glass, paper, wood, leather, and translucent surfaces. State how light reacts to each material when it matters.
-- Strengthen motion and cinematic storytelling through body weight, balance, hand placement, gaze direction, wind-driven hair and fabric, object motion, depth, and the small event happening in this exact frame.
+- Strengthen motion and spatial storytelling through body weight, balance, hand placement, gaze direction, wind-driven hair and fabric, object motion, depth, and the small event happening in this exact frame.
 - Allow rich detail density and tasteful decorative complexity, but omit unrelated clutter and contradictory elements.
 - When the source is sparse, add reasonable visible clothing, props, environment, lighting, and material detail that supports the subject and scene. Never invent a separate subject or unrelated setting.
 - The provided static vocabulary lexicon is optional reference data only. Use zero or more entries when they fit the source and selected model; never copy, combine, or force a term merely because it appears in the lexicon, and ignore unrelated entries.
-- Aim for a polished Japanese light-novel illustration: refined character design, vivid but coherent color, clear material response, commercial finish, camera awareness, and emotional tension.
+- Keep the description concrete and coherent: refined character design, consistent color, clear material response, camera awareness and visible emotional cues. Never name a style, medium, studio, artist or quality level.
 
 Anti-lazy rules:
 - Never return a short, generic, high-level, or evasive description.
@@ -99,6 +129,7 @@ Output rules:
 - Do not use weight syntax such as (text:1.2) or any other weighting syntax.
 - Tags must be lowercase. Keep the requested anchor tags and separate tag items clearly.
 - Detail is preferred over vague quality words, but every added detail must serve the visible image.
+- Stay within the selected output profile's length budget: add the detail that changes what is seen, and do not pad with adjectives or repeated ideas.
 
 Each result must be one complete image, not a storyboard, collage, or list of alternatives.
 
@@ -137,10 +168,14 @@ SUBJECT
 Use long but clear English sentences to confirm the subject's appearance, clothing, key accessories, props, pose, and main material qualities.
 
 MASTER DESCRIPTION
-Write one high-density natural-language paragraph that recombines all important details. Emphasize layered decoration, movement, camera, light, material texture, color relationships, depth, and the small story implied by the frame. Do not make it a short summary."""
+Write one high-density natural-language paragraph that recombines all important details. Emphasize layered decoration, movement, camera, light, material texture, color relationships, depth, and the small event implied by the frame. Do not make it a short summary; this paragraph must also work on its own as the final image prompt."""
 INLINE_DELTA_DIRECTIVE = """INLINE PROMPT CONTRACT:
 Never echo the source Prompt twice.
-When FIXED PROMPT is non-empty, it is immutable source text. Return ONLY one concise English expansion to append after it, never a rewritten or repeated source prompt. Do not alter, interpret, translate, duplicate, or include any LoRA tag (<lora:...>) or trigger token from the fixed prompt in your expansion; those technical tokens are excluded from semantic variation. Add concrete, visible, spatially compatible details and vary action, environment, camera, composition, lighting, atmosphere, or materials without contradicting fixed text. When FIXED PROMPT is empty, return one complete directly usable English image prompt that follows the user's request. In both cases output only the prompt text, with no title, explanation, analysis, alternatives, or meta commentary."""
+When FIXED PROMPT is non-empty it is immutable source text: return ONLY one concise English expansion to append after it, never a rewritten or repeated source prompt.
+Do not alter, translate, duplicate or include any technical token (for example <lora:...>) or trigger word from the fixed prompt; those are excluded from semantic variation.
+Vary action, environment, camera, composition, lighting, atmosphere or materials without contradicting the fixed text, and stay inside the output profile's length budget.
+When FIXED PROMPT is empty, return one complete, directly usable English image prompt that follows the user's request.
+Either way: prompt text only — no title, explanation, analysis, alternatives or meta commentary."""
 PRESET_UI_CHOICES = [
     ("Danbooru 标签", "Danbooru Tags"),
     ("Pony / Illustrious 标签", "Pony / Illustrious Tags"),
@@ -311,11 +346,12 @@ _VARIATION_DIMENSIONS = (
 )
 _BATCH_VARIATION_FOCI = _VARIATION_DIMENSIONS  # Backward-compatible test/API name; selection is no longer cyclic.
 _COMPLETE_PROMPT_CONTRACT = (
-    "Complete prompt contract: preserve every source-fixed subject, identity, tag, and restriction. "
-    "Always keep the fixed subject and add a compact minimum of visible grounding: choose at least two useful details from action/pose, expression, environment, props, composition/camera, time/weather, or lighting. "
-    "Use the selected output profile and let the model decide which other visible dimensions need detail for this image; "
-    "add only compatible clothing, environment, props, composition, camera, time, weather, or lighting when useful. "
-    "Keep one coherent single image and return the prompt without alternatives or explanation; do not force a checklist, storyboard, or collage."
+    "Complete prompt contract: keep every source-fixed subject, identity, tag and restriction. "
+    "Make the recipe items visible, and choose enough visible grounding for this image "
+    "(action, expression, environment, props, composition, camera, time, weather, light) "
+    "instead of a generic summary. "
+    "Follow the selected output profile's format and length budget; one coherent single image per item, "
+    "no checklist, storyboard or collage."
 )
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
@@ -328,28 +364,30 @@ _MAX_RESPONSE_RETRIES = 1
 _DIVERSITY_MEMORY_SIZE = 64
 _DIVERSITY_REFERENCE_LIMIT = 10
 _DIVERSITY_LEDGER_LIMIT = 18
-_DIVERSITY_STOP_TOKENS = frozenset({
-    "a", "an", "and", "anime", "art", "best", "background", "character", "clothes", "clothing",
-    "color", "composition", "cute", "detailed", "expression", "face", "girl", "hair", "image",
-    "illustration", "japanese", "light", "lighting", "masterpiece", "outfit", "pose", "quality",
-    "scene", "setting", "subject", "style", "the", "very", "visual", "weather", "with",
-    "anchors", "backgrounds", "break", "description", "detail", "details", "extreme", "layered",
-    "master", "part", "paragraph", "props", "reference", "section", "tags", "three", "two", "use",
-})
-_DIVERSITY_CONCEPT_ALIASES = {
-    "stand": "stand", "standing": "stand", "wait": "stand", "waiting": "stand", "stroll": "walk",
-    "walk": "walk", "walking": "walk", "step": "walk", "stepping": "walk",
-    "run": "run", "running": "run", "sprint": "run", "sprinting": "run",
-    "sit": "sit", "sitting": "sit", "seated": "sit", "kneel": "kneel", "kneeling": "kneel",
-    "hold": "hold", "holding": "hold", "carry": "hold", "carrying": "hold", "grip": "hold", "gripping": "hold",
-    "look": "gaze", "looking": "gaze", "gaze": "gaze", "gazing": "gaze", "stare": "gaze", "staring": "gaze",
-    "smile": "smile", "smiling": "smile", "grin": "smile", "grinning": "smile",
-    "laugh": "laugh", "laughing": "laugh", "giggle": "laugh", "giggling": "laugh",
-    "portrait": "portrait", "closeup": "portrait", "close_up": "portrait", "headshot": "portrait",
-    "fullbody": "fullbody", "full_body": "fullbody", "wide_shot": "wide_shot", "long_shot": "wide_shot",
-    "front_facing": "front_facing", "three_quarter": "three_quarter", "low_angle": "low_angle", "high_angle": "high_angle",
-    "temple": "shrine", "shrine": "shrine", "sanctuary": "shrine", "shrine_gate": "shrine",
-    "umbrella": "umbrella", "parasol": "umbrella", "rain_umbrella": "umbrella",
+# Shared subject and format vocabulary, concept aliases and stop words live in
+# prompt_studio_diversity: the runtime duplicate gate and the measurement report
+# import the same tables, so "gate passes" and "report looks good" cannot drift
+# apart. Only the tokenisation of the skeleton string happens here.
+_DIVERSITY_SKELETON_TOKENS = frozenset(
+    token for token in re.split(r"[^a-z0-9_]+", _DIVERSITY_SKELETON_WORDS.lower()) if token
+)
+# Content-only similarity ceiling. Calibrated on the stored 312-prompt batch:
+# content cosine (skeleton removed) is 0.28 on average and 0.45 at p90, while the
+# worst match against the previous ten items averages 0.46, so 0.55 retries only
+# clearly repetitive items instead of the whole batch.
+_MAX_CONTENT_SIMILARITY = 0.55
+_DIVERSITY_SETTINGS_KEY = "prompt_diversity_v1"
+_DIVERSITY_MEMORY_SETTING = "prompt_diversity_memory_v1"
+_DIVERSITY_SETTINGS_DEFAULTS = {
+    "recipe_enabled": True,
+    "recipe_dimensions": 3,
+    "retry_limit": 1,
+    "similarity_threshold": _MAX_CONTENT_SIMILARITY,
+    "memory_enabled": True,
+    "memory_sources": 6,
+    "memory_per_source": 16,
+    "batch_temperature_floor": False,
+    "source_fold_duplicates": False,
 }
 _RECENT_BATCH_OUTPUTS: dict[str, list[str]] = {}
 _RECENT_BATCH_OUTPUTS_LOCK = threading.Lock()
@@ -379,8 +417,11 @@ def _choose_variation_lenses(used: set[str] | None = None, count: int = 2) -> tu
     return tuple(chosen)
 
 
-def _independent_batch_directive(sequence: int = 0, used_lenses: set[str] | None = None) -> str:
-    """Create a compact directive; batch memory and underused lenses drive diversity."""
+def _independent_batch_directive(
+    sequence: int = 0, used_lenses: set[str] | None = None,
+    recipe: Iterable[tuple[str, str, str]] | None = None,
+) -> str:
+    """Create a compact directive; batch memory, underused lenses and a sampled recipe drive diversity."""
     global _independent_batch_sequence
     requested_sequence = int(sequence or 0)
     if requested_sequence > 0:
@@ -397,10 +438,14 @@ def _independent_batch_directive(sequence: int = 0, used_lenses: set[str] | None
         "choose fresh compatible details and avoid repeated concepts, actions, and props from the diversity ledger. Do not vary only style, quality words, synonyms, or tag order. "
         "Use static vocabulary only as a reference. "
         f"独立请求标识: {nonce}."
+        + _recipe_directive_block(recipe)
     )
 
 
-def _independent_creative_directive(sequence: int = 0, used_lenses: set[str] | None = None) -> str:
+def _independent_creative_directive(
+    sequence: int = 0, used_lenses: set[str] | None = None,
+    recipe: Iterable[tuple[str, str, str]] | None = None,
+) -> str:
     """Create the compact inline variation and conditional-completeness contract."""
     global _independent_creative_sequence
     requested_sequence = int(sequence or 0)
@@ -417,6 +462,7 @@ def _independent_creative_directive(sequence: int = 0, used_lenses: set[str] | N
         f"Optional underused variation lenses: {', '.join(lenses)}. Reinterpret them freely and avoid repeated concepts from the diversity ledger. "
         "Use static vocabulary only as a reference. "
         f"Independent request id: {nonce}."
+        + _recipe_directive_block(recipe)
     )
 
 
@@ -452,14 +498,18 @@ def _distinctive_overlap(left: str, right: str, stable_source: str = "") -> floa
     return len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
 
 
-def _is_diversity_duplicate(left: str, right: str, stable_source: str = "") -> bool:
-    """Catch both near-copy prompts and long prompts sharing the same key concepts."""
-    if _prompt_similarity(left, right, stable_source) >= _MAX_BATCH_SIMILARITY:
-        return True
-    left_tokens = _distinctive_tokens(left, stable_source)
-    right_tokens = _distinctive_tokens(right, stable_source)
-    common = len(left_tokens & right_tokens)
-    return common >= _MIN_DISTINCTIVE_COMMON and _distinctive_overlap(left, right, stable_source) >= _MIN_DISTINCTIVE_OVERLAP
+def _is_diversity_duplicate(left: str, right: str, stable_source: str = "", threshold: float | None = None) -> bool:
+    """True when two prompts describe the same content once the shared skeleton is gone.
+
+    Near-copies, and long prompts that only reword the same place, prop, action and
+    palette, land above the content threshold; prompts that genuinely change one of
+    those dimensions do not. The previous token-overlap clause is gone because the
+    subject skeleton made it fire on every observed pair.
+    """
+    if not str(left or "").strip() or not str(right or "").strip():
+        return False
+    limit = _MAX_CONTENT_SIMILARITY if threshold is None else float(threshold)
+    return _content_similarity(left, right, stable_source) >= limit
 
 
 def _diversity_exclusion_terms_from_outputs(
@@ -476,28 +526,326 @@ def _diversity_exclusion_terms_from_outputs(
 
 
 def _remember_diverse_output(source: str, prompt: str, force: bool = False) -> bool:
-    """Reject near-identical outputs for the same repeated batch request."""
-    key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
+    """Record an accepted output so later items in the run can differ from it."""
+    text = str(prompt or "").strip()
+    if not text:
+        return False
+    _load_diversity_memory()
+    key = _diversity_memory_key(source)
     with _RECENT_BATCH_OUTPUTS_LOCK:
         previous = _RECENT_BATCH_OUTPUTS.setdefault(key, [])
-        duplicate = any(_is_diversity_duplicate(prompt, item, source) for item in previous)
+        duplicate = any(_is_diversity_duplicate(text, item, source) for item in previous)
         if not duplicate or force:
-            previous.append(prompt)
+            previous.append(text)
             del previous[:-_DIVERSITY_MEMORY_SIZE]
-        return not duplicate
+    if not duplicate or force:
+        _diversity_memory_touch(key)
+        _persist_diversity_memory()
+    return not duplicate
 
 
 def _recent_diverse_outputs(source: str, limit: int = _DIVERSITY_REFERENCE_LIMIT) -> list[str]:
-    key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
+    _load_diversity_memory()
+    key = _diversity_memory_key(source)
     with _RECENT_BATCH_OUTPUTS_LOCK:
         return list(_RECENT_BATCH_OUTPUTS.get(key, [])[-max(1, int(limit or 1)):])
 
 
 def _diversity_exclusion_terms(source: str, limit: int = _DIVERSITY_LEDGER_LIMIT) -> list[str]:
-    key = hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
+    _load_diversity_memory()
+    key = _diversity_memory_key(source)
     with _RECENT_BATCH_OUTPUTS_LOCK:
         previous = list(_RECENT_BATCH_OUTPUTS.get(key, []))
     return _diversity_exclusion_terms_from_outputs(previous, source, limit)
+
+
+def _diversity_int(value: Any, default: int, lower: int, upper: int) -> int:
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(lower, min(parsed, upper))
+
+
+def _diversity_float(value: Any, default: float, lower: float, upper: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed != parsed:  # NaN
+        parsed = default
+    return max(lower, min(parsed, upper))
+
+
+def _diversity_settings() -> dict[str, Any]:
+    """Return the diversity layer settings, tolerant of a missing or corrupt store.
+
+    Every switch lives in one settings record (prompt_diversity_v1) so the layer
+    can be tuned or disabled without touching call sites; unknown or malformed
+    values fall back to the conservative defaults above.
+    """
+    stored: Any = {}
+    try:
+        stored = DB.get_setting(_DIVERSITY_SETTINGS_KEY, {}) or {}
+    except Exception:
+        LOGGER.exception("读取多样性设置失败，使用默认值")
+    merged = dict(_DIVERSITY_SETTINGS_DEFAULTS)
+    if isinstance(stored, dict):
+        merged.update({key: value for key, value in stored.items() if key in merged})
+    return {
+        "recipe_enabled": _coerce_bool(merged.get("recipe_enabled"), True),
+        "recipe_dimensions": _diversity_int(merged.get("recipe_dimensions"), 3, 1, 6),
+        "retry_limit": _diversity_int(merged.get("retry_limit"), 1, 0, _MAX_DIVERSITY_RETRIES),
+        "similarity_threshold": _diversity_float(
+            merged.get("similarity_threshold"), _MAX_CONTENT_SIMILARITY, 0.2, 0.95),
+        "memory_enabled": _coerce_bool(merged.get("memory_enabled"), True),
+        "memory_sources": _diversity_int(merged.get("memory_sources"), 6, 1, 32),
+        "memory_per_source": _diversity_int(
+            merged.get("memory_per_source"), 16, 1, _DIVERSITY_MEMORY_SIZE),
+        "batch_temperature_floor": _coerce_bool(merged.get("batch_temperature_floor"), False),
+        "source_fold_duplicates": _coerce_bool(merged.get("source_fold_duplicates"), False),
+    }
+
+
+def _content_similarity(left: str, right: str, stable_source: str = "") -> float:
+    """Cosine over content tokens only; the shared subject/format skeleton is removed."""
+    left_tokens = _canonical_diversity_tokens(str(left or ""))
+    right_tokens = _canonical_diversity_tokens(str(right or ""))
+    stable = _canonical_diversity_tokens(stable_source)
+    left_tokens = left_tokens - stable
+    right_tokens = right_tokens - stable
+    for token in _DIVERSITY_SKELETON_TOKENS:
+        left_tokens.pop(token, None)
+        right_tokens.pop(token, None)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return _cosine(left_tokens, right_tokens)
+
+
+def _worst_content_similarity(candidate: str, context: Iterable[str], stable_source: str = "") -> float:
+    """Highest content overlap between the candidate and a batch's earlier outputs."""
+    worst = 0.0
+    for item in context or ():
+        text = str(item or "").strip()
+        if not text:
+            continue
+        worst = max(worst, _content_similarity(candidate, text, stable_source))
+    return worst
+
+
+_DIVERSITY_MEMORY_LOCK = threading.Lock()
+_DIVERSITY_MEMORY_LOADED = False
+_DIVERSITY_MEMORY_TOUCHED: list[str] = []
+_RECIPE_USED_TERMS_LOCK = threading.Lock()
+_RECIPE_USED_TERMS: set[str] = set()
+_RECIPE_USED_TERMS_LIMIT = 800
+
+
+def _diversity_memory_key(source: str) -> str:
+    return hashlib.sha256(str(source or "").strip().encode("utf-8")).hexdigest()
+
+
+def _load_diversity_memory() -> None:
+    """Restore the persisted cross-process memory once per process."""
+    global _DIVERSITY_MEMORY_LOADED
+    with _DIVERSITY_MEMORY_LOCK:
+        if _DIVERSITY_MEMORY_LOADED:
+            return
+        # Mark first: a failing store must not retry on every generated prompt.
+        _DIVERSITY_MEMORY_LOADED = True
+        try:
+            stored = DB.get_setting(_DIVERSITY_MEMORY_SETTING, {}) or {}
+        except Exception:
+            LOGGER.exception("读取多样性记忆失败")
+            return
+    if not isinstance(stored, dict):
+        return
+    with _RECENT_BATCH_OUTPUTS_LOCK:
+        for key, values in stored.items():
+            if not isinstance(values, list) or key in _RECENT_BATCH_OUTPUTS:
+                continue
+            cleaned = [str(value).strip()[:600] for value in values if str(value).strip()]
+            if cleaned:
+                _RECENT_BATCH_OUTPUTS[str(key)] = cleaned[-_DIVERSITY_MEMORY_SIZE:]
+
+
+def _diversity_memory_touch(key: str) -> None:
+    with _DIVERSITY_MEMORY_LOCK:
+        if key in _DIVERSITY_MEMORY_TOUCHED:
+            _DIVERSITY_MEMORY_TOUCHED.remove(key)
+        _DIVERSITY_MEMORY_TOUCHED.insert(0, key)
+        del _DIVERSITY_MEMORY_TOUCHED[32:]
+
+
+def _persist_diversity_memory() -> None:
+    """Write the bounded recent-output memory back; never fatal for generation."""
+    settings = _diversity_settings()
+    if not settings["memory_enabled"]:
+        return
+    sources = int(settings["memory_sources"])
+    per_source = int(settings["memory_per_source"])
+    with _RECENT_BATCH_OUTPUTS_LOCK:
+        snapshot = {key: list(values) for key, values in _RECENT_BATCH_OUTPUTS.items() if values}
+    if not snapshot:
+        return
+    with _DIVERSITY_MEMORY_LOCK:
+        order = [key for key in _DIVERSITY_MEMORY_TOUCHED if key in snapshot]
+    order += [key for key in snapshot if key not in order]
+    payload = {
+        key: [item[:600] for item in snapshot[key][-per_source:]]
+        for key in order[:sources]
+    }
+    try:
+        DB.set_setting(_DIVERSITY_MEMORY_SETTING, payload)
+    except Exception:
+        LOGGER.exception("写入多样性记忆失败")
+
+
+# One lexicon category family per visual dimension. Clothing, hair, eyes and
+# other identity categories stay out on purpose: the plugin already treats a
+# fixed subject and its attributes as locked, so a recipe must never rewrite them.
+_RECIPE_DIMENSION_RULES = (
+    ("action", ("动作",), ("姿势", "运动")),
+    ("setting", ("场景",), ("环境",)),
+    ("prop", ("物品",), ()),
+    ("expression", ("表情",), ()),
+    ("light", ("光影", "光线", "天气"), ("天空",)),
+    ("camera", ("镜头", "视角", "构图"), ()),
+    ("palette", ("颜色",), ()),
+)
+_RECIPE_EXCLUDED_CATEGORY_HINTS = (
+    "人物", "角色", "服饰", "服装", "头发", "眼睛", "眉毛", "表情包", "袜子", "鞋子",
+)
+_RECIPE_LABELS = {
+    "action": "action or pose",
+    "setting": "setting or location",
+    "prop": "prop or visible object",
+    "expression": "facial expression",
+    "light": "time of day, weather or light",
+    "camera": "camera framing",
+    "palette": "dominant color accent",
+}
+
+
+def _recipe_schedule(sequence: int, seed: int = 0, count: int | None = None) -> tuple[str, ...]:
+    """Coverage-balanced dimension choice for item N of one batch.
+
+    Picking each item's dimensions independently lets four of eight items land in
+    the same mix. Walking a shuffled list of every combination instead gives the
+    first C(dimensions, size) items a fully distinct mix, which is the cheapest
+    way to raise the effective number of distinct items a batch can produce
+    (the same argument the Vendi Score / effective-dimension work makes for
+    measuring and enforcing coverage).
+    """
+    settings = _diversity_settings()
+    requested = int(settings["recipe_dimensions"] if count is None else count)
+    dimensions = [dimension for dimension, _keywords, _extra in _RECIPE_DIMENSION_RULES]
+    size = max(1, min(requested, len(dimensions)))
+    combos = list(itertools.combinations(dimensions, size))
+    if not combos:
+        return ()
+    order = random.Random(int(seed)).sample(combos, len(combos))
+    return tuple(order[(max(1, int(sequence)) - 1) % len(order)])
+
+
+def _weighted_category(sampler, names: list[str], groups: dict[str, list[str]]) -> str:
+    """Pick a category with probability inversely proportional to its term count.
+
+    Without this, a 326-term pool (物品) dominates an 18-term pool (颜色) simply
+    because it has more tickets in the draw, so the recipe concentrates on the
+    same few dimensions across a long batch.
+    """
+    weights = [1.0 / max(1, len(groups[name])) for name in names]
+    return sampler.choices(names, weights=weights, k=1)[0]
+
+
+def _lexicon_recipe(
+    used_terms: set[str] | None = None, count: int | None = None,
+    dimensions: Iterable[str] | None = None,
+) -> list[tuple[str, str, str]]:
+    """Sample one local-lexicon term per independent visual dimension for one item.
+
+    This is the deterministic half of the diversity design: the recipe is decided
+    in code from the indexed lexicon, so a batch cannot collapse onto one scene
+    before the model is even called. Batch callers pass their own used-term set
+    and the coverage plan from ``_recipe_schedule``.
+    """
+    settings = _diversity_settings()
+    if not settings["recipe_enabled"]:
+        return []
+    requested = int(settings["recipe_dimensions"] if count is None else count)
+    planned = [str(item) for item in (dimensions or ()) if str(item)]
+    try:
+        groups = DB.wildcard_terms_by_category()
+    except Exception:
+        LOGGER.exception("读取静态词库失败，跳过配方抽样")
+        return []
+    if not groups:
+        return []
+    used = used_terms
+    if used is None:
+        with _RECIPE_USED_TERMS_LOCK:
+            used = _RECIPE_USED_TERMS
+    if len(used) > _RECIPE_USED_TERMS_LIMIT:
+        used.clear()
+    sampler = random.SystemRandom()
+    pools: list[tuple[str, list[str]]] = []
+    for dimension, keywords, extra in _RECIPE_DIMENSION_RULES:
+        names = [
+            name for name in groups
+            if any(key in name for key in (*keywords, *extra))
+            and not any(blocked in name for blocked in _RECIPE_EXCLUDED_CATEGORY_HINTS)
+            and groups[name]
+        ]
+        if names:
+            pools.append((dimension, names))
+    if planned:
+        by_dimension = dict(pools)
+        pools = [(dimension, by_dimension[dimension]) for dimension in planned if dimension in by_dimension]
+    else:
+        sampler.shuffle(pools)
+        requested = max(1, requested)
+    picks: list[tuple[str, str, str]] = []
+    claimed: set[str] = set()
+    for dimension, names in pools:
+        if not planned and len(picks) >= requested:
+            break
+        candidates = [name for name in names if name not in claimed]
+        while candidates:
+            name = _weighted_category(sampler, candidates, groups)
+            candidates.remove(name)
+            values = [term for term in groups[name] if term.casefold() not in used]
+            if not values:
+                continue
+            term = sampler.choice(values)
+            used.add(term.casefold())
+            claimed.add(name)
+            picks.append((dimension, name, term))
+            break
+    return picks
+
+
+def _recipe_directive_block(recipe: Iterable[tuple[str, str, str]] | None) -> str:
+    """Render a sampled recipe as a system-controlled per-item requirement."""
+    items = [item for item in (recipe or ()) if item and str(item[2]).strip()]
+    if not items:
+        return ""
+    lines = [
+        f"- {_RECIPE_LABELS.get(dimension, dimension)}: {str(term).strip()}"
+        for dimension, _name, term in items
+    ]
+    return (
+        "\nREQUIRED LOCAL RECIPE for this single item (sampled in code from the indexed local "
+        "lexicon). Make every listed item clearly visible in the image and keep the subject, "
+        "identity, clothing, LoRA and explicit user constraints exactly as supplied. If a listed "
+        "item contradicts the fixed source or an explicit requirement, drop that item instead of "
+        "changing the fixed content, and pick a different compatible option in the same dimension:\n"
+        + "\n".join(lines)
+        + "\nKeep the result inside this profile's length budget, and never introduce art-style, "
+          "medium, quality or artist words (for example masterpiece, best quality, 8k, artstation, "
+          "octane, cinematic lighting, or any artist or studio name): they compete with the "
+          "checkpoint instead of describing the picture."
+    )
 
 
 _PNG_BATCH_CANCEL_EVENTS: dict[str, threading.Event] = {}
@@ -516,6 +864,7 @@ def _png_batch_cancel_event(cancel_id: str = "") -> tuple[str, threading.Event]:
 _SERVER_QUEUE_WAKE = threading.Event()
 _SERVER_QUEUE_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _SERVER_QUEUE_CANCEL_LOCK = threading.Lock()
+_SERVER_QUEUE_ACTIVE_BATCHES: set[str] = set()
 _SERVER_QUEUE_THREAD: threading.Thread | None = None
 _SERVER_QUEUE_START_LOCK = threading.Lock()
 
@@ -528,14 +877,18 @@ def _server_queue_cancel_event(batch_id: str) -> threading.Event:
 
 def _release_server_queue_cancel_event(batch_id: str) -> None:
     key = str(batch_id or "").strip()
-    records = DB.list_server_queue(key, 2000)
+    with _SERVER_QUEUE_CANCEL_LOCK:
+        if key in _SERVER_QUEUE_ACTIVE_BATCHES:
+            return
+    records = DB.list_server_queue(key, MAX_SERVER_QUEUE_REQUESTS)
     if records and any(record["status"] in {"pending", "running"} for record in records):
         return
     with _SERVER_QUEUE_CANCEL_LOCK:
-        _SERVER_QUEUE_CANCEL_EVENTS.pop(key, None)
+        if key not in _SERVER_QUEUE_ACTIVE_BATCHES:
+            _SERVER_QUEUE_CANCEL_EVENTS.pop(key, None)
 
 
-def _server_queue_snapshot(batch_id: str, limit: int = 500) -> dict[str, Any]:
+def _server_queue_snapshot(batch_id: str, limit: int = MAX_SERVER_QUEUE_REQUESTS) -> dict[str, Any]:
     records = DB.list_server_queue(str(batch_id or ""), limit)
     counts: dict[str, int] = {}
     for record in records:
@@ -566,11 +919,14 @@ def _parse_generation_settings(value) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _server_render_prompt(prompt: str, target: str, job_id: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Render one queued prompt inside the current Forge process."""
+def _server_render_prompt(
+    prompt: str, target: str, job_id: str, config: dict[str, Any] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Render and save one queued prompt locally through Forge."""
     target = str(target or "none")
     if target == "none":
-        return {}
+        return
     if target != "txt2img":
         raise RuntimeError("服务端队列目前只支持 txt2img；img2img 需要由队列任务提供 init image")
 
@@ -613,7 +969,7 @@ def _server_render_prompt(prompt: str, target: str, job_id: str, config: dict[st
         distilled_cfg_scale=_float("distilled_cfg_scale", 3.5, 0, 30),
         width=_int("width", 1024, 64, 4096),
         height=_int("height", 1024, 64, 4096),
-        enable_hr=bool(settings.get("enable_hr", False)),
+        enable_hr=_coerce_bool(settings.get("enable_hr"), False),
         denoising_strength=_float("denoising_strength", 0.75, 0, 1),
         hr_scale=_float("hr_scale", 2, 1, 4),
         hr_upscaler=(str(settings.get("hr_upscaler") or "").strip() or None),
@@ -638,39 +994,61 @@ def _server_render_prompt(prompt: str, target: str, job_id: str, config: dict[st
         progress.add_task_to_queue(task_id)
     except Exception:
         progress = None
-    with queue_lock:
-        shared.state.begin(job=task_id)
-        if progress is not None:
-            progress.start_task(task_id)
-        try:
-            with closing(p):
-                processed = processing.process_images(p)
-        finally:
-            if progress is not None:
-                progress.finish_task(task_id)
-            shared.state.end()
-            total_tqdm = getattr(shared, "total_tqdm", None)
-            if total_tqdm is not None:
-                total_tqdm.clear()
-
-    images = []
+    acquired = False
+    state_started = False
+    interrupt_stop = threading.Event()
+    interrupt_watcher = None
     try:
-        from io import BytesIO
+        with closing(p):
+            try:
+                while not acquired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("服务端队列已取消")
+                    acquired = queue_lock.acquire(False)
+                    if not acquired:
+                        time.sleep(0.1)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("服务端队列已取消")
+                shared.state.begin(job=task_id)
+                state_started = True
+                if progress is not None:
+                    progress.start_task(task_id)
 
-        for image in (processed.images or []):
-            if isinstance(image, str):
-                images.append(image)
-                continue
-            buffer = BytesIO()
-            image.save(buffer, format="PNG")
-            images.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
-    except Exception:
-        LOGGER.exception("failed to encode server queue images")
-    return {"images": images, "info": processed.js() if processed else ""}
+                def watch_cancel() -> None:
+                    # Forge rewrites state.job for multi-batch progress. This
+                    # watcher belongs to the render holding queue_lock and is
+                    # joined before that lock can pass to another Forge job.
+                    while not interrupt_stop.wait(0.1):
+                        if cancel_event is not None and cancel_event.is_set():
+                            shared.state.interrupt()
+                            return
 
+                if cancel_event is not None:
+                    interrupt_watcher = threading.Thread(
+                        target=watch_cancel, name=f"server-queue-cancel-{job_id}", daemon=True,
+                    )
+                    interrupt_watcher.start()
+                processing.process_images(p)
+            finally:
+                interrupt_stop.set()
+                if interrupt_watcher is not None:
+                    interrupt_watcher.join()
+                if progress is not None:
+                    if state_started:
+                        progress.finish_task(task_id)
+                    else:
+                        progress.pending_tasks.pop(task_id, None)
+                if state_started:
+                    shared.state.end()
+                    total_tqdm = getattr(shared, "total_tqdm", None)
+                    if total_tqdm is not None:
+                        total_tqdm.clear()
+    finally:
+        if acquired:
+            queue_lock.release()
 
 def _server_queue_prepare_prompt(job, config, history, lenses, cancel_event):
-    if bool(config.get("direct_prompt")):
+    if _coerce_bool(config.get("direct_prompt"), False):
         prompt = str(job.get("request") or "").strip()
         if not prompt:
             raise RuntimeError("直接生图队列中的 Prompt 为空")
@@ -681,9 +1059,9 @@ def _server_queue_prepare_prompt(job, config, history, lenses, cancel_event):
         config.get("nsfw_injection", ""), config.get("user_instruction", ""),
         config.get("provider", "OpenAI Compatible"), config.get("endpoint", ""), config.get("model", ""), "",
         float(config.get("temperature", 1.0)), int(config.get("timeout", 90) or 90),
-        int(config.get("max_tokens", 8096) or 8096), bool(config.get("send_temperature", True)),
-        bool(config.get("remove_bad", True)), config.get("remove_terms", ""), bool(config.get("shuffle", False)),
-        bool(config.get("spaces", False)), int(config.get("max_tags", 0) or 0),
+        int(config.get("max_tokens", 8096) or 8096), _coerce_bool(config.get("send_temperature"), True),
+        _coerce_bool(config.get("remove_bad"), True), config.get("remove_terms", ""), _coerce_bool(config.get("shuffle"), False),
+        _coerce_bool(config.get("spaces"), False), int(config.get("max_tags", 0) or 0),
         config.get("structured_mode", "Plain Prompt"), int(config.get("region_count", 1) or 1),
         float(config.get("save_score", 0) or 0), False,
         "server_queue", f"server_queue:{job['batch_id']}:{job['position']}", True, cancel_event,
@@ -693,23 +1071,36 @@ def _server_queue_prepare_prompt(job, config, history, lenses, cancel_event):
     return generated, status, False
 
 
+def _server_queue_job_active(job: dict[str, Any]) -> bool:
+    return DB.server_queue_job_is_active(job.get("id", ""), job.get("claim_token"))
+
+
 def _server_queue_worker() -> None:
     batch_histories: dict[str, list[str]] = {}
     batch_lenses: dict[str, set[str]] = {}
+    last_recovery = 0.0
     while True:
+        now = time.monotonic()
+        if now - last_recovery >= 60.0:
+            active_tokens = []
+            recovered = DB.recover_server_queue(active_claim_tokens=active_tokens)
+            if recovered:
+                LOGGER.warning("marked %s stale server queue jobs as unknown", recovered)
+            last_recovery = now
         job = DB.claim_server_queue_job()
         if not job:
             _SERVER_QUEUE_WAKE.wait(1.0)
             _SERVER_QUEUE_WAKE.clear()
             continue
-        cancel_event = _server_queue_cancel_event(job["batch_id"])
-        if cancel_event.is_set():
-            DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消")
-            _release_server_queue_cancel_event(job["batch_id"])
-            continue
-        config = dict(job.get("config") or {})
+        batch_id = str(job.get("batch_id") or "")
+        with _SERVER_QUEUE_CANCEL_LOCK:
+            _SERVER_QUEUE_ACTIVE_BATCHES.add(batch_id)
+        cancel_event = _server_queue_cancel_event(batch_id)
         try:
-            batch_id = str(job.get("batch_id") or "")
+            if cancel_event.is_set() or not _server_queue_job_active(job):
+                DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消", expected_claim_token=job.get("claim_token"))
+                continue
+            config = dict(job.get("config") or {})
             if batch_id not in batch_histories and len(batch_histories) >= 32:
                 stale_batch = next(iter(batch_histories))
                 batch_histories.pop(stale_batch, None)
@@ -719,25 +1110,45 @@ def _server_queue_worker() -> None:
             generated, status, direct_prompt = _server_queue_prepare_prompt(
                 job, config, history, lenses, cancel_event,
             )
-            if cancel_event.is_set():
-                DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消")
-                _release_server_queue_cancel_event(job["batch_id"])
+            if cancel_event.is_set() or not _server_queue_job_active(job):
+                DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消", expected_claim_token=job.get("claim_token"))
                 continue
             if not generated:
                 raise RuntimeError(status or "LLM 未返回 Prompt")
             if not direct_prompt:
                 history.append(generated)
                 del history[:-_DIVERSITY_MEMORY_SIZE]
-            if not direct_prompt and bool(config.get("cache_result", True)):
+            if not direct_prompt and _coerce_bool(config.get("cache_result"), True):
+                if cancel_event.is_set() or not _server_queue_job_active(job):
+                    DB.update_server_queue_job(job["id"], "cancelled", error="服务端队列已取消", expected_claim_token=job.get("claim_token"))
+                    continue
                 DB.save_prompt(generated, "", config.get("preset", "Danbooru Tags"), config.get("base_model", ""), 0, job["request"], score_source="unrated", source_kind="server_queue", source_ref=f"server_queue:{job['id']}", dedupe=True)
-            render_result = _server_render_prompt(generated, job.get("target", "none"), job["id"], config)
-            DB.update_server_queue_job(job["id"], "completed", prompt=generated, images=render_result.get("images", []))
+            _server_render_prompt(
+                generated, job.get("target", "none"), job["id"], config, cancel_event,
+            )
+            if not cancel_event.is_set() and _server_queue_job_active(job):
+                DB.update_server_queue_job(
+                    job["id"], "completed", prompt=generated,
+                    expected_claim_token=job.get("claim_token"),
+                )
+            else:
+                DB.update_server_queue_job(
+                    job["id"], "cancelled", error="服务端队列已取消",
+                    expected_claim_token=job.get("claim_token"),
+                )
         except Exception as error:
-            LOGGER.exception("server queue job failed: %s", job["id"])
-            DB.update_server_queue_job(job["id"], "cancelled" if cancel_event.is_set() else "error", error=str(error))
+            if cancel_event.is_set():
+                LOGGER.info("server queue job cancelled: %s", job["id"])
+            else:
+                LOGGER.exception("server queue job failed: %s", job["id"])
+            DB.update_server_queue_job(
+                job["id"], "cancelled" if cancel_event.is_set() else "error", error=str(error),
+                expected_claim_token=job.get("claim_token"),
+            )
         finally:
-            _release_server_queue_cancel_event(job["batch_id"])
-
+            with _SERVER_QUEUE_CANCEL_LOCK:
+                _SERVER_QUEUE_ACTIVE_BATCHES.discard(batch_id)
+            _release_server_queue_cancel_event(batch_id)
 
 def _ensure_server_queue_worker() -> None:
     global _SERVER_QUEUE_THREAD
@@ -758,8 +1169,8 @@ def _enqueue_server_queue(payload: dict[str, Any], cancel_event=None) -> dict[st
     requests = [str(item).strip() for item in requests if str(item).strip() and not str(item).strip().startswith("#")]
     if not requests:
         raise ValueError("服务端队列至少需要一条请求")
-    if len(requests) > 1000:
-        raise ValueError("单次服务端队列最多 1000 条请求")
+    if len(requests) > MAX_SERVER_QUEUE_REQUESTS:
+        raise ValueError(f"单次服务端队列最多 {MAX_SERVER_QUEUE_REQUESTS} 条请求")
     if any(len(request) > 12000 for request in requests):
         raise ValueError("单条服务端队列请求最多 12000 个字符")
     target = str(payload.get("target") or "none")
@@ -778,6 +1189,9 @@ def _enqueue_server_queue(payload: dict[str, Any], cancel_event=None) -> dict[st
         "cache_result": True, "target": target, "direct_prompt": False, "generation_settings": {}, "source": "",
     }
     merged.update({key: value for key, value in config.items() if key in merged and key not in {"provider", "endpoint", "model"}})
+    for key, default in (("direct_prompt", False), ("cache_result", True), ("send_temperature", True),
+                         ("remove_bad", True), ("shuffle", False), ("spaces", False)):
+        merged[key] = _coerce_bool(merged.get(key), default)
     if merged["direct_prompt"] and target != "txt2img":
         raise ValueError("直接 Prompt 队列只支持 txt2img 生图")
     merged["preset"], _preset_aligned = _aligned_preset(merged["preset"], merged["base_model"])
@@ -810,11 +1224,6 @@ def _server_queue_html(snapshot: dict[str, Any]) -> str:
                 f"{settings.get('steps', '?')} 步 · CFG {settings.get('cfg_scale', '?')} · "
                 f"{settings.get('sampler_name', '?')}"
             )
-        image_html = "".join(
-            f"<img class='lps-queue-image' src='{html.escape(str(image if str(image).startswith('data:') else 'data:image/png;base64,' + str(image)), quote=True)}' alt='generated image'>"
-            for image in (item.get("images") or [])
-            if str(image or "").strip()
-        )
         rows.append(
             "<div class='lps-server-queue-row'>"
             f"<span>{int(item.get('position', 0))}</span>"
@@ -822,7 +1231,6 @@ def _server_queue_html(snapshot: dict[str, Any]) -> str:
             f"<code>{html.escape(str(item.get('prompt') or item.get('request') or ''))}</code>"
             f"<small>{html.escape(parameter_text)}</small>"
             f"<small>{html.escape(str(item.get('error') or ''))}</small>"
-            f"<div class='lps-queue-images'>{image_html}</div>"
             "</div>"
         )
     return "".join(rows) or "<div class='lps-auto-loop-empty'>暂无服务端队列记录。</div>"
@@ -1069,7 +1477,7 @@ def _workflow_settings() -> dict[str, Any]:
         except (TypeError, ValueError):
             values[key] = WORKFLOW_DEFAULTS[key]
     for key in ["remove_bad", "shuffle", "spaces", "cache_result", "batch_skip_existing", "batch_skip_failed"]:
-        values[key] = bool(values[key])
+        values[key] = _coerce_bool(values[key], bool(WORKFLOW_DEFAULTS.get(key, False)))
     for key in [
         "system_override", "nsfw_injection", "user_instruction", "remove_terms",
         "wd_endpoint", "wd_model", "wildcard_path",
@@ -1097,10 +1505,10 @@ def _save_workflow_settings(
         "base_model": _canonical_base_model(base_model),
         "safety": safety, "nsfw_injection": nsfw_injection, "user_instruction": user_instruction,
         "structured_mode": _canonical_output_mode(structured_mode), "region_count": int(region_count or 1),
-        "remove_bad": bool(remove_bad), "remove_terms": remove_terms, "shuffle": bool(shuffle),
-        "spaces": bool(spaces), "max_tags": int(max_tags or 0),
-        "save_score": float(save_score or 0), "cache_result": bool(cache_result),
-        "batch_skip_existing": bool(batch_skip_existing), "batch_skip_failed": bool(batch_skip_failed),
+        "remove_bad": _coerce_bool(remove_bad, True), "remove_terms": remove_terms, "shuffle": _coerce_bool(shuffle),
+        "spaces": _coerce_bool(spaces), "max_tags": int(max_tags or 0),
+        "save_score": float(save_score or 0), "cache_result": _coerce_bool(cache_result, True),
+        "batch_skip_existing": _coerce_bool(batch_skip_existing), "batch_skip_failed": _coerce_bool(batch_skip_failed),
         "wd_endpoint": wd_endpoint, "wd_model": wd_model,
         "wd_threshold": float(wd_threshold or 0), "wildcard_path": wildcard_path,
     })
@@ -1203,7 +1611,7 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         retry_count = max(0, min(int(saved.get("retry_count", DEFAULT_LLM_SETTINGS["retry_count"])), 5))
     except (TypeError, ValueError):
         retry_count = DEFAULT_LLM_SETTINGS["retry_count"]
-    thinking_enabled = bool(saved.get("thinking_enabled", DEFAULT_LLM_SETTINGS["thinking_enabled"]))
+    thinking_enabled = _coerce_bool(saved.get("thinking_enabled"), DEFAULT_LLM_SETTINGS["thinking_enabled"])
     try:
         thinking_budget = max(0, min(int(saved.get("thinking_budget", DEFAULT_LLM_SETTINGS["thinking_budget"])), 262144))
     except (TypeError, ValueError):
@@ -1238,7 +1646,7 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         "top_k": saved.get("top_k"),
         "timeout": timeout,
         "max_tokens": max_tokens,
-        "send_temperature": bool(saved.get("send_temperature", profile["send_temperature"])),
+        "send_temperature": _coerce_bool(saved.get("send_temperature"), profile["send_temperature"]),
         "retry_count": retry_count,
         "thinking_enabled": thinking_enabled,
         "thinking_budget": thinking_budget,
@@ -1249,6 +1657,116 @@ def _connection_settings(provider: str | None = None) -> dict[str, Any]:
         "weights_path": str(saved.get("weights_path") or ""),
         "model_version": str(saved.get("model_version") or ""),
     }
+
+
+def _handoff_inference_settings() -> dict[str, Any]:
+    """Return the isolated inference profile used for prompts received from other plugins."""
+    base = _connection_settings()
+    saved = DB.get_setting("handoff_inference_v1", {}) or {}
+    if not isinstance(saved, dict):
+        saved = {}
+    def bounded_number(name, default, low, high, cast):
+        try:
+            return max(low, min(cast(saved.get(name, default)), high))
+        except (TypeError, ValueError):
+            return default
+    try:
+        sampling = normalize_sampling(saved.get("top_p", base.get("top_p")), saved.get("top_k", base.get("top_k")))
+    except (TypeError, ValueError):
+        try:
+            sampling = normalize_sampling(base.get("top_p"), base.get("top_k"))
+        except (TypeError, ValueError):
+            sampling = {}
+    return {
+        **base,
+        "temperature": bounded_number("temperature", base["temperature"], 0.0, 2.0, float),
+        "timeout": bounded_number("timeout", base["timeout"], 5, 600, int),
+        "max_tokens": bounded_number("max_tokens", base["max_tokens"], 0, 262144, int),
+        "retry_count": bounded_number("retry_count", base["retry_count"], 0, 5, int),
+        "thinking_enabled": _coerce_bool(saved.get("thinking_enabled"), base["thinking_enabled"]),
+        "thinking_budget": bounded_number("thinking_budget", base["thinking_budget"], 0, 262144, int),
+        "reasoning_effort": str(saved.get("reasoning_effort", base["reasoning_effort"]) or "").strip(),
+        "send_temperature": _coerce_bool(saved.get("send_temperature"), base["send_temperature"]),
+        "top_p": sampling.get("top_p"),
+        "top_k": sampling.get("top_k"),
+    }
+
+
+def _save_handoff_inference_settings(temperature, timeout, max_tokens, retry_count, thinking_enabled, thinking_budget, reasoning_effort, send_temperature, top_p=None, top_k=None):
+    try:
+        values = {
+            "version": HANDOFF_INFERENCE_SETTINGS_VERSION,
+            "temperature": max(0.0, min(float(temperature), 2.0)),
+            "timeout": max(5, min(int(timeout), 600)),
+            "max_tokens": max(0, min(int(max_tokens), 262144)),
+            "retry_count": max(0, min(int(retry_count), 5)),
+        "thinking_enabled": _coerce_bool(thinking_enabled),
+            "thinking_budget": max(0, min(int(thinking_budget or 0), 262144)),
+            "reasoning_effort": str(reasoning_effort or "").strip(),
+        "send_temperature": _coerce_bool(send_temperature, True),
+            "top_p": normalize_sampling(top_p, None).get("top_p"),
+            "top_k": normalize_sampling(None, top_k).get("top_k"),
+        }
+    except (TypeError, ValueError) as error:
+        return f"外部原始 Prompt 参数保存失败：{_safe_error(error)}"
+    DB.set_setting("handoff_inference_v1", values)
+    return "外部原始 Prompt 的独立 LLM 推理参数已保存；仅影响交接箱处理。"
+
+
+def _processed_cache_inference_settings() -> dict[str, Any]:
+    """Return the isolated, conservative profile used by cache transformations."""
+    base = _connection_settings()
+    saved = DB.get_setting("processed_cache_inference_v1", {}) or {}
+    if not isinstance(saved, dict):
+        saved = {}
+
+    def bounded(name, default, low, high, cast):
+        try:
+            return max(low, min(cast(saved.get(name, default)), high))
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        sampling = normalize_sampling(saved.get("top_p", 0.9), saved.get("top_k"))
+    except (TypeError, ValueError):
+        sampling = {"top_p": 0.9, "top_k": None}
+    return {
+        "provider": base["provider"], "endpoint": base["endpoint"], "model": base["model"],
+        "temperature": bounded("temperature", 0.25, 0.0, 2.0, float),
+        "top_p": sampling.get("top_p"), "top_k": sampling.get("top_k"),
+        "timeout": bounded("timeout", 90, 5, 600, int),
+        "max_tokens": bounded("max_tokens", 8096, 0, 262144, int),
+        "send_temperature": _coerce_bool(saved.get("send_temperature"), True),
+        "retry_count": bounded("retry_count", 2, 0, 5, int),
+        "thinking_enabled": _coerce_bool(saved.get("thinking_enabled"), False),
+        "thinking_budget": bounded("thinking_budget", 0, 0, 262144, int),
+        "reasoning_effort": str(saved.get("reasoning_effort") or "").strip(),
+        "fallback_provider": "", "fallback_endpoint": "", "fallback_model": "",
+    }
+
+
+def _save_processed_cache_inference_settings(
+    temperature, timeout, max_tokens, retry_count, thinking_enabled, thinking_budget,
+    reasoning_effort, send_temperature, top_p=None, top_k=None,
+):
+    try:
+        sampling = normalize_sampling(top_p, top_k)
+        values = {
+            "version": PROCESSED_CACHE_INFERENCE_SETTINGS_VERSION,
+            "temperature": max(0.0, min(float(temperature), 2.0)),
+            "timeout": max(5, min(int(timeout), 600)),
+            "max_tokens": max(0, min(int(max_tokens), 262144)),
+            "retry_count": max(0, min(int(retry_count), 5)),
+            "thinking_enabled": _coerce_bool(thinking_enabled),
+            "thinking_budget": max(0, min(int(thinking_budget or 0), 262144)),
+            "reasoning_effort": str(reasoning_effort or "").strip(),
+            "send_temperature": _coerce_bool(send_temperature, True),
+            "top_p": sampling.get("top_p"), "top_k": sampling.get("top_k"),
+        }
+    except (TypeError, ValueError) as error:
+        return f"处理结果库参数保存失败：{_safe_error(error)}"
+    DB.set_setting("processed_cache_inference_v1", values)
+    return "处理结果库的独立 LLM 参数已保存；仅影响缓存 Prompt 写入处理结果库。"
 
 
 def _credential_status(provider: str, endpoint: str) -> str:
@@ -1690,6 +2208,47 @@ def _normalize_generation_count(value, default=8):
         return default
 
 
+_SOURCE_DUPLICATION_WINDOW = 200
+
+
+def _source_duplication(sources: list[str]) -> tuple[list[str], dict[str, Any]]:
+    """Report sources that can only produce the same picture; optionally fold them.
+
+    Ten identical sources do not buy ten pictures: the prompt layer can only vary
+    what the source leaves open. Counting them is informative and free; folding is
+    opt-in because repeating one source on purpose is a legitimate workflow (one
+    subject, many scenes).
+    """
+    texts = [str(item or "").strip() for item in sources]
+    texts = [text for text in texts if text]
+    if len(texts) < 2:
+        return texts, {}
+    settings = _diversity_settings()
+    threshold = float(settings["similarity_threshold"])
+    # Pairwise comparison is quadratic: only the window a batch can actually use
+    # is worth scanning, and the tail is passed through untouched.
+    window = texts[:_SOURCE_DUPLICATION_WINDOW]
+    try:
+        clusters = _duplicate_clusters(window, threshold)
+    except Exception:
+        LOGGER.exception("源重复检测失败")
+        return texts, {}
+    duplicates = sum(len(cluster) - 1 for cluster in clusters)
+    if not duplicates:
+        return texts, {}
+    stats: dict[str, Any] = {
+        "content_duplicates": duplicates,
+        "content_duplicate_groups": len(clusters),
+        "content_threshold": threshold,
+    }
+    if not settings["source_fold_duplicates"]:
+        return texts, stats
+    dropped = {index for cluster in clusters for index in cluster[1:]}
+    kept = [text for index, text in enumerate(texts) if index not in dropped]
+    stats["content_folded"] = len(dropped)
+    return kept, stats
+
+
 def _build_inspiration_sources(
     source_text: str,
     generation_count: int = 8,
@@ -1713,7 +2272,8 @@ def _build_inspiration_sources(
                 + ("保留其中的身份、LoRA、权重、明确属性和安全限制；" if lock_known else "")
             )
             parsed = [prefix + "在此基础上完成本条创作要求：" + item for item in parsed]
-        return parsed[:200], stats
+        parsed, dedupe_stats = _source_duplication(parsed)
+        return parsed[:200], {**stats, **dedupe_stats}
     topics = [item.strip() for item in str(topic_pool or "").replace(",", "\n").splitlines() if item.strip()]
     topics = topics or list(_INSPIRATION_TOPIC_POOL)
     rng = random.SystemRandom()
@@ -1746,7 +2306,8 @@ def _build_inspiration_sources(
                 + source
             )
         sources.append(source)
-    return sources, {"ignored": 0, "duplicates": 0, "generated": len(sources)}
+    sources, dedupe_stats = _source_duplication(sources)
+    return sources, {"ignored": 0, "duplicates": 0, "generated": len(sources), **dedupe_stats}
 
 
 def _preview_batch_sources(source_text, skip_existing, preset, base_model, generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=True, shared_request=""):
@@ -1763,6 +2324,12 @@ def _preview_batch_sources(source_text, skip_existing, preset, base_model, gener
     )
     if stats.get("generated"):
         message += f" 已按随机题材生成 {stats['generated']} 条内部创作要求。"
+    if stats.get("content_duplicates"):
+        message += (
+            f" 其中 {stats['content_duplicates']} 条输入与前面几乎描述同一画面（内容相似度阈值 "
+            f"{float(stats.get('content_threshold', 0.55)):.2f}），这些输入本身不会带来新画面，"
+            "多样性完全取决于配方与内容去重；如需自动折叠，在 prompt_diversity_v1 中开启 source_fold_duplicates。"
+        )
     if len(sources) > 200:
         message += " 预览仅显示前 200 条。"
     if _normalize_generation_count(generation_count) == 0:
@@ -1841,6 +2408,10 @@ def _batch_generate(
     pending, inserted, duplicates, score_updates, skipped, failed, request_count = [], 0, 0, 0, 0, 0, 0
     batch_history = []
     used_lenses: set[str] = set()
+    used_recipe_terms: set[str] = set()
+    # One seed per batch run: the coverage plan is deterministic inside the run
+    # and different between runs, so reruns explore new mixes.
+    recipe_seed = random.SystemRandom().getrandbits(32)
     _BATCH_CONTEXT.history = batch_history
     issues = []
     result_rows = [] if continuous else [[index, source, "", "等待处理"] for index, source in enumerate(sources[:200], start=1)]
@@ -1919,7 +2490,12 @@ def _batch_generate(
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     0, False, "", "", False, _BATCH_CANCEL,
-                    _independent_batch_directive(index, used_lenses) + "\n" + (
+                    _independent_batch_directive(
+                        index, used_lenses,
+                        _lexicon_recipe(
+                            used_recipe_terms, dimensions=_recipe_schedule(index, recipe_seed),
+                        ),
+                    ) + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{total_label} 条。"
                         "批次上下文中的结果只用于排除重复，不要复制其措辞、构图、动作或物品组合；"
                         "请根据原要求自由选择变化，不要把任何变化维度当作硬性模板。"
@@ -2275,9 +2851,9 @@ def _save_llm_settings(
             "temperature": max(0.0, min(float(temperature), 2.0)),
             "timeout": max(5, min(int(timeout), 600)),
             "max_tokens": max(0, min(int(max_tokens), 262144)),
-            "send_temperature": bool(send_temperature),
+            "send_temperature": _coerce_bool(send_temperature, True),
             "retry_count": max(0, min(int(retry_count), 5)),
-            "thinking_enabled": bool(thinking_enabled),
+            "thinking_enabled": _coerce_bool(thinking_enabled),
             "thinking_budget": max(0, min(int(thinking_budget or 0), 262144)),
             "reasoning_effort": str(reasoning_effort or "").strip(),
             "top_p": sampling.get("top_p"),
@@ -2391,49 +2967,34 @@ def _clear_llm_credentials(provider, endpoint):
 
 
 _LORA_TOKEN_RE = re.compile(r"<lora:[^>]+>", re.IGNORECASE)
-
-
+# LoRA, LyCORIS and hypernetwork tags are loader instructions, not prompt text.
+# If the model drops one, the adapter silently stops loading - the picture then
+# looks like the base model and the user reads it as "my LoRA got worse".
+_TECHNICAL_TOKEN_RES = (
+    _LORA_TOKEN_RE,
+    re.compile(r"<lyco:[^>]+>", re.IGNORECASE),
+    re.compile(r"<hypernet:[^>]+>", re.IGNORECASE),
+)
 def _immutable_technical_tokens(prompt: str) -> list[str]:
     """Extract LoRA tags and standalone trigger tokens without interpreting them."""
     text = str(prompt or "")
-    loras = _LORA_TOKEN_RE.findall(text)
+    tags = [match for pattern in _TECHNICAL_TOKEN_RES for match in pattern.findall(text)]
     # Natural-language words remain ordinary fixed prompt context. Compact
     # activation tokens are conventionally marked by an underscore, digit, or
     # technical separator; preserve those verbatim without semantic expansion.
-    words = re.findall(r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", text)
-    return list(dict.fromkeys([*loras, *words]))
+    # Loader tags are blanked out first: otherwise the inside of
+    # ``<lora:myStyle:0.7>`` ("myStyle:0") would be listed as a word the model
+    # should keep verbatim.
+    stripped = text
+    for pattern in _TECHNICAL_TOKEN_RES:
+        stripped = pattern.sub(" ", stripped)
+    words = re.findall(r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", stripped)
+    return list(dict.fromkeys([*tags, *words]))
 
 
 def _preserves_immutable_technical_tokens(source: str, candidate: str) -> bool:
     candidate_text = str(candidate or "")
     return all(token in candidate_text for token in _immutable_technical_tokens(source))
-
-
-def _finalize_generated_prompt(
-    result, preset, safety, remove_bad=True, remove_terms="", shuffle=False, spaces=False,
-    max_tags=0, structured_mode="Plain Prompt", region_count=1,
-):
-    preset = _canonical_preset(preset)
-    structured_mode = _canonical_output_mode(structured_mode)
-    result = str(result or "").strip()
-    lowered = result.casefold()
-    meta_markers = ("let me ", "here is", "as an ai", "writing prompt", "i will ", "restart inspection", "corrected prompt")
-    if any(marker in lowered for marker in meta_markers):
-        raise ValueError("Prompt 包含解释或自我审阅内容。")
-    if "daylight" in lowered and any(term in lowered for term in ("midnight", "moonlit", "nighttime")):
-        raise ValueError("Prompt 包含白天与夜晚冲突。")
-    if "indoors" in lowered and "outdoors" in lowered:
-        raise ValueError("Prompt 包含室内与室外冲突。")
-    if safety == "SFW" and not is_sfw_output(result):
-        raise ValueError("SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。")
-    if preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
-        result = process_tags(result, bool(remove_bad), remove_terms, bool(shuffle), bool(spaces), int(max_tags or 0))
-    if structured_mode != "Plain Prompt":
-        result = regional_format(result, structured_mode, int(region_count or 1))
-    result = str(result or "").strip()
-    if not result:
-        raise ValueError("LLM 输出在标签清理或格式化后未返回可用 Prompt。")
-    return result
 
 
 def _processed_kind_for_preset(preset: str) -> str:
@@ -2497,12 +3058,26 @@ def _aligned_quality_guidance(base_model: str) -> str:
     )
 
 
+# Count and group tags describe how many subjects the picture has, so offering them
+# as optional vocabulary can rewrite a fixed single-character prompt (the measured
+# failure: "single young girl" + a reference tail of 1girl/2girls/3girls...).
+_STATIC_REFERENCE_BLOCKLIST = frozenset({
+    "1girl", "2girls", "3girls", "4girls", "5girls", "6+girls",
+    "1boy", "2boys", "3boys", "multiple girls", "multiple boys",
+    "solo", "solo focus", "male focus", "no humans", "group", "couple", "duo",
+    "threesome", "crowd",
+})
+
+
 def _static_prompt_reference(
     source: str, related_limit: int = 8, sample_limit: int = 8,
     exclude_terms: list[str] | None = None,
 ) -> list[str]:
     """Provide optional, category-balanced lexicon references, excluding batch concepts."""
-    related = DB.wildcard_matches(str(source or ""), max(0, min(30, int(related_limit or 0))))
+    related = [
+        term for term in DB.wildcard_matches(str(source or ""), max(0, min(30, int(related_limit or 0))))
+        if str(term or "").strip().casefold() not in _STATIC_REFERENCE_BLOCKLIST
+    ]
     excluded = {str(item).strip().casefold() for item in (exclude_terms or []) if str(item).strip()}
     sample_excluded = excluded | {str(item).strip().casefold() for item in related if str(item).strip()}
     requested = max(0, min(30 - len(related), int(sample_limit or 0)))
@@ -2516,7 +3091,9 @@ def _static_prompt_reference(
     seen = set()
     for term, category in [*((term, "") for term in related), *samples]:
         normalized = str(term or "").strip()
-        if normalized and normalized.casefold() not in seen and normalized.casefold() not in excluded:
+        if (normalized and normalized.casefold() not in seen
+                and normalized.casefold() not in excluded
+                and normalized.casefold() not in _STATIC_REFERENCE_BLOCKLIST):
             seen.add(normalized.casefold())
             result.append(f"[{category}] {normalized}" if category else normalized)
     return result
@@ -2548,6 +3125,7 @@ def _generate(
         batch_history = list(getattr(_BATCH_CONTEXT, "history", None) or [])
     batch_history = [str(item).strip() for item in batch_history if str(item).strip()]
     effective_batch_directive = str(batch_directive or "").strip()
+    context_outputs: list[str] = []
     if effective_batch_directive:
         recent_outputs = _recent_diverse_outputs(source)
         context_outputs = [*recent_outputs, *batch_history]
@@ -2555,16 +3133,27 @@ def _generate(
         static_tags = _static_prompt_reference(source, exclude_terms=exclusion_terms)
         if exclusion_terms:
             effective_batch_directive += (
-                "\nDIVERSITY LEDGER: these concepts have appeared repeatedly in earlier outputs. "
-                "Prefer fresh alternatives and do not reuse them unless the source explicitly fixes them: "
+                "\nCOVERAGE SO FAR: this batch has already spent these content concepts: "
                 + ", ".join(exclusion_terms)
-                + "."
+                + ". Treat the list as a coverage map: the next item should land on a different "
+                  "combination of action, place, prop and light rather than renaming one of them."
+            )
+        fresh = [
+            str(term).strip() for term in static_tags
+            if str(term).strip().casefold() not in {item.casefold() for item in exclusion_terms}
+        ]
+        if fresh:
+            effective_batch_directive += (
+                "\nUNUSED DIRECTIONS for this item (local-lexicon terms this batch has not used yet; "
+                "pick from them when they fit the fixed subject and ignore the rest): "
+                + ", ".join(fresh[:6])
             )
         if context_outputs:
-            exclusions = "\n".join(f"- {item[:520]}" for item in context_outputs[-_DIVERSITY_REFERENCE_LIMIT:])
+            latest = context_outputs[-3:]
+            summary = "\n".join(f"- {item[:320]}" for item in latest)
             effective_batch_directive += (
-                "\nRecent outputs are exclusion references only. Do not reuse their scene structure, action, "
-                "camera arrangement, prop combination, or distinctive decorative elements:\n" + exclusions
+                "\nThe most recent items of this batch, listed only so you can judge coverage. "
+                "Never echo their wording, scene structure or prop combination:\n" + summary
             )
     else:
         static_tags = _static_prompt_reference(source)
@@ -2574,25 +3163,52 @@ def _generate(
         static_tags, system_override, effective_batch_directive, operation_instruction,
     )
     runtime_connection = dict(connection_settings or _connection_settings(provider))
+    diversity = _diversity_settings()
+    gate_context = list(context_outputs) if effective_batch_directive else []
+    retry_limit = int(diversity["retry_limit"]) if gate_context else 0
+    similarity_limit = float(diversity["similarity_threshold"])
+    diversity_retries_used = 0
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
         request_temperature = float(1.0 if temperature is None else temperature)
-        if effective_batch_directive and not preserve_inference_settings:
+        if effective_batch_directive and (
+            not preserve_inference_settings or diversity["batch_temperature_floor"]
+        ):
             request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
-        for attempt in range(_MAX_DIVERSITY_RETRIES + 1):
+        result = ""
+        accepted = ""
+        best_candidate = ""
+        best_score = -1.0
+        retry_reason = ""
+        attempt = 0
+        while attempt < 1 + max(_MAX_RESPONSE_RETRIES, retry_limit):
             attempt_system = system
-            if attempt:
+            if retry_reason == "diversity":
+                attempt_system = build_system_prompt(
+                    preset, base_model, safety, nsfw_injection, user_instruction, examples,
+                    static_tags, system_override,
+                    effective_batch_directive
+                    + "\nDIVERSITY RETRY: the previous candidate repeated content that an earlier item of "
+                      "this batch already used. Keep the subject, identity and every explicit constraint, "
+                      "and make this item clearly different in the required recipe dimensions and in the "
+                      "variation lenses listed above.",
+                    operation_instruction,
+                )
+            elif retry_reason == "response":
                 attempt_system = build_system_prompt(
                     preset, base_model, safety, nsfw_injection, user_instruction, examples,
                     static_tags, system_override,
                     effective_batch_directive + "\nRESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise result directly and do not spend output on analysis or reasoning.",
                     operation_instruction,
                 )
+            attempt_temperature = request_temperature
+            if attempt and (retry_reason == "diversity" or not preserve_inference_settings):
+                attempt_temperature = min(2.0, request_temperature + 0.15 * attempt)
             try:
-                result = call_llm(
+                raw_result = call_llm(
                     provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
-                    request_temperature if preserve_inference_settings else min(2.0, request_temperature + 0.15 * attempt),
-                    int(timeout or 90), int(max_tokens or 0), bool(send_temperature),
+                    attempt_temperature,
+                    int(timeout or 90), int(max_tokens or 0), _coerce_bool(send_temperature),
                     max_retries=runtime_connection["retry_count"], cancel_event=cancel_event,
                     thinking_enabled=runtime_connection.get("thinking_enabled"),
                     thinking_budget=runtime_connection.get("thinking_budget", 0),
@@ -2603,14 +3219,32 @@ def _generate(
             except RuntimeError as error:
                 if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
                     raise
+                retry_reason = "response"
+                attempt += 1
                 continue
             candidate = _finalize_generated_prompt(
-                result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
+                raw_result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
             )
             result = candidate
             system = attempt_system
-            break
+            if not gate_context:
+                break
+            score = _worst_content_similarity(candidate, gate_context, source)
+            if best_candidate == "" or score < best_score:
+                best_candidate, best_score = candidate, score
+            if score < similarity_limit:
+                accepted = candidate
+                break
+            if attempt >= retry_limit:
+                break
+            retry_reason = "diversity"
+            attempt += 1
+            diversity_retries_used += 1
+        if accepted:
+            result = accepted
+        elif best_candidate:
+            result = best_candidate
     except LLMRequestError as error:
         if str(error) == "LLM request cancelled":
             return "", system, "已取消"
@@ -2621,6 +3255,11 @@ def _generate(
         result = str(result or "").strip()
     except ValueError as error:
         return "", system, f"生成失败：{error}"
+    if result and gate_context:
+        try:
+            _remember_diverse_output(source, result)
+        except Exception:
+            LOGGER.exception("记录多样性记忆失败")
     if cache_result and result:
         DB.save_prompt(
             result, "", preset, base_model, float(save_score or 0), source,
@@ -2630,6 +3269,8 @@ def _generate(
             dedupe=False,
         )
     status = "生成完成" + ("（预设已按底模对齐）" if preset_aligned else "")
+    if diversity_retries_used:
+        status += f"（内容重复，已重试 {diversity_retries_used} 次）"
     return result, system, status
 
 
@@ -2649,9 +3290,9 @@ def _generate_auto_loop(
             "request": str(request or "").strip(), "preset": preset, "system_override": system_override,
             "base_model": base_model, "safety": safety, "nsfw_injection": nsfw_injection,
             "user_instruction": user_instruction, "provider": provider, "endpoint": endpoint, "model": model,
-            "temperature": temperature, "max_tokens": max_tokens, "send_temperature": bool(send_temperature),
-            "remove_bad": bool(remove_bad),
-            "remove_terms": remove_terms, "shuffle": bool(shuffle), "spaces": bool(spaces),
+            "temperature": temperature, "max_tokens": max_tokens, "send_temperature": _coerce_bool(send_temperature, True),
+            "remove_bad": _coerce_bool(remove_bad, True),
+            "remove_terms": remove_terms, "shuffle": _coerce_bool(shuffle), "spaces": _coerce_bool(spaces),
             "max_tags": max_tags, "structured_mode": structured_mode, "region_count": region_count,
         }
         fingerprint = hashlib.sha256(
@@ -2663,14 +3304,14 @@ def _generate_auto_loop(
             provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, True, "auto_loop", source_ref, True, _AUTO_LOOP_CANCEL,
-            _independent_creative_directive(),
+            _independent_creative_directive(recipe=_lexicon_recipe()),
         )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, False, "", "", False, _AUTO_LOOP_CANCEL,
-            _independent_creative_directive(),
+            _independent_creative_directive(recipe=_lexicon_recipe()),
     )
 
 
@@ -2696,14 +3337,24 @@ def _expand_or_polish(
         exclusion_terms = _diversity_exclusion_terms_from_outputs(previous, source)
         if exclusion_terms:
             directive += (
-                "\nDIVERSITY LEDGER: concepts already repeated in this batch; prefer fresh alternatives and avoid reusing them "
-                "unless the source explicitly fixes them: " + ", ".join(exclusion_terms) + "."
+                "\nCOVERAGE SO FAR in this batch: " + ", ".join(exclusion_terms)
+                + ". Use it as a coverage map and land on a different combination of action, place, "
+                  "prop and light rather than renaming one of them."
+            )
+        fresh = [
+            str(term).strip() for term in static_tags
+            if str(term).strip().casefold() not in {item.casefold() for item in exclusion_terms}
+        ]
+        if fresh:
+            directive += (
+                "\nUNUSED DIRECTIONS for this item (local-lexicon terms this batch has not used yet): "
+                + ", ".join(fresh[:6])
             )
         if previous:
-            previous_summary = "\n".join(f"- {item[:520]}" for item in previous[-_DIVERSITY_REFERENCE_LIMIT:])
+            previous_summary = "\n".join(f"- {item[:320]}" for item in previous[-3:])
             directive += (
-                "\nPrevious outputs are supplied only as exclusion constraints; do not copy their wording, scene structure, action, "
-                "or prop combination:\n" + previous_summary
+                "\nThe most recent items of this batch, listed only so you can judge coverage. "
+                "Never echo their wording, scene structure or prop combination:\n" + previous_summary
             )
     if directive:
         instruction += (
@@ -2738,32 +3389,48 @@ def _expand_or_polish(
 
     system = build_transform_system(directive)
     try:
-        request_temperature = float(temperature or 1.0)
+        request_temperature = float(temperature if preserve_inference_settings else (temperature or 1.0))
     except (TypeError, ValueError):
         request_temperature = 1.0
-    if directive and not preserve_inference_settings:
+    diversity_settings = _diversity_settings() if directive else {}
+    if directive and (
+        not preserve_inference_settings or diversity_settings.get("batch_temperature_floor")
+    ):
         request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
+    retry_limit = int(diversity_settings.get("retry_limit") or 0) if directive else 0
+    similarity_limit = float(diversity_settings.get("similarity_threshold") or _MAX_CONTENT_SIMILARITY)
+    gate_context = list(previous) if directive and previous else []
+    diversity_retries_used = 0
     runtime_connection = dict(connection_settings or _connection_settings(provider))
     try:
         resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
         result = ""
-        for attempt in range(_MAX_DIVERSITY_RETRIES + 1):
+        accepted = ""
+        best_candidate = ""
+        best_score = -1.0
+        retry_reason = ""
+        attempt = 0
+        while attempt < 1 + max(_MAX_RESPONSE_RETRIES, retry_limit):
             attempt_system = system
-            if attempt:
+            if retry_reason:
                 retry_directive = ""
-                if directive:
+                if directive and retry_reason == "diversity":
                     retry_directive = (
-                        f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate was too similar to an existing item. "
-                        "Favor a different compatible combination of setting, action, prop relationship, spatial layout, camera angle, "
-                        "time/weather, or visible daily-life context, while leaving the model free to choose; follow the required output contract and return exactly one result."
+                        f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate repeated content that "
+                        "an item of this batch already used. Favor a different compatible combination of "
+                        "setting, action, prop relationship, spatial layout, camera angle, time/weather and "
+                        "visible daily-life context, follow the required output contract and return exactly one result."
                     )
                 retry_directive += "\nRESPONSE RETRY: return one concise result directly and do not spend output on analysis or reasoning."
                 attempt_system = build_transform_system(retry_directive)
+            attempt_temperature = request_temperature
+            if attempt and (retry_reason == "diversity" or not preserve_inference_settings):
+                attempt_temperature = min(2.0, request_temperature + 0.15 * attempt)
             try:
-                result = call_llm(
+                raw_result = call_llm(
                     provider, endpoint, model, resolved_key, attempt_system,
-                    build_user_message(source), request_temperature if preserve_inference_settings else min(2.0, request_temperature + 0.15 * attempt),
-                    int(timeout or 90), int(max_tokens or 0), bool(send_temperature),
+                    build_user_message(source), attempt_temperature,
+                    int(timeout or 90), int(max_tokens or 0), _coerce_bool(send_temperature),
                     max_retries=runtime_connection["retry_count"], cancel_event=cancel_event,
                     thinking_enabled=runtime_connection.get("thinking_enabled"),
                     thinking_budget=runtime_connection.get("thinking_budget", 0),
@@ -2774,15 +3441,46 @@ def _expand_or_polish(
             except RuntimeError as error:
                 if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
                     raise
+                retry_reason = "response"
+                attempt += 1
                 continue
             finalize_preset = "Krea 2 Natural" if use_fixed_krea_polish else preset
             result = _finalize_generated_prompt(
-                result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
+                raw_result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
             )
-            if result:
+            if not result:
+                if attempt >= _MAX_RESPONSE_RETRIES:
+                    break
+                retry_reason = "response"
+                attempt += 1
+                continue
+            if not gate_context:
                 break
-        return result, "LLM 提示词处理完成"
+            score = _worst_content_similarity(result, gate_context, source)
+            if best_candidate == "" or score < best_score:
+                best_candidate, best_score = result, score
+            if score < similarity_limit:
+                accepted = result
+                break
+            if attempt >= retry_limit:
+                break
+            retry_reason = "diversity"
+            attempt += 1
+            diversity_retries_used += 1
+        if accepted:
+            result = accepted
+        elif best_candidate:
+            result = best_candidate
+        if result and directive:
+            try:
+                _remember_diverse_output(source, result)
+            except Exception:
+                LOGGER.exception("记录多样性记忆失败")
+        note = ""
+        if diversity_retries_used:
+            note += f"（内容重复，已重试 {diversity_retries_used} 次）"
+        return result, "LLM 提示词处理完成" + note
     except Exception as error:
         return "", f"处理失败：{_safe_error(error)}"
 
@@ -3341,8 +4039,8 @@ def _custom_templates() -> dict[str, dict[str, Any]]:
                 dimensions = [item.strip() for item in dimensions.split(",") if item.strip()]
             result[clean_name] = {
                 "content": clean_value,
-                "preserve_fixed_prompt": bool(record.get("preserve_fixed_prompt", True)),
-                "obey_user_prompt": bool(record.get("obey_user_prompt", True)),
+                "preserve_fixed_prompt": _coerce_bool(record.get("preserve_fixed_prompt"), True),
+                "obey_user_prompt": _coerce_bool(record.get("obey_user_prompt"), True),
                 "variation_dimensions": [str(item) for item in dimensions if str(item).strip()],
                 "style_rules": str(record.get("style_rules", "") or "").strip(),
                 "forbidden_content": str(record.get("forbidden_content", "") or "").strip(),
@@ -3439,7 +4137,7 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     # the end of a cache library, start again from the first record so the
     # browser's native loop remains infinite. The API keeps strict exhaustion
     # behavior unless the caller explicitly opts into cycling.
-    allow_wrap = bool(payload.get("allow_wrap", False))
+    allow_wrap = _coerce_bool(payload.get("allow_wrap"), False)
     records: list[dict[str, Any]] = []
     cursor = after_id
     wrapped = False
@@ -3609,8 +4307,8 @@ def _save_custom_template(name, content, preserve_fixed_prompt=True, obey_user_p
     dimensions = [item.strip() for item in dimensions if str(item).strip()]
     templates[name] = {
         "content": content,
-        "preserve_fixed_prompt": bool(preserve_fixed_prompt),
-        "obey_user_prompt": bool(obey_user_prompt),
+        "preserve_fixed_prompt": _coerce_bool(preserve_fixed_prompt, True),
+        "obey_user_prompt": _coerce_bool(obey_user_prompt, True),
         "variation_dimensions": dimensions or ["action", "environment_detail", "camera", "composition", "lighting", "atmosphere"],
         "style_rules": str(style_rules or "").strip(),
         "forbidden_content": str(forbidden_content or "").strip(),
@@ -3778,12 +4476,12 @@ def _test_connection(provider, endpoint, model, api_key, fallback_model, tempera
         resolved_fallback_key = CREDENTIALS.resolve(fallback_api_key, fallback_provider, fallback_endpoint)
         output = call_llm(
             provider, endpoint, model, resolved_key, "Reply exactly: READY", "Connection test",
-            float(temperature or 0), int(timeout or 30), max(16, min(int(max_tokens or 64), 64)), bool(send_temperature),
+            float(temperature or 0), int(timeout or 30), max(16, min(int(max_tokens or 64), 64)), _coerce_bool(send_temperature),
             max_retries=max(0, min(int(retry_count or 0), 5)),
             fallback_model=str(fallback_model or "").strip(),
             fallback_provider=fallback_provider, fallback_endpoint=fallback_endpoint,
             fallback_api_key=resolved_fallback_key,
-            thinking_enabled=bool(thinking_enabled), thinking_budget=int(thinking_budget or 0), reasoning_effort=str(reasoning_effort or ""),
+            thinking_enabled=_coerce_bool(thinking_enabled), thinking_budget=int(thinking_budget or 0), reasoning_effort=str(reasoning_effort or ""),
             top_p=top_p, top_k=top_k,
         )
         return f"{provider} 连接成功：{output[:160]}"
@@ -3848,7 +4546,7 @@ def _inline_generate(
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         remove_bad, remove_terms, shuffle, spaces, max_tags,
         structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
-        INLINE_DELTA_DIRECTIVE + "\n\n" + _independent_creative_directive(),
+        INLINE_DELTA_DIRECTIVE + "\n\n" + _independent_creative_directive(recipe=_lexicon_recipe()),
         connection_settings=connection, preserve_inference_settings=True,
     )
     return generated, system, status
@@ -3896,7 +4594,7 @@ def inject_inline_before_negative(component, **kwargs):
 
 
 def _inline_cache_transform(source, action, preset, base_model, instruction, cancel_event):
-    workflow, connection = _workflow_settings(), _connection_settings()
+    workflow, connection = _workflow_settings(), _processed_cache_inference_settings()
     return _expand_or_polish(
         source, _canonical_action(action), _canonical_preset(preset), workflow["system_override"],
         _canonical_base_model(base_model), workflow["safety"], workflow["nsfw_injection"], instruction,
@@ -3981,6 +4679,37 @@ def _processed_result_view(query=""):
     )
 
 
+def _processed_result_manage(action, field, operation, find, value, selected_ids, query="", scope="selected"):
+    """Single bulk-management entry point for processed-result edits/deletes."""
+    records = _processed_result_records(query)
+    selected = {str(item) for item in _selected_values(selected_ids)}
+    if scope != "filtered":
+        if not selected:
+            return gr.update(), gr.update(), "请先选择处理结果。"
+        records = [record for record in records if str(record["id"]) in selected]
+    if not records:
+        return gr.update(), gr.update(), "当前范围没有处理结果。"
+    action = str(action or "edit").strip().casefold()
+    try:
+        if action == "delete":
+            changed = RESULT_DB.delete_prompts([record["id"] for record in records], "processed_result_bulk_delete")
+            message = f"已批量删除 {changed} 条处理结果。"
+        else:
+            changed = RESULT_DB.edit_prompts(
+                records, str(field or "prompt"), str(operation or "replace"),
+                str(find or ""), str(value or ""),
+            )
+            message = f"已批量修改 {changed} 条处理结果。"
+    except (TypeError, ValueError) as error:
+        return gr.update(), gr.update(), f"处理结果批量管理失败：{_safe_error(error)}"
+    refreshed = _processed_result_records(query)
+    return (
+        gr.update(value=_processed_result_rows(refreshed)),
+        gr.update(choices=_processed_result_choices(refreshed), value=[]),
+        message + f" 当前筛选结果 {len(refreshed)} 条。",
+    )
+
+
 def _processed_result_append(selected_ids, query="", scope="selected"):
     records = _processed_result_records(query)
     selected = {str(value) for value in _selected_values(selected_ids)}
@@ -4010,7 +4739,7 @@ def _processed_result_enqueue(selected_ids, query="", queue_ids=None, generation
     settings = _parse_generation_settings(generation_settings)
     submitted = Counter()
     for batch_id in dict.fromkeys(batch_ids):
-        for job in DB.list_server_queue(batch_id, 2000):
+        for job in DB.list_server_queue(batch_id, MAX_SERVER_QUEUE_REQUESTS):
             config = job.get("config") or {}
             if (
                 job.get("status") in {"pending", "running", "completed"}
@@ -4135,14 +4864,14 @@ def _inline_cache_resume(stage, cancel_id):
 def _inline_cache_enqueue_results(stage, selected_id=0, edited_result="", generation_settings=None, queue_ids=None):
     batch_ids = list(dict.fromkeys([*(queue_ids or []), *((stage or {}).get("queue_ids") or [])]))
     if not stage:
-        return stage or {}, batch_ids, "没有已处理结果可入队。", _server_queue_gallery(batch_ids)
+        return stage or {}, batch_ids, "没有已处理结果可入队。"
     queued_ids = {str(item) for item in (stage or {}).get("queued_ids", [])}
     items = [
         dict(item) for item in (stage or {}).get("items", [])
         if str(item["record"]["id"]) not in queued_ids
     ]
     if not items:
-        return stage, batch_ids, "没有新的未入队处理结果。", _server_queue_gallery(batch_ids)
+        return stage, batch_ids, "没有新的未入队处理结果。"
     selected_id = str(selected_id or "")
     edited_result = str(edited_result or "").strip()
     pending = []
@@ -4151,7 +4880,7 @@ def _inline_cache_enqueue_results(stage, selected_id=0, edited_result="", genera
         if prompt:
             pending.append((str(item["record"]["id"]), prompt))
     if not pending:
-        return stage, batch_ids, "没有有效 Prompt 可入队。", _server_queue_gallery(batch_ids)
+        return stage, batch_ids, "没有有效 Prompt 可入队。"
     submitted_batches = 0
     updated_stage = {**stage, "queued_ids": list(stage.get("queued_ids") or []), "queue_ids": batch_ids}
     try:
@@ -4168,16 +4897,16 @@ def _inline_cache_enqueue_results(stage, selected_id=0, edited_result="", genera
             updated_stage["queued_ids"].extend(ident for ident, _ in chunk)
             submitted_batches += 1
     except Exception as error:
-        return updated_stage, batch_ids, f"生图队列提交失败：{_safe_error(error)}", _server_queue_gallery(batch_ids)
+        return updated_stage, batch_ids, f"生图队列提交失败：{_safe_error(error)}"
     return updated_stage, batch_ids, (
         f"已将 {len(pending)} 条已处理 Prompt 加入 {submitted_batches} 个 txt2img 后台生图队列。"
         "队列由 Forge 进程继续执行，关闭或离开浏览器不会停止。"
-    ), _server_queue_gallery(batch_ids)
+    )
 
 
 def _inline_cache_queue_status(batch_ids):
     identifiers = [str(item) for item in (batch_ids or []) if str(item).strip()]
-    jobs = [job for batch_id in identifiers for job in DB.list_server_queue(batch_id, 2000)]
+    jobs = [job for batch_id in identifiers for job in DB.list_server_queue(batch_id, MAX_SERVER_QUEUE_REQUESTS)]
     counts = Counter(job["status"] for job in jobs)
     settings = {}
     for job in jobs:
@@ -4196,22 +4925,6 @@ def _inline_cache_queue_status(batch_ids):
         f"运行中 {counts['running']} · 失败 {counts['error']} · 取消 {counts['cancelled']}" + parameter_hint
         if jobs else "尚未提交生图队列。"
     )
-
-
-def _server_queue_gallery(batch_ids):
-    identifiers = [str(item) for item in (batch_ids or []) if str(item).strip()]
-    images = []
-    for batch_id in identifiers:
-        for job in DB.list_server_queue(batch_id, 2000):
-            for image in job.get("images", []) or []:
-                value = str(image or "").strip()
-                if value:
-                    images.append((value if value.startswith("data:") else f"data:image/png;base64,{value}", f"队列 {job.get('position', '')}"))
-    return images[-100:]
-
-
-def _processed_result_queue_view(batch_ids):
-    return _inline_cache_queue_status(batch_ids), _server_queue_gallery(batch_ids)
 
 
 def _inline_cache_cancel_queues(batch_ids):
@@ -4292,6 +5005,7 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
     """Select source records for processing; cache management stays in its tab."""
     prefix = f"llm_prompt_studio_{slot}_cache"
     workflow = _workflow_settings()
+    cache_inference = _processed_cache_inference_settings()
     initial_picker, initial_message, _, _, _ = _cache_picker_view()
     with gr.Accordion("缓存 Prompt 处理", open=False, elem_id=prefix, elem_classes=["lps-inline-cache"]):
         with gr.Row(elem_classes=["lps-form-row"]):
@@ -4314,6 +5028,23 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
             model = gr.Dropdown(label="目标模型", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id=f"{prefix}_model")
             action = gr.Radio(label="操作", choices=ACTION_UI_CHOICES, value="Polish", elem_id=f"{prefix}_action")
         instruction = gr.Textbox(label="处理要求（可选）", lines=1, max_lines=6, elem_id=f"{prefix}_instruction")
+        with gr.Accordion("处理结果库独立 LLM 参数", open=False, elem_classes=["lps-settings-section"]):
+            gr.Markdown("仅影响缓存 Prompt 处理并写入处理结果库；服务商、地址、模型和凭据继承主连接，推理参数独立保存。")
+            with gr.Row(elem_classes=["lps-model-settings-row"]):
+                cache_temperature = gr.Number(label="温度", value=cache_inference["temperature"], minimum=0, maximum=2, step=0.05)
+                cache_top_p = gr.Number(label="Top P", value=cache_inference["top_p"], minimum=0, maximum=1, step=0.01)
+                cache_top_k = gr.Number(label="Top K", value=cache_inference["top_k"], minimum=0, maximum=100000, precision=0)
+                cache_max_tokens = gr.Number(label="最大 Token", value=cache_inference["max_tokens"], minimum=0, maximum=262144, precision=0)
+            with gr.Row(elem_classes=["lps-model-settings-row"]):
+                cache_timeout = gr.Number(label="超时（秒）", value=cache_inference["timeout"], minimum=5, maximum=600, precision=0)
+                cache_retry_count = gr.Number(label="重试次数", value=cache_inference["retry_count"], minimum=0, maximum=5, precision=0)
+                cache_thinking_enabled = gr.Checkbox(label="启用思考", value=cache_inference["thinking_enabled"])
+                cache_send_temperature = gr.Checkbox(label="发送温度", value=cache_inference["send_temperature"])
+            with gr.Row(elem_classes=["lps-model-settings-row"]):
+                cache_thinking_budget = gr.Number(label="思考预算", value=cache_inference["thinking_budget"], minimum=0, maximum=262144, precision=0)
+                cache_reasoning_effort = gr.Dropdown(label="推理强度", choices=[("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high")], value=cache_inference["reasoning_effort"])
+                cache_save = gr.Button("保存处理结果库参数")
+            cache_settings_status = gr.Markdown(elem_classes=["lps-status"])
         with gr.Row(elem_classes=["lps-form-row"]):
             scope = gr.Radio(label="处理范围", choices=["当前记录", "全部筛选结果"], value="当前记录", elem_id=f"{prefix}_scope")
             run = gr.Button("开始处理", variant="primary", size="sm", elem_id=f"{prefix}_run")
@@ -4382,6 +5113,13 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
             values.append(gr.update(visible=bool(values[0])))
             return values
 
+        cache_save.click(
+            _save_processed_cache_inference_settings,
+            inputs=[cache_temperature, cache_timeout, cache_max_tokens, cache_retry_count,
+                    cache_thinking_enabled, cache_thinking_budget, cache_reasoning_effort,
+                    cache_send_temperature, cache_top_p, cache_top_k],
+            outputs=cache_settings_status,
+        )
         browse_inputs = [query, fmt, model_filter, page]
         browse_outputs = [picker, browse_status, page, selected, source]
         refresh.click(_cache_picker_view, inputs=[query, fmt, model_filter], outputs=browse_outputs)
@@ -4419,12 +5157,12 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
         enqueue_event = enqueue_images.click(
             _inline_cache_enqueue_results,
             inputs=[stage, result_id, result, queue_controls["settings"], queue_controls["ids"]],
-            outputs=[stage, queue_controls["ids"], enqueue_status, queue_controls["gallery"]],
+            outputs=[stage, queue_controls["ids"], enqueue_status],
             js="(stage, resultId, result, settings, ids) => [stage, resultId, result, window.llmPromptStudioAutoLoop.readTxt2imgSettings() || settings, ids]",
         )
         enqueue_event.then(
-            lambda ids: (*_processed_result_queue_view(ids), gr.update(open=True)),
-            inputs=queue_controls["ids"], outputs=[queue_controls["status"], queue_controls["gallery"], queue_controls["panel"]], queue=False,
+            lambda ids: (_inline_cache_queue_status(ids), gr.update(open=True)),
+            inputs=queue_controls["ids"], outputs=[queue_controls["status"], queue_controls["panel"]], queue=False,
         )
 
 
@@ -4553,6 +5291,16 @@ def _wd14_interrogate(image, model, threshold, character_threshold=0.85):
     return interrogate_local(image, model, threshold, character_threshold)
 
 
+def _wd14_release_after_batch():
+    """Release the cached ONNX session when a batch no longer needs it."""
+    try:
+        return unload_local_model()
+    except Exception as error:
+        # Cleanup must not hide the batch result or turn a completed job into a failure.
+        LOGGER.warning("WD14 model cleanup skipped: %s", error)
+        return ""
+
+
 def _wd14_process(image, model, threshold, character_threshold, *llm_args):
     tags, status = _wd14_interrogate(image, model, threshold, character_threshold)
     if not tags:
@@ -4624,6 +5372,7 @@ def _wd14_run_batch(folder, recursive, model, threshold, character_threshold, ta
     finally:
         with _WD14_BATCH_LOCK:
             job._studio_running = False
+        _wd14_release_after_batch()
 
 
 def _wd14_cancel_batch(task_id):
@@ -4866,7 +5615,7 @@ def _api_auto_loop_generate(payload: dict[str, Any]):
         connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"],
         workflow["spaces"], workflow["max_tags"], workflow["structured_mode"],
-        workflow["region_count"], bool(payload.get("cache_result", workflow["cache_result"])),
+        workflow["region_count"], _coerce_bool(payload.get("cache_result"), workflow["cache_result"]),
     )
     if not generated:
         raise ValueError(status)
@@ -4898,7 +5647,7 @@ def _normalize_ranbooru_handoff(payload: dict[str, Any]) -> dict[str, Any]:
     selected_prompt = str(payload.get("selected_prompt") or "").strip()
     if max(len(tags_prompt), len(natural_prompt), len(selected_prompt)) > 100000:
         raise ValueError("Ranbooru 交接 Prompt 超过 100000 字符上限")
-    selected_is_natural = bool(payload.get("selected_is_natural"))
+    selected_is_natural = _coerce_bool(payload.get("selected_is_natural"), False)
     if not tags_prompt and selected_prompt and not selected_is_natural:
         tags_prompt = selected_prompt
     if not natural_prompt and selected_prompt and selected_is_natural:
@@ -4956,11 +5705,104 @@ def receive_ranbooru_handoff(payload: dict[str, Any], action: str = "send") -> d
     }
 
 
+def _normalize_generic_handoff(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a plugin-neutral raw prompt handoff.
+
+    Ranbooru keeps its richer adapter above; other extensions only need a
+    stable source identity and one raw prompt string.
+    """
+    payload = dict(payload or {})
+    allowed = {"schema", "source_kind", "source_ref", "source_id", "prompt", "raw_prompt", "negative_prompt", "metadata"}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"通用交接包含不支持的字段：{', '.join(unknown)}")
+    schema = str(payload.get("schema") or "prompt_studio.handoff.v1").strip()
+    if schema != "prompt_studio.handoff.v1":
+        raise ValueError("通用交接 schema 必须是 prompt_studio.handoff.v1")
+    source_kind = str(payload.get("source_kind") or "").strip()
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", source_kind) or source_kind.casefold() == "ranbooru":
+        raise ValueError("通用交接必须提供 1 到 80 个字符的非 Ranbooru source_kind")
+    raw_prompt_value = payload.get("raw_prompt")
+    prompt_value = payload.get("prompt")
+    if raw_prompt_value is not None and not isinstance(raw_prompt_value, str):
+        raise ValueError("通用交接 raw_prompt 必须是字符串")
+    if prompt_value is not None and not isinstance(prompt_value, str):
+        raise ValueError("通用交接 prompt 必须是字符串")
+    prompt = str(raw_prompt_value or prompt_value or "").strip()
+    if not prompt:
+        raise ValueError("通用交接没有可用的原始 Prompt")
+    if len(prompt) > 16000:
+        raise ValueError("通用交接原始 Prompt 超过 16000 字符上限")
+    negative_prompt_value = payload.get("negative_prompt")
+    if negative_prompt_value is not None and not isinstance(negative_prompt_value, str):
+        raise ValueError("通用交接 negative_prompt 必须是字符串")
+    negative_prompt = str(negative_prompt_value or "").strip()
+    if len(negative_prompt) > 16000:
+        raise ValueError("通用交接负面 Prompt 超过 16000 字符上限")
+    if negative_prompt and len(prompt) + len("\n\nNEGATIVE PROMPT (avoid these concepts):\n") + len(negative_prompt) > 16000:
+        raise ValueError("通用交接 Prompt 与负面 Prompt 合计超过 16000 字符上限")
+    metadata = payload.get("metadata", {})
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise ValueError("通用交接 metadata 必须是对象")
+    try:
+        metadata_json = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+        metadata_size = len(metadata_json.encode("utf-8"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("通用交接 metadata 必须可序列化为 JSON") from error
+    if metadata_size > 32768:
+        raise ValueError("通用交接 metadata 超过 32KB 限制")
+    source_ref = str(payload.get("source_ref") or payload.get("source_id") or "").strip()[:500]
+    if not source_ref:
+        # Derive an idempotency key from the complete normalized payload so a
+        # negative prompt or metadata change cannot overwrite a different
+        # handoff that omitted an explicit source reference.
+        canonical = json.dumps(
+            {
+                "source_kind": source_kind,
+                "raw_prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "metadata": metadata,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        source_ref = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return {
+        "schema": schema,
+        "source_kind": source_kind,
+        "source_ref": source_ref,
+        "raw_prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "metadata": metadata,
+    }
+
+
+def receive_handoff(payload: dict[str, Any], action: str = "send") -> dict[str, Any]:
+    """Receive versioned generic handoffs and the legacy Ranbooru shape."""
+    payload = dict(payload or {})
+    if "schema" in payload:
+        normalized = _normalize_generic_handoff(payload)
+    elif any(key in payload for key in ("ranbooru_id", "tags_prompt", "natural_prompt", "selected_prompt")):
+        return receive_ranbooru_handoff(payload, action)
+    else:
+        normalized = _normalize_generic_handoff(payload)
+    handoff_id = DB.save_handoff(
+        normalized, normalized["source_kind"], normalized["source_ref"], action,
+    )
+    return {
+        "handoff_id": handoff_id,
+        "status": "已加入 LLM 处理队列。" if action != "send" else "已发送到 LLM 提示词工作室。",
+    }
+
+
 def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
     if record.get("status") == "completed" and str(record.get("result_prompt") or "").strip():
         return {
             "handoff_id": record["id"], "prompt": record["result_prompt"], "system_prompt": "",
-            "status": "Ranbooru 实时处理已完成，复用已有结果，未重复请求 LLM。",
+            "status": f"{record.get('source_kind') or '插件'} 实时处理已完成，复用已有结果，未重复请求 LLM。",
         }
     claimed = DB.claim_handoff(record["id"])
     if claimed is None:
@@ -4968,7 +5810,7 @@ def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
         if latest and latest.get("status") == "completed" and str(latest.get("result_prompt") or "").strip():
             return {
                 "handoff_id": latest["id"], "prompt": latest["result_prompt"], "system_prompt": "",
-                "status": "Ranbooru 实时处理已完成，复用已有结果，未重复请求 LLM。",
+                "status": f"{latest.get('source_kind') or '插件'} 实时处理已完成，复用已有结果，未重复请求 LLM。",
             }
         raise ValueError("交接记录正在处理，或当前状态不允许重复执行")
     record = claimed
@@ -4980,18 +5822,33 @@ def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
         )
         raise ValueError(message)
     payload = record.get("payload") or {}
+    source_kind = str(record.get("source_kind") or "ranbooru")
     workflow = _workflow_settings()
-    connection = _connection_settings()
+    connection = _handoff_inference_settings()
     preset = workflow["preset"]
     base_model = workflow["base_model"]
     safety = _handoff_safety(payload.get("rating", ""), workflow["safety"])
-    selected_prompt = str(payload.get("selected_prompt") or "").strip()
-    natural_prompt = str(payload.get("natural_prompt") or "").strip()
-    selected_is_natural = bool(payload.get("selected_is_natural") and natural_prompt)
-    source_tags = "" if selected_is_natural else str(payload.get("tags_prompt") or "").strip()
-    request = natural_prompt if selected_is_natural else str(natural_prompt or selected_prompt).strip()
+    if source_kind == "ranbooru":
+        selected_prompt = str(payload.get("selected_prompt") or "").strip()
+        natural_prompt = str(payload.get("natural_prompt") or "").strip()
+        selected_is_natural = _coerce_bool(payload.get("selected_is_natural"), False) and bool(natural_prompt)
+        source_tags = "" if selected_is_natural else str(payload.get("tags_prompt") or "").strip()
+        request = natural_prompt if selected_is_natural else str(natural_prompt or selected_prompt).strip()
+    else:
+        source_tags = ""
+        request = str(payload.get("raw_prompt") or payload.get("prompt") or "").strip()
+        negative_prompt = str(payload.get("negative_prompt") or "").strip()
+        if negative_prompt:
+            request = f"{request}\n\nNEGATIVE PROMPT (avoid these concepts):\n{negative_prompt}"
+    if source_kind == "ranbooru":
+        negative_prompt = ""
     if not source_tags and not request:
-        raise ValueError("交接记录没有可处理的 Prompt")
+        message = "交接记录没有可处理的 Prompt"
+        DB.update_handoff(
+            record["id"], "error", error=message,
+            expected_claim_token=record.get("claim_token"), expected_revision=record.get("revision"),
+        )
+        raise ValueError(message)
     profile_key = hashlib.sha256(f"{preset}\x1f{base_model}".encode("utf-8")).hexdigest()[:12]
     prompt_source_ref = f"{record['source_ref']}:llm:{profile_key}"
     generated = system = status = ""
@@ -5002,9 +5859,11 @@ def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
             connection["provider"], connection["endpoint"], connection["model"], "",
             connection["temperature"], connection["timeout"], connection["max_tokens"],
             connection["send_temperature"],
-            workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
+            _coerce_bool(workflow["remove_bad"], True), workflow["remove_terms"],
+            _coerce_bool(workflow["shuffle"]), _coerce_bool(workflow["spaces"]),
             workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
-            0, False, "ranbooru", prompt_source_ref, True,
+            0, False, source_kind, prompt_source_ref, False,
+            connection_settings=connection, preserve_inference_settings=True,
         )
     except Exception as error:
         generated = ""
@@ -5022,9 +5881,9 @@ def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
                 if not owns_revision:
                     raise ValueError("交接已被新版本替代；旧 LLM 结果已丢弃")
                 DB.save_prompt(
-                    generated, "", preset, base_model, 0, source_tags or request,
-                    score_source="unrated", score_reason="Ranbooru 交接未评分",
-                    source_kind="ranbooru", source_ref=prompt_source_ref, dedupe=True,
+                    generated, negative_prompt, preset, base_model, 0, source_tags or request,
+                    score_source="unrated", score_reason=f"{source_kind} 交接未评分",
+                    source_kind=source_kind, source_ref=prompt_source_ref, dedupe=True,
                 )
                 completed = DB.update_handoff(
                     record["id"], "completed", result_prompt=generated,
@@ -5043,14 +5902,14 @@ def _process_handoff_record(record: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{cache_error}；记录已保留，可手动重试") from error
         return {
             "handoff_id": record["id"], "prompt": generated, "system_prompt": system,
-            "status": f"Ranbooru 实时处理完成（LLM 请求 1 次）：{status}",
+            "status": f"{source_kind} 交接处理完成（LLM 请求 1 次）：{status}",
         }
     if not DB.update_handoff(
         record["id"], "error", error=status,
         expected_claim_token=record.get("claim_token"), expected_revision=record.get("revision"),
     ):
         raise ValueError("交接已被新版本替代；旧 LLM 错误结果已丢弃")
-    raise ValueError(f"Ranbooru 实时处理失败，已记录并可手动重试：{status}")
+    raise ValueError(f"{source_kind} 交接处理失败，已记录并可手动重试：{status}")
 
 
 def process_ranbooru_handoff(payload_or_id: dict[str, Any] | int | str) -> dict[str, Any]:
@@ -5067,20 +5926,45 @@ def process_ranbooru_handoff(payload_or_id: dict[str, Any] | int | str) -> dict[
     return _process_handoff_record(record)
 
 
+def process_handoff(payload_or_id: dict[str, Any] | int | str) -> dict[str, Any]:
+    if isinstance(payload_or_id, dict):
+        handoff_id = payload_or_id.get("handoff_id")
+        if handoff_id is not None and set(payload_or_id).issubset({"handoff_id"}):
+            try:
+                record = DB.get_handoff(int(handoff_id))
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError("请选择有效的交接记录") from error
+        else:
+            received = receive_handoff(payload_or_id, "process_and_cache")
+            record = DB.get_handoff(received["handoff_id"])
+    else:
+        try:
+            record = DB.get_handoff(int(payload_or_id))
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("请选择有效的交接记录") from error
+    if not record:
+        raise ValueError("交接记录不存在或已被清理")
+    return _process_handoff_record(record)
+
+
 def _handoff_views(selected=None):
     records = DB.list_handoffs()
     rows, choices = [], []
     for record in records:
         payload = record.get("payload") or {}
-        preview = " ".join(str(payload.get("selected_prompt") or payload.get("tags_prompt") or "").split())
+        preview = " ".join(str(
+            payload.get("selected_prompt") or payload.get("natural_prompt") or
+            payload.get("raw_prompt") or payload.get("prompt") or payload.get("tags_prompt") or ""
+        ).split())
         if len(preview) > 72:
             preview = preview[:69] + "..."
         label = HANDOFF_STATUS_LABELS.get(record["status"], record["status"])
         choices.append((f"#{record['id']} | {label} | {preview}", str(record["id"])))
         rows.append([
-            record["id"], label, record["attempts"], payload.get("ranbooru_id", ""),
+            record["id"], label, record["attempts"], record.get("source_kind", ""),
             payload.get("rating", ""), payload.get("source_score", 0),
-            payload.get("tags_prompt", ""), payload.get("natural_prompt", ""),
+            payload.get("tags_prompt", "") or payload.get("raw_prompt", "") or payload.get("prompt", ""),
+            payload.get("natural_prompt", "") or payload.get("negative_prompt", ""),
             record.get("error") or record.get("payload_decode_error", ""), record.get("result_prompt", ""),
         ])
     available = {value for _, value in choices}
@@ -5125,23 +6009,23 @@ def _load_handoff_into_generation(handoff_id):
     if not record:
         return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), "请选择一条交接记录。"
     payload = record.get("payload") or {}
-    has_tags = bool(str(payload.get("tags_prompt") or "").strip())
+    has_tags = record.get("source_kind") == "ranbooru" and bool(str(payload.get("tags_prompt") or "").strip())
     preset = "NoobAI Tags" if has_tags else "Krea 2 Natural"
     base_model = "NoobAI" if has_tags else "Krea 2"
     workflow = _workflow_settings()
     return (
-        payload.get("natural_prompt") or payload.get("selected_prompt") or "",
+        payload.get("natural_prompt") or payload.get("selected_prompt") or payload.get("raw_prompt") or payload.get("prompt") or "",
         payload.get("tags_prompt") or "",
         preset,
         base_model,
         _handoff_safety(payload.get("rating", ""), workflow["safety"]),
-        f"已载入 Ranbooru 交接 #{record['id']}，可在“生成提示词”页继续编辑。",
+        f"已载入 {record.get('source_kind') or '插件'} 交接 #{record['id']}，可在“生成提示词”页继续编辑。",
     )
 
 
 def _process_selected_handoff(handoff_id, query="", min_score=0, output_mode="全部", base_model="全部"):
     try:
-        result = process_ranbooru_handoff(handoff_id)
+        result = process_handoff(handoff_id)
         message = result["status"]
         prompt = result["prompt"]
         system = result["system_prompt"]
@@ -5239,7 +6123,7 @@ def on_app_started(_, app):
 
         @app.post("/llm-prompt-studio/v1/native-cache/release", dependencies=api_dependencies)
         def prompt_studio_native_cache_release(payload: dict[str, Any]):
-            return _native_cache_release(payload.get("token", ""), bool(payload.get("commit")))
+            return _native_cache_release(payload.get("token", ""), _coerce_bool(payload.get("commit"), False))
 
         @app.post("/llm-prompt-studio/v1/auto-loop-generate", dependencies=api_dependencies)
         def prompt_studio_auto_loop_generate(payload: dict[str, Any]):
@@ -5283,20 +6167,24 @@ def on_app_started(_, app):
         @app.post("/llm-prompt-studio/v1/handoff", dependencies=api_dependencies)
         def prompt_studio_handoff(payload: dict[str, Any]):
             try:
-                return receive_ranbooru_handoff(payload)
+                return receive_handoff(payload)
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
 
         @app.post("/llm-prompt-studio/v1/handoff/process", dependencies=api_dependencies)
         def prompt_studio_handoff_process(payload: dict[str, Any]):
             try:
-                return process_ranbooru_handoff(payload)
+                return process_handoff(payload)
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
 
         @app.get("/llm-prompt-studio/v1/handoffs", dependencies=api_dependencies)
         def prompt_studio_handoffs(limit: int = 100):
-            return {"records": DB.list_handoffs(limit)}
+            try:
+                bounded_limit = max(1, min(int(limit or 100), 1000))
+            except (TypeError, ValueError, OverflowError) as error:
+                raise HTTPException(status_code=400, detail="limit 必须是 1 到 1000 的整数") from error
+            return {"records": DB.list_handoffs(bounded_limit)}
     except Exception as error:
         LOGGER.exception("API registration failed: %s", error)
     # Do not start the server-owned generation worker during WebUI startup.
@@ -5312,27 +6200,26 @@ def on_app_started(_, app):
 
 def on_ui_tabs():
     llm_settings = _connection_settings()
+    handoff_settings = _handoff_inference_settings()
     workflow = _workflow_settings()
     ranbooru_link = _ranbooru_link_settings()
     initial_records = DB.list_prompts(limit=None)
     initial_processed_records = _processed_result_records()
     initial_handoff_table, initial_handoff_choices, initial_handoff_status = _handoff_views()
-    with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio") as ui:
-        gr.Markdown("## LLM 提示词工作室", elem_classes=["lps-heading"])
+    with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio", elem_classes=["lps-app-shell"]) as ui:
+        gr.Markdown("## LLM 提示词工作室", elem_classes=["lps-heading", "lps-brand-heading"])
         processed_result_queue_ids = gr.State([])
         processed_result_generation_settings = gr.Textbox(value="{}", visible=False)
         result_queue_panel = gr.Accordion("缓存结果生图队列", open=False, render=False,
                                          elem_id="llm_prompt_studio_result_queue")
         processed_result_queue_status = gr.Markdown("尚未提交生图队列。", render=False,
             elem_id="llm_prompt_studio_processed_result_queue_status")
-        processed_result_gallery = gr.Gallery(label="已生成图片", columns=4, height=320, render=False,
-            elem_id="llm_prompt_studio_processed_result_gallery")
         result_queue_controls = dict(ids=processed_result_queue_ids, settings=processed_result_generation_settings,
-            panel=result_queue_panel, status=processed_result_queue_status, gallery=processed_result_gallery)
+            panel=result_queue_panel, status=processed_result_queue_status)
         with gr.Tabs(elem_id="llm_prompt_studio_main_tabs"):
             with gr.Tab("生成", elem_id="llm_prompt_studio_generate_tab"):
                 with gr.Row(elem_classes=["lps-main-workbench"]):
-                    with gr.Column(scale=3, elem_classes=["lps-source-column"]):
+                    with gr.Column(scale=3, elem_classes=["lps-source-column", "lps-panel"]):
                         request = gr.Textbox(
                             label="创作要求",
                             value=_template_request(_default_template_choice()),
@@ -5379,7 +6266,7 @@ def on_ui_tabs():
                                 template_default = gr.Button("设为默认模板", elem_id="llm_prompt_studio_template_default")
                                 template_delete = gr.Button("删除所选自定义模板", variant="stop", elem_id="llm_prompt_studio_template_delete")
                             template_status = gr.Markdown(elem_id="llm_prompt_studio_template_status")
-                    with gr.Column(scale=2, elem_classes=["lps-rules-column"]):
+                    with gr.Column(scale=2, elem_classes=["lps-rules-column", "lps-panel"]):
                         with gr.Row():
                             preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
                             base_model = gr.Dropdown(label="模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
@@ -5405,7 +6292,7 @@ def on_ui_tabs():
                             max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=workflow["max_tags"], step=1)
                         save_score = gr.Number(value=0, visible=False)
                         cache_result = gr.State(True)
-                with gr.Row(elem_classes=["lps-generation-destination"]):
+                with gr.Row(elem_classes=["lps-generation-destination", "lps-toolbar"]):
                     generation_destination = gr.Radio(
                         label="生成去向", choices=[("仅保存到缓存", "cache"), ("生成并加入生图队列", "queue")],
                         value="cache", elem_id="llm_prompt_studio_generation_destination", scale=3,
@@ -5434,7 +6321,7 @@ def on_ui_tabs():
                         batch_skip_failed = gr.Checkbox(label="失败后继续", value=workflow["batch_skip_failed"])
                     batch_preview_button = gr.Button("预览任务")
                     batch_preview_status = gr.Markdown()
-                with gr.Row(elem_classes=["lps-primary-actions"]):
+                with gr.Row(elem_classes=["lps-primary-actions", "lps-action-bar"]):
                     generate = gr.Button("生成到缓存", variant="primary", elem_id="llm_prompt_studio_generate_button", elem_classes=["lps-primary"])
                     batch_cancel = gr.Button("停止", variant="stop", elem_id="llm_prompt_studio_generation_stop")
                 batch_status = gr.Markdown("就绪", elem_id="llm_prompt_studio_batch_status", elem_classes=["lps-status"])
@@ -5442,7 +6329,7 @@ def on_ui_tabs():
                 system_preview = gr.Textbox(visible=False, elem_id="llm_prompt_studio_system_preview")
                 batch_task_id = gr.State(lambda: uuid.uuid4().hex)
                 batch_issue_state = gr.State([])
-                with gr.Accordion("本次结果", open=False):
+                with gr.Accordion("本次结果", open=False, elem_classes=["lps-result-panel"]):
                     batch_queue = gr.Dataframe(
                         value=[], headers=["序号", "输入", "生成结果", "状态"],
                         datatype=["number", "str", "str", "str"], interactive=False, wrap=True,
@@ -5458,7 +6345,7 @@ def on_ui_tabs():
                         batch_select_all_issues = gr.Button("全选")
                         batch_clear_issue_selection = gr.Button("清空选择")
                         batch_retry_selected = gr.Button("重试所选", variant="primary")
-                with gr.Accordion("生图队列", open=True, visible=False, elem_id="llm_prompt_studio_generation_queue") as generation_queue_panel:
+                with gr.Accordion("生图队列", open=True, visible=False, elem_id="llm_prompt_studio_generation_queue", elem_classes=["lps-result-panel"]) as generation_queue_panel:
                     with gr.Row():
                         server_queue_refresh = gr.Button("刷新进度", elem_id="llm_prompt_studio_server_queue_refresh")
                         server_queue_cancel = gr.Button("取消等待中的生图", variant="stop", elem_id="llm_prompt_studio_server_queue_cancel")
@@ -5466,7 +6353,7 @@ def on_ui_tabs():
                     server_queue_generation_settings = gr.Textbox(value="{}", visible=False, elem_id="llm_prompt_studio_server_queue_generation_settings")
                     server_queue_status = gr.HTML("", elem_id="llm_prompt_studio_server_queue_status", elem_classes=["lps-status"])
                     server_queue_log = gr.HTML("", elem_id="llm_prompt_studio_server_queue_log", elem_classes=["lps-auto-loop-log"])
-                with gr.Accordion("工作参数", open=False, elem_classes=["lps-secondary-panel"]):
+                with gr.Accordion("工作参数", open=False, elem_classes=["lps-secondary-panel", "lps-utility-panel"]):
                     with gr.Row():
                         save_workflow = gr.Button("保存当前参数")
                         reset_workflow = gr.Button("恢复默认")
@@ -5475,7 +6362,7 @@ def on_ui_tabs():
                     _create_inline_cache_panel("txt2img", _PROMPT_TARGETS.get("txt2img"), result_queue_controls)
 
             with gr.Tab("缓存", elem_id="llm_prompt_studio_library_tab"):
-                with gr.Accordion("导入与插件批次", open=False, elem_id="llm_prompt_studio_png_batch_tab"):
+                with gr.Accordion("导入与插件批次", open=False, elem_id="llm_prompt_studio_png_batch_tab", elem_classes=["lps-import-panel"]):
                     with gr.Row(elem_classes=["lps-plugin-source-actions"]):
                         png_collector_pull = gr.Button(
                             "读取 PNG Collector 当前缓存",
@@ -5576,12 +6463,12 @@ def on_ui_tabs():
                         outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
                     )
 
-                with gr.Row():
+                with gr.Row(elem_classes=["lps-filter-bar"]):
                     cache_query = gr.Textbox(label="搜索 Prompt、负面词、源标签或外部来源", scale=4)
                     cache_min_score = gr.Number(value=0, visible=False)
                     cache_output_filter = gr.Dropdown(label="格式", choices=["全部"] + PRESET_UI_CHOICES, value="全部", scale=2)
                     cache_model_filter = gr.Dropdown(label="目标模型", choices=["全部"] + MODEL_UI_CHOICES, value="全部", scale=2)
-                with gr.Row():
+                with gr.Row(elem_classes=["lps-pagination-bar"]):
                     refresh = gr.Button("应用筛选", variant="primary", elem_classes=["lps-primary"])
                     clear_filters = gr.Button("清除筛选", elem_classes=["lps-secondary"])
                     undo_delete = gr.Button("撤销删除", elem_classes=["lps-secondary"])
@@ -5595,9 +6482,9 @@ def on_ui_tabs():
                     value=_as_rows(initial_records), label="已缓存 Prompt",
                     headers=["序号", "ID", "格式", "模型", "正向提示词", "来源"],
                     datatype=["number", "number", "str", "str", "str", "str"],
-                    interactive=False, wrap=False, height=520, elem_id="llm_prompt_studio_cache_table", elem_classes=["lps-table"],
+                    interactive=False, wrap=False, height=520, elem_id="llm_prompt_studio_cache_table", elem_classes=["lps-table", "lps-table-card"],
                 )
-                with gr.Accordion("单条编辑 · 点击上方记录载入全文", open=True):
+                with gr.Accordion("编辑 / 删除当前记录", open=True, elem_classes=["lps-editor-panel"]):
                     with gr.Row():
                         record_id = gr.Textbox(label="当前内部 ID", interactive=False)
                         record_output_mode = gr.Dropdown(label="格式", choices=PRESET_UI_CHOICES, value=workflow["preset"], allow_custom_value=True)
@@ -5607,39 +6494,50 @@ def on_ui_tabs():
                     record_prompt = gr.Textbox(label="正向提示词", lines=6, max_lines=30, elem_classes=["lps-output"])
                     record_negative = gr.Textbox(label="负面提示词", lines=2, max_lines=4, visible=False)
                     with gr.Row():
+                        load_selected = gr.Button("载入所选单条", visible=False)
                         save = gr.Button("保存当前记录", variant="primary")
                         save_as_new = gr.Button("另存为新记录")
-                with gr.Accordion("删除当前记录", open=False):
-                    with gr.Row():
-                        load_selected = gr.Button("载入所选单条", visible=False)
                         preview_selected = gr.Button("预览删除当前记录")
                         delete_selected = gr.Button("确认删除当前记录", variant="stop")
                     selection_preview = gr.Textbox(label="删除预览", lines=1, max_lines=2, interactive=False)
-                with gr.Accordion("批量修改 · 当前记录 / 全部筛选结果", open=False):
+                with gr.Accordion("批量修改 / 删除", open=False, elem_classes=["lps-editor-panel"]):
                     edit_snapshot = gr.State({})
                     with gr.Row():
-                        edit_scope = gr.Radio(label="范围", choices=["当前记录", "全部筛选结果"], value="全部筛选结果")
+                        edit_scope = gr.Radio(label="修改范围", choices=["当前记录", "全部筛选结果"], value="全部筛选结果")
                         edit_field = gr.Dropdown(label="字段", choices=list(CACHE_EDIT_FIELDS), value="正向提示词")
-                        edit_operation = gr.Dropdown(label="操作", choices=list(CACHE_EDIT_OPERATIONS), value="查找替换")
+                        edit_operation = gr.Dropdown(label="修改方式", choices=list(CACHE_EDIT_OPERATIONS), value="查找替换")
                     with gr.Row():
                         edit_find = gr.Textbox(label="查找文字（精确匹配）")
                         edit_value = gr.Textbox(label="替换 / 写入内容（追加时自行包含空格或逗号）")
                     with gr.Row():
-                        edit_preview_button = gr.Button("预览影响范围")
-                        edit_apply = gr.Button("应用预览中的修改", variant="primary")
+                        edit_preview_button = gr.Button("预览修改范围")
+                        edit_apply = gr.Button("应用修改", variant="primary")
                     edit_preview_text = gr.Textbox(label="修改预览", lines=3, max_lines=5, interactive=False)
-                with gr.Accordion("按全库序号批量管理", open=False):
-                    position_spec = gr.Textbox(label="全库序号或范围", placeholder="1-100,205,300-320")
                     with gr.Row():
-                        preview_positions = gr.Button("预览这些序号")
+                        position_spec = gr.Textbox(label="删除范围（全库序号或范围）", placeholder="1-100,205,300-320")
+                        preview_positions = gr.Button("预览删除范围")
                         delete_positions = gr.Button("删除这些序号", variant="stop")
-                with gr.Accordion("Ranbooru 实时交接箱", open=False):
+                with gr.Accordion("插件实时交接箱", open=False, elem_classes=["lps-handoff-panel"]):
+                    gr.Markdown("外部插件原始 Prompt 使用独立推理参数（默认继承主连接）。", elem_classes=["lps-status"])
+                    with gr.Row(elem_classes=["lps-model-settings-row", "lps-handoff-settings"]):
+                        handoff_temperature = gr.Number(label="交接温度", value=handoff_settings["temperature"], minimum=0, maximum=2, step=0.05)
+                        handoff_timeout = gr.Number(label="交接超时（秒）", value=handoff_settings["timeout"], minimum=5, maximum=600, precision=0)
+                        handoff_max_tokens = gr.Number(label="交接最大 Token", value=handoff_settings["max_tokens"], minimum=0, maximum=262144, precision=0)
+                        handoff_retry_count = gr.Number(label="交接重试次数", value=handoff_settings["retry_count"], minimum=0, maximum=5, precision=0)
+                        handoff_top_p = gr.Number(label="交接 Top P", value=handoff_settings["top_p"], minimum=0, maximum=1, step=0.01)
+                        handoff_top_k = gr.Number(label="交接 Top K", value=handoff_settings["top_k"], minimum=0, maximum=100000, precision=0)
+                    with gr.Row(elem_classes=["lps-model-settings-row", "lps-handoff-settings"]):
+                        handoff_thinking_enabled = gr.Checkbox(label="交接启用思考", value=handoff_settings["thinking_enabled"])
+                        handoff_thinking_budget = gr.Number(label="交接思考预算", value=handoff_settings["thinking_budget"], minimum=0, maximum=262144, precision=0)
+                        handoff_reasoning_effort = gr.Dropdown(label="交接推理强度", choices=[("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high")], value=handoff_settings["reasoning_effort"])
+                        handoff_send_temperature = gr.Checkbox(label="交接发送温度", value=handoff_settings["send_temperature"])
+                    handoff_save_settings = gr.Button("保存交接推理参数")
                     handoff_selection = gr.Dropdown(
                         label="选择交接记录",
                         choices=initial_handoff_choices.get("choices", []),
                         value=initial_handoff_choices.get("value"),
                     )
-                    with gr.Row():
+                    with gr.Row(elem_classes=["lps-handoff-actions"]):
                         handoff_refresh = gr.Button("刷新交接箱")
                         handoff_load = gr.Button("载入到生成页")
                         handoff_process = gr.Button("使用 LLM 处理并缓存", variant="primary")
@@ -5649,11 +6547,11 @@ def on_ui_tabs():
                     handoff_table = gr.Dataframe(
                         value=initial_handoff_table.get("value", []),
                         headers=[
-                                "交接 ID", "状态", "尝试次数", "Ranbooru ID", "分级", "源评分",
-                                "Tag Prompt", "自然语言 Prompt", "错误", "LLM 结果",
+                                "交接 ID", "状态", "尝试次数", "来源插件", "分级", "源评分",
+                                "源 Prompt", "自然语言 / 负面 Prompt", "错误", "LLM 结果",
                         ],
                         datatype=["number", "str", "number", "str", "str", "number", "str", "str", "str", "str"],
-                        interactive=False, wrap=True, label="实时交接、错误与跳过汇总", elem_id="llm_prompt_studio_handoff_table", elem_classes=["lps-table"],
+                        interactive=False, wrap=True, label="实时交接、错误与跳过汇总", elem_id="llm_prompt_studio_handoff_table", elem_classes=["lps-table", "lps-table-card"],
                     )
                 with gr.Accordion("JSON / CSV 导入导出", open=False):
                     with gr.Row():
@@ -5665,8 +6563,8 @@ def on_ui_tabs():
                         export_button = gr.Button("导出全部缓存")
                     export_file = gr.File(label="导出文件", interactive=False)
 
-            with gr.Tab("处理结果库", elem_id="llm_prompt_studio_processed_results_tab"):
-                with gr.Row(elem_classes=["lps-form-row"]):
+            with gr.Tab("处理结果库", elem_id="llm_prompt_studio_processed_results_tab", elem_classes=["lps-results-tab"]):
+                with gr.Row(elem_classes=["lps-form-row", "lps-filter-bar"]):
                     processed_result_query = gr.Textbox(label="搜索处理结果", scale=4)
                     processed_result_refresh = gr.Button("刷新结果库", variant="primary")
                 processed_result_status = gr.Markdown(
@@ -5683,9 +6581,9 @@ def on_ui_tabs():
                     headers=["序号", "结果 ID", "格式", "模型", "处理后的 Prompt", "来源批次"],
                     datatype=["number", "number", "str", "str", "str", "str"],
                     interactive=False, wrap=True, height=520,
-                    elem_id="llm_prompt_studio_processed_result_table", elem_classes=["lps-table"],
+                    elem_id="llm_prompt_studio_processed_result_table", elem_classes=["lps-table", "lps-table-card"],
                 )
-                with gr.Row(elem_classes=["lps-form-row"]):
+                with gr.Row(elem_classes=["lps-form-row", "lps-action-bar"]):
                     processed_result_scope = gr.Radio(
                         label="使用范围", choices=[("所选结果", "selected"), ("全部筛选结果", "filtered")],
                         value="selected", elem_id="llm_prompt_studio_processed_result_scope",
@@ -5694,14 +6592,32 @@ def on_ui_tabs():
                         elem_id="llm_prompt_studio_processed_result_append")
                     processed_result_enqueue = gr.Button("加入生图队列", variant="primary",
                         elem_id="llm_prompt_studio_processed_result_enqueue")
+                with gr.Accordion("批量管理结果（编辑 / 删除）", open=False, elem_classes=["lps-settings-section"]):
+                    with gr.Row(elem_classes=["lps-form-row"]):
+                        processed_result_manage_action = gr.Radio(
+                            label="操作", choices=[("批量修改", "edit"), ("批量删除", "delete")],
+                            value="edit", elem_id="llm_prompt_studio_processed_result_manage_action",
+                        )
+                        processed_result_manage_field = gr.Dropdown(
+                            label="字段", choices=[("正面 Prompt", "prompt"), ("负面 Prompt", "negative_prompt"), ("标签", "tags"), ("格式", "output_mode"), ("模型", "base_model")],
+                            value="prompt", elem_id="llm_prompt_studio_processed_result_manage_field",
+                        )
+                        processed_result_manage_operation = gr.Dropdown(
+                            label="修改方式", choices=[("查找替换", "replace"), ("追加", "append"), ("前置", "prepend"), ("覆盖", "set")],
+                            value="replace", elem_id="llm_prompt_studio_processed_result_manage_operation",
+                        )
+                    with gr.Row(elem_classes=["lps-form-row"]):
+                        processed_result_manage_find = gr.Textbox(label="查找内容", elem_id="llm_prompt_studio_processed_result_manage_find")
+                        processed_result_manage_value = gr.Textbox(label="替换 / 写入内容", elem_id="llm_prompt_studio_processed_result_manage_value")
+                        processed_result_manage_apply = gr.Button("执行批量管理", variant="primary", elem_id="llm_prompt_studio_processed_result_manage_apply")
                 processed_result_append_payload = gr.State("")
 
-            with gr.Tab("设置", elem_id="llm_prompt_studio_connection_tab"):
+            with gr.Tab("设置", elem_id="llm_prompt_studio_connection_tab", elem_classes=["lps-settings-tab"]):
                 gr.Markdown("### LLM 模型设置", elem_classes=["lps-heading"])
-                with gr.Row(elem_classes=["lps-model-settings-row"]):
+                with gr.Row(elem_classes=["lps-model-settings-row", "lps-settings-primary"]):
                     provider = gr.Dropdown(label="服务提供方", choices=PROVIDER_UI_CHOICES, value=llm_settings["provider"], scale=1)
                     endpoint = gr.Textbox(label="模型服务地址", value=llm_settings["endpoint"], scale=2)
-                with gr.Row(elem_classes=["lps-model-settings-row"]):
+                with gr.Row(elem_classes=["lps-model-settings-row", "lps-settings-primary"]):
                     model = gr.Dropdown(
                         label="预训练模型 / 模型 ID", choices=[llm_settings["model"]] if llm_settings["model"] else [],
                         value=llm_settings["model"], allow_custom_value=True,
@@ -5711,14 +6627,14 @@ def on_ui_tabs():
                 api_key = gr.Textbox(label="API Key（留空则使用已保存凭据）", type="password")
                 weights_path = gr.State(llm_settings["weights_path"])
                 model_version = gr.State(llm_settings["model_version"])
-                with gr.Group(elem_classes=["lps-model-advanced"]):
+                with gr.Group(elem_classes=["lps-model-advanced", "lps-settings-section"]):
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
                         temperature = gr.Number(label="温度", value=llm_settings["temperature"], minimum=0, maximum=2, step=0.05)
                         top_p = gr.Number(label="Top P（留空用模型默认）", value=llm_settings["top_p"], minimum=0, maximum=1, step=0.05)
                         top_k = gr.Number(label="Top K（留空用模型默认）", value=llm_settings["top_k"], minimum=0, maximum=100000, precision=0, visible=_supports_top_k(llm_settings["provider"]))
                         max_tokens = gr.Number(label="最大输出 Token", value=llm_settings["max_tokens"], minimum=0, maximum=262144, precision=0)
                     send_temperature = gr.Checkbox(label="发送温度参数", value=llm_settings["send_temperature"])
-                with gr.Accordion("请求与推理", open=False):
+                with gr.Accordion("请求与推理", open=False, elem_classes=["lps-settings-section"]):
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
                         timeout = gr.Number(label="超时（秒）", value=llm_settings["timeout"], minimum=5, maximum=600, precision=0)
                         retry_count = gr.Number(label="重试次数", value=llm_settings["retry_count"], minimum=0, maximum=5, precision=0)
@@ -5749,7 +6665,7 @@ def on_ui_tabs():
                     with gr.Row():
                         fallback_test = gr.Button("测试备用连接", elem_id="llm_prompt_studio_fallback_test")
                         fallback_clear_credentials = gr.Button("清除备用 API Key", elem_id="llm_prompt_studio_fallback_clear")
-                with gr.Row(elem_classes=["lps-primary-actions"]):
+                with gr.Row(elem_classes=["lps-primary-actions", "lps-action-bar"]):
                     test = gr.Button("测试连接", elem_id="llm_prompt_studio_test_connection")
                     save_connection = gr.Button("保存并应用", variant="primary")
                     clear_credentials = gr.Button("清除已保存的 API Key")
@@ -5847,7 +6763,7 @@ def on_ui_tabs():
                 processed_result_refresh_queue = gr.Button("刷新生图进度", size="sm")
                 processed_result_cancel_queue = gr.Button("取消等待中的生图", variant="stop", size="sm")
             processed_result_queue_status.render()
-            processed_result_gallery.render()
+            gr.Markdown("生成图片保存在 Forge 输出目录；此处仅显示队列进度。")
 
         workflow_inputs = [
             preset, system_override, base_model, safety, nsfw_injection, user_instruction,
@@ -6027,6 +6943,13 @@ def on_ui_tabs():
             _handoff_views, inputs=handoff_selection,
             outputs=[handoff_table, handoff_selection, handoff_status],
         )
+        handoff_save_settings.click(
+            _save_handoff_inference_settings,
+            inputs=[handoff_temperature, handoff_timeout, handoff_max_tokens, handoff_retry_count,
+                    handoff_thinking_enabled, handoff_thinking_budget, handoff_reasoning_effort, handoff_send_temperature,
+                    handoff_top_p, handoff_top_k],
+            outputs=handoff_status,
+        )
         handoff_load.click(
             _load_handoff_into_generation, inputs=handoff_selection,
             outputs=[request, source_tags, preset, base_model, safety, handoff_status],
@@ -6131,6 +7054,21 @@ def on_ui_tabs():
         )
         processed_result_query.submit(_processed_result_view, inputs=processed_result_query,
             outputs=[processed_result_table, processed_result_selection, processed_result_status])
+        processed_result_manage_action.change(
+            lambda action: [gr.update(visible=str(action or "edit") == "edit") for _ in range(4)],
+            inputs=processed_result_manage_action,
+            outputs=[processed_result_manage_field, processed_result_manage_operation,
+                     processed_result_manage_find, processed_result_manage_value],
+            queue=False,
+        )
+        processed_result_manage_apply.click(
+            _processed_result_manage,
+            inputs=[processed_result_manage_action, processed_result_manage_field,
+                    processed_result_manage_operation, processed_result_manage_find,
+                    processed_result_manage_value, processed_result_selection,
+                    processed_result_query, processed_result_scope],
+            outputs=[processed_result_table, processed_result_selection, processed_result_status],
+        )
         processed_result_append_event = processed_result_append.click(
             _processed_result_append,
             inputs=[processed_result_selection, processed_result_query, processed_result_scope],
@@ -6167,15 +7105,15 @@ def on_ui_tabs():
             js="(selected, query, queueIds, settings, scope) => [selected, query, queueIds, window.llmPromptStudioAutoLoop.readTxt2imgSettings() || settings, scope]",
         )
         processed_result_enqueue_event.then(
-            lambda ids: (*_processed_result_queue_view(ids), gr.update(open=bool(ids))),
+            lambda ids: (_inline_cache_queue_status(ids), gr.update(open=bool(ids))),
             inputs=processed_result_queue_ids,
-            outputs=[processed_result_queue_status, processed_result_gallery, result_queue_panel],
+            outputs=[processed_result_queue_status, result_queue_panel],
             queue=False,
         )
         processed_result_refresh_queue.click(
-            _processed_result_queue_view,
+            _inline_cache_queue_status,
             inputs=processed_result_queue_ids,
-            outputs=[processed_result_queue_status, processed_result_gallery],
+            outputs=processed_result_queue_status,
             queue=False,
         )
         processed_result_cancel_queue.click(
@@ -6185,4 +7123,3 @@ def on_ui_tabs():
             queue=False,
         )
     return [(ui, "LLM 提示词工作室", "llm_prompt_studio")]
-
