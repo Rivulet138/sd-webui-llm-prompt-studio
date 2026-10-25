@@ -27,7 +27,9 @@ from prompt_studio_diversity import (
     CONCEPT_ALIASES as _DIVERSITY_CONCEPT_ALIASES,
     SKELETON_WORDS as _DIVERSITY_SKELETON_WORDS,
     STOP_TOKENS as _DIVERSITY_STOP_TOKENS,
+    diversity_report,
     duplicate_clusters as _duplicate_clusters,
+    format_report,
 )
 
 from prompt_studio_core import (
@@ -605,6 +607,105 @@ def _diversity_settings() -> dict[str, Any]:
         "batch_temperature_floor": _coerce_bool(merged.get("batch_temperature_floor"), False),
         "source_fold_duplicates": _coerce_bool(merged.get("source_fold_duplicates"), False),
     }
+
+
+# Control order of the prompt page (kept in one place so save/reset stay aligned).
+_DIVERSITY_CONTROL_KEYS = (
+    "recipe_enabled", "recipe_dimensions", "retry_limit", "similarity_threshold",
+    "memory_enabled", "batch_temperature_floor", "source_fold_duplicates",
+)
+_PROMPT_LAYER_NOTE = """提示词按六层组装，从上到下依次生效：
+
+1. **统一策略**（不可协商的硬规则）：只输出载荷、单图、只写可见事实、禁用风格/媒介/画质/艺术家词、固定内容不可变、模型原生锚点、长度预算、安全。
+2. **输出格式预设**：标签行 / 段落 + 字段顺序 + 长度带宽。可在「设置 → 当前生效内容」覆盖。
+3. **底模规则**：该模型族的词表与权重习惯。
+4. **质量锚点策略**：哪些原生锚点可用。
+5. **操作语义**：生成 / 转换 / 扩写 / 润色的差异。
+6. **本批次指令**：本条配方、已覆盖概念、未使用方向（运行时注入，无需编辑）。
+
+「当前生效内容」**只替换第 2 层**，其余五层恒在。"""
+
+
+def _save_diversity_settings(
+    recipe_enabled, recipe_dimensions, retry_limit, similarity_threshold,
+    memory_enabled, batch_temperature_floor, source_fold_duplicates,
+) -> str:
+    """Persist the prompt-page controls; every value is clamped again on read."""
+    payload = {
+        "recipe_enabled": _coerce_bool(recipe_enabled, True),
+        "recipe_dimensions": _diversity_int(recipe_dimensions, 3, 1, 6),
+        "retry_limit": _diversity_int(retry_limit, 1, 0, _MAX_DIVERSITY_RETRIES),
+        "similarity_threshold": _diversity_float(
+            similarity_threshold, _MAX_CONTENT_SIMILARITY, 0.2, 0.95),
+        "memory_enabled": _coerce_bool(memory_enabled, True),
+        "batch_temperature_floor": _coerce_bool(batch_temperature_floor, False),
+        "source_fold_duplicates": _coerce_bool(source_fold_duplicates, False),
+    }
+    try:
+        DB.set_setting(_DIVERSITY_SETTINGS_KEY, payload)
+    except Exception as error:
+        LOGGER.exception("保存多样性参数失败")
+        return f"保存失败：{_safe_error(error)}"
+    summary = (
+        ("配方开" if payload["recipe_enabled"] else "配方关")
+        + f"，维度 {payload['recipe_dimensions']}"
+        + f"，重试 {payload['retry_limit']}"
+        + f"，阈值 {payload['similarity_threshold']:.2f}"
+    )
+    if payload["memory_enabled"]:
+        summary += "，记忆开"
+    if payload["batch_temperature_floor"]:
+        summary += "，温度下限开"
+    if payload["source_fold_duplicates"]:
+        summary += "，自动折叠重复输入"
+    return f"已保存：{summary}。下一次生成生效。"
+
+
+def _reset_diversity_settings() -> tuple:
+    """Restore defaults and push the values back into the controls."""
+    defaults = dict(_DIVERSITY_SETTINGS_DEFAULTS)
+    try:
+        DB.set_setting(_DIVERSITY_SETTINGS_KEY, defaults)
+        message = "已恢复默认值，下一次生成生效。"
+    except Exception as error:
+        LOGGER.exception("恢复多样性默认值失败")
+        message = f"恢复失败：{_safe_error(error)}"
+    return (*(defaults[key] for key in _DIVERSITY_CONTROL_KEYS), message)
+
+
+def _prompt_preview_text() -> str:
+    """Return the system prompt the next generation will actually send."""
+    try:
+        workflow = _workflow_settings()
+        preset, base_model = _resolve_preset_model(workflow["preset"], workflow["base_model"])
+        preset, _aligned = _aligned_preset(preset, base_model)
+        return build_system_prompt(
+            preset, base_model, workflow["safety"], workflow["nsfw_injection"],
+            workflow["user_instruction"], [], None,
+            workflow["system_override"], "",
+            build_operation_instruction("Generate", base_model),
+        )
+    except Exception as error:
+        LOGGER.exception("生成系统提示词预览失败")
+        return f"预览失败：{_safe_error(error)}"
+
+
+def _diversity_report_markdown(limit=500) -> str:
+    """Read-only diversity report over the cached prompt library."""
+    try:
+        count = max(10, min(int(limit or 500), 5000))
+        texts = [
+            str(record.get("prompt") or "").strip()
+            for record in DB.list_prompts(limit=count)
+        ]
+        texts = [text for text in texts if text]
+        if not texts:
+            return "缓存库为空，暂无可统计的提示词。"
+        report = diversity_report(texts)
+        return "**缓存库多样性**（最近 %d 条）\n\n```\n%s\n```" % (len(texts), format_report(report))
+    except Exception as error:
+        LOGGER.exception("多样性统计失败")
+        return f"统计失败：{_safe_error(error)}"
 
 
 def _content_similarity(left: str, right: str, stable_source: str = "") -> float:
@@ -2990,11 +3091,6 @@ def _immutable_technical_tokens(prompt: str) -> list[str]:
         stripped = pattern.sub(" ", stripped)
     words = re.findall(r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", stripped)
     return list(dict.fromkeys([*tags, *words]))
-
-
-def _preserves_immutable_technical_tokens(source: str, candidate: str) -> bool:
-    candidate_text = str(candidate or "")
-    return all(token in candidate_text for token in _immutable_technical_tokens(source))
 
 
 def _processed_kind_for_preset(preset: str) -> str:
@@ -6675,6 +6771,86 @@ def on_ui_tabs():
                     elem_id="llm_prompt_studio_connection_status",
                     elem_classes=["lps-status"],
                 )
+            diversity_state = _diversity_settings()
+            with gr.Tab("提示词", elem_id="llm_prompt_studio_prompt_tab", elem_classes=["lps-settings-tab"]):
+                gr.Markdown("### 提示词与多样性", elem_classes=["lps-heading"])
+                gr.Markdown(_PROMPT_LAYER_NOTE, elem_classes=["lps-status"])
+                with gr.Accordion("批量多样性参数", open=True, elem_classes=["lps-settings-section"]):
+                    gr.Markdown(
+                        "保存后对**下一次**生成生效；单条生成不受配方影响。取值超出范围会自动夹紧。",
+                        elem_classes=["lps-status"],
+                    )
+                    with gr.Row():
+                        diversity_recipe_enabled = gr.Checkbox(
+                            label="启用词库配方",
+                            value=diversity_state["recipe_enabled"],
+                            elem_id="llm_prompt_studio_diversity_recipe_enabled",
+                        )
+                        diversity_memory_enabled = gr.Checkbox(
+                            label="跨批次记忆",
+                            value=diversity_state["memory_enabled"],
+                            elem_id="llm_prompt_studio_diversity_memory_enabled",
+                        )
+                    with gr.Row():
+                        diversity_recipe_dimensions = gr.Slider(
+                            label="配方维度数（每条抽几项）", minimum=1, maximum=6, step=1,
+                            value=diversity_state["recipe_dimensions"],
+                            elem_id="llm_prompt_studio_diversity_recipe_dimensions",
+                        )
+                        diversity_retry_limit = gr.Slider(
+                            label="内容重复时重试次数", minimum=0, maximum=3, step=1,
+                            value=diversity_state["retry_limit"],
+                            elem_id="llm_prompt_studio_diversity_retry_limit",
+                        )
+                        diversity_similarity_threshold = gr.Slider(
+                            label="内容相似度阈值（越低越严格）", minimum=0.2, maximum=0.95, step=0.05,
+                            value=diversity_state["similarity_threshold"],
+                            elem_id="llm_prompt_studio_diversity_similarity_threshold",
+                        )
+                    with gr.Row():
+                        diversity_temperature_floor = gr.Checkbox(
+                            label="批量内温度不低于 1.25",
+                            value=diversity_state["batch_temperature_floor"],
+                            elem_id="llm_prompt_studio_diversity_batch_temperature_floor",
+                        )
+                        diversity_fold_duplicates = gr.Checkbox(
+                            label="自动折叠重复输入",
+                            value=diversity_state["source_fold_duplicates"],
+                            elem_id="llm_prompt_studio_diversity_source_fold_duplicates",
+                        )
+                    with gr.Row(elem_classes=["lps-primary-actions", "lps-action-bar"]):
+                        diversity_save_button = gr.Button("保存多样性参数", variant="primary", elem_id="llm_prompt_studio_diversity_save")
+                        diversity_reset_button = gr.Button("恢复默认", elem_id="llm_prompt_studio_diversity_reset")
+                    diversity_status = gr.Markdown(
+                        "修改后点「保存多样性参数」；当前值保存在 settings 的 prompt_diversity_v1。",
+                        elem_id="llm_prompt_studio_diversity_status", elem_classes=["lps-status"],
+                    )
+                with gr.Accordion("系统提示词预览", open=False, elem_classes=["lps-settings-section"]):
+                    gr.Markdown(
+                        "展示当前设置下真正发给模型的系统提示词（六层拼装结果，不含本批次配方）。",
+                        elem_classes=["lps-status"],
+                    )
+                    prompt_preview_button = gr.Button("刷新预览", elem_id="llm_prompt_studio_prompt_preview_button")
+                    prompt_preview_box = gr.Textbox(
+                        label="组装后的系统提示词", lines=12, max_lines=40, show_copy_button=True,
+                        value=_prompt_preview_text(), elem_id="llm_prompt_studio_prompt_preview",
+                    )
+                with gr.Accordion("缓存库多样性统计", open=False, elem_classes=["lps-settings-section"]):
+                    gr.Markdown(
+                        "只读统计最近 N 条缓存：distinct-n / Self-BLEU / Vendi / 内容余弦。"
+                        "Vendi 接近条数说明真的多样，接近 1 说明几乎每条都是同一画面。",
+                        elem_classes=["lps-status"],
+                    )
+                    with gr.Row():
+                        diversity_report_limit = gr.Number(
+                            label="统计最近条数", value=500, minimum=10, maximum=5000, precision=0,
+                            elem_id="llm_prompt_studio_diversity_report_limit",
+                        )
+                        diversity_report_button = gr.Button("统计当前缓存库", elem_id="llm_prompt_studio_diversity_report")
+                    diversity_report_output = gr.Markdown(
+                        "点上方按钮开始统计；该操作不写库、不调用 LLM。",
+                        elem_id="llm_prompt_studio_diversity_report_output",
+                    )
             with gr.Tab("更多", elem_id="llm_prompt_studio_tools_tab"):
                 with gr.Tabs(elem_id="llm_prompt_studio_tools_tabs"):
                     with gr.Tab("静态词库", elem_id="llm_prompt_studio_wildcards_tab"):
@@ -6824,6 +7000,24 @@ def on_ui_tabs():
             outputs=[test_status, endpoint, model, fallback_provider, fallback_endpoint, fallback_model, weights_path, model_version],
         )
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
+        diversity_save_button.click(
+            _save_diversity_settings,
+            inputs=[diversity_recipe_enabled, diversity_recipe_dimensions, diversity_retry_limit,
+                    diversity_similarity_threshold, diversity_memory_enabled,
+                    diversity_temperature_floor, diversity_fold_duplicates],
+            outputs=diversity_status,
+        )
+        diversity_reset_button.click(
+            _reset_diversity_settings,
+            outputs=[diversity_recipe_enabled, diversity_recipe_dimensions, diversity_retry_limit,
+                     diversity_similarity_threshold, diversity_memory_enabled,
+                     diversity_temperature_floor, diversity_fold_duplicates, diversity_status],
+        )
+        prompt_preview_button.click(_prompt_preview_text, outputs=prompt_preview_box)
+        diversity_report_button.click(
+            _diversity_report_markdown, inputs=diversity_report_limit,
+            outputs=diversity_report_output,
+        )
         fallback_clear_credentials.click(
             _clear_llm_credentials, inputs=[fallback_provider, fallback_endpoint], outputs=test_status,
         )

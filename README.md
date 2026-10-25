@@ -109,6 +109,8 @@ git -C extensions clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio
 
 「当前生效内容」只替换第②层，其余五层恒在——所以自定义正文不会把安全或禁用词规则一起改没。
 
+想直接看拼装结果？打开 **「提示词」页 → 系统提示词预览 → 刷新预览**，会打印当前设置下真正发给模型的全文（不含本批次配方）。
+
 ### 长度预算
 
 | 输出格式 | 长度 |
@@ -142,7 +144,7 @@ git -C extensions clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio
 - **跨批次记忆**：结果按「源 Prompt」记最近 6 组 × 16 条，写入 `settings.prompt_diversity_memory_v1`，重启后继续生效。
 - **单条生成不受影响**：只有带批次指令的任务才启用配方与去重。
 
-调参写在 `settings` 表的 `prompt_diversity_v1`（JSON，改完下一次生成生效）：
+所有参数都在 **「提示词」页 → 批量多样性参数** 里图形化调；也可以写 `settings` 表的 `prompt_diversity_v1`（JSON，便于脚本化与复现），改完下一次生成生效：
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
@@ -157,6 +159,17 @@ git -C extensions clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio
 ---
 
 ## 使用手册
+
+### 「提示词」页
+
+所有跟提示词本身相关的开关集中在这一页：
+
+| 区域 | 做什么 |
+| --- | --- |
+| 提示词说明 | 六层结构各自负责什么、哪一层可编辑 |
+| 批量多样性参数 | 配方开关与维度数、去重重试次数、内容相似度阈值、跨批次记忆、温度下限、自动折叠重复输入；保存后下一次生成生效，取值越界自动夹紧 |
+| 系统提示词预览 | 一键打印当前设置下拼装出的完整系统提示词，方便核对与复制 |
+| 缓存库多样性统计 | 只读统计最近 N 条缓存的 distinct-n / Self-BLEU / Vendi / 内容余弦，不写库、不调用 LLM |
 
 ### 生成与批量
 
