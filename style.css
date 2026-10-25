@@ -50,8 +50,6 @@
 .lps-server-queue-row { display: grid; grid-template-columns: 3rem 6rem minmax(0, 1fr); gap: .5rem; align-items: start; padding: .45rem .55rem; border-bottom: 1px solid var(--border-color-primary, #555); }
 .lps-server-queue-row code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .lps-server-queue-row small { grid-column: 3; color: var(--body-text-color-subdued, #aaa); overflow-wrap: anywhere; }
-.lps-queue-images { grid-column: 3; display: flex; flex-wrap: wrap; gap: .45rem; }
-.lps-queue-image { width: 8rem; height: 8rem; object-fit: contain; border-radius: .35rem; background: var(--background-fill-secondary, #222); }
 .lps-auto-loop-row { display: grid; grid-template-columns: 1.4rem 3rem 7rem minmax(0, 1fr); gap: .5rem; align-items: start; width: 100%; min-width: 0; padding: .45rem .6rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; box-sizing: border-box; cursor: pointer; }
 .lps-auto-loop-row code { display: block; min-width: 0; max-height: 7rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
 .lps-auto-loop-row input[type="checkbox"] { margin-top: .2rem; accent-color: var(--primary-500, #3b82f6); }
@@ -210,4 +208,333 @@
     #llm_prompt_studio_main_tabs .lps-main-workbench > :is(.lps-source-column, .lps-rules-column) { flex: 1 1 auto !important; width: 100%; }
     #llm_prompt_studio_png_batch_tab :is(#llm_prompt_studio_png_collector_pull, #llm_prompt_studio_ranbooru_batch_load) { flex-basis: 100%; width: 100%; }
     :is(#llm_prompt_studio_cache_table, .lps-cache-table) table { min-width: 680px; }
+}
+
+/* Product UI refresh. These rules only change presentation; component IDs,
+   event wiring, and the existing Gradio controls remain untouched. */
+#llm_prompt_studio.lps-app-shell {
+    --lps-surface: var(--background-fill-primary, #111827);
+    --lps-surface-raised: var(--background-fill-secondary, #1f2937);
+    --lps-surface-soft: color-mix(in srgb, var(--lps-surface-raised) 58%, transparent);
+    --lps-border: var(--border-color-primary, rgba(148, 163, 184, .28));
+    --lps-border-strong: color-mix(in srgb, var(--lps-border) 78%, var(--body-text-color, #e5e7eb));
+    --lps-ink: var(--body-text-color, #f3f4f6);
+    --lps-muted: var(--body-text-color-subdued, #a7b0bf);
+    --lps-accent: var(--primary-500, #60a5fa);
+    --lps-danger: var(--error-500, #f87171);
+    max-width: 1720px;
+    padding: .5rem .8rem 1.4rem;
+    color: var(--lps-ink);
+}
+
+#llm_prompt_studio .lps-brand-heading {
+    margin: 0 0 .7rem;
+    padding: .25rem 0 .8rem;
+    border-bottom: 1px solid var(--lps-border);
+}
+
+#llm_prompt_studio .lps-brand-heading h2 {
+    margin: 0;
+    color: var(--lps-ink);
+    font-size: 1.45rem;
+    font-weight: 750;
+    letter-spacing: -.015em;
+    line-height: 1.25;
+    text-wrap: balance;
+}
+
+#llm_prompt_studio #llm_prompt_studio_main_tabs {
+    max-width: none;
+    border: 1px solid var(--lps-border);
+    border-radius: 10px;
+    background: var(--lps-surface);
+    box-shadow: 0 8px 26px color-mix(in srgb, #000 16%, transparent);
+    overflow: clip;
+}
+
+#llm_prompt_studio #llm_prompt_studio_main_tabs > .tab-nav {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    display: flex;
+    flex-wrap: nowrap;
+    gap: .35rem;
+    padding: .45rem .55rem 0;
+    border-bottom: 1px solid var(--lps-border);
+    background: var(--lps-surface-raised);
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+#llm_prompt_studio #llm_prompt_studio_main_tabs > .tab-nav button {
+    flex: 0 0 auto;
+    min-height: 2.35rem;
+    padding: .5rem .85rem;
+    border: 1px solid transparent;
+    border-bottom: 2px solid transparent;
+    border-radius: 7px 7px 0 0;
+    color: var(--lps-muted);
+    background: transparent;
+    font-size: .97rem;
+    font-weight: 650;
+    transition: color .16s ease, background-color .16s ease, border-color .16s ease;
+}
+
+#llm_prompt_studio #llm_prompt_studio_main_tabs > .tab-nav button:hover {
+    color: var(--lps-ink);
+    background: color-mix(in srgb, var(--lps-surface) 72%, transparent);
+}
+
+#llm_prompt_studio #llm_prompt_studio_main_tabs > .tab-nav button[aria-selected="true"] {
+    color: var(--lps-ink);
+    border-color: var(--lps-border);
+    border-bottom-color: var(--lps-accent);
+    background: var(--lps-surface);
+    box-shadow: 0 -1px 0 color-mix(in srgb, var(--lps-accent) 30%, transparent) inset;
+}
+
+#llm_prompt_studio #llm_prompt_studio_main_tabs > .tabitem {
+    padding: 1rem 1rem 1.2rem;
+}
+
+#llm_prompt_studio .lps-panel {
+    min-width: 0;
+    padding: .9rem 1rem 1rem;
+    border: 1px solid var(--lps-border);
+    border-radius: 9px;
+    background: var(--lps-surface-soft);
+}
+
+#llm_prompt_studio .lps-panel > .block,
+#llm_prompt_studio .lps-panel > .gradio-group,
+#llm_prompt_studio .lps-panel > .gradio-row,
+#llm_prompt_studio .lps-panel > .gradio-column {
+    background: transparent;
+}
+
+#llm_prompt_studio .lps-main-workbench {
+    align-items: stretch;
+    gap: .9rem;
+}
+
+#llm_prompt_studio .lps-source-column,
+#llm_prompt_studio .lps-rules-column {
+    gap: .65rem;
+}
+
+#llm_prompt_studio .lps-source-column > .block:first-child label,
+#llm_prompt_studio .lps-rules-column > .block:first-child label {
+    font-weight: 700;
+}
+
+#llm_prompt_studio :is(textarea, input:not([type="checkbox"]):not([type="radio"]), select) {
+    border-color: var(--lps-border);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--lps-surface) 86%, var(--lps-surface-raised));
+}
+
+#llm_prompt_studio :is(textarea, input, select):focus-visible {
+    border-color: var(--lps-accent) !important;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--lps-accent) 24%, transparent);
+}
+
+#llm_prompt_studio textarea::placeholder,
+#llm_prompt_studio input::placeholder {
+    color: var(--lps-muted);
+    opacity: .9;
+}
+
+#llm_prompt_studio .lps-toolbar,
+#llm_prompt_studio .lps-filter-bar,
+#llm_prompt_studio .lps-pagination-bar,
+#llm_prompt_studio .lps-action-bar {
+    align-items: end;
+    gap: .55rem;
+    margin: .75rem 0;
+    padding: .65rem .7rem;
+    border: 1px solid var(--lps-border);
+    border-radius: 8px;
+    background: var(--lps-surface-soft);
+}
+
+#llm_prompt_studio .lps-filter-bar {
+    margin-top: 0;
+    flex-wrap: wrap;
+}
+
+#llm_prompt_studio .lps-filter-bar > .block {
+    min-width: 12rem;
+}
+
+#llm_prompt_studio .lps-filter-bar > .block:first-child {
+    flex: 2 1 20rem;
+}
+
+#llm_prompt_studio .lps-primary-actions,
+#llm_prompt_studio .lps-action-bar {
+    flex-wrap: wrap;
+}
+
+#llm_prompt_studio .lps-primary-actions {
+    border-color: color-mix(in srgb, var(--lps-accent) 32%, var(--lps-border));
+    background: color-mix(in srgb, var(--lps-accent) 7%, var(--lps-surface-raised));
+}
+
+#llm_prompt_studio .lps-primary-actions button,
+#llm_prompt_studio .lps-action-bar button {
+    min-height: 2.5rem;
+    border-radius: 7px;
+    font-weight: 650;
+}
+
+#llm_prompt_studio #llm_prompt_studio_generate_button,
+#llm_prompt_studio #llm_prompt_studio_png_batch_run,
+#llm_prompt_studio #llm_prompt_studio_processed_result_enqueue {
+    min-width: 12rem;
+    box-shadow: 0 3px 10px color-mix(in srgb, var(--lps-accent) 20%, transparent);
+}
+
+#llm_prompt_studio .lps-status {
+    min-height: 2rem;
+    margin: .55rem 0;
+    padding: .55rem .7rem;
+    border: 1px solid var(--lps-border);
+    border-radius: 7px;
+    background: var(--lps-surface-soft);
+    color: var(--lps-ink);
+    line-height: 1.45;
+}
+
+#llm_prompt_studio .lps-status:empty {
+    display: none;
+}
+
+#llm_prompt_studio .lps-output textarea,
+#llm_prompt_studio #llm_prompt_studio_output textarea {
+    border-color: color-mix(in srgb, var(--lps-accent) 34%, var(--lps-border));
+    background: color-mix(in srgb, var(--lps-accent) 4%, var(--lps-surface));
+}
+
+#llm_prompt_studio .lps-result-panel,
+#llm_prompt_studio .lps-utility-panel,
+#llm_prompt_studio .lps-import-panel,
+#llm_prompt_studio .lps-editor-panel,
+#llm_prompt_studio .lps-settings-section {
+    margin-top: .7rem;
+    border: 1px solid var(--lps-border);
+    border-radius: 8px;
+    background: var(--lps-surface-soft);
+}
+
+#llm_prompt_studio :is(.lps-result-panel, .lps-utility-panel, .lps-import-panel, .lps-editor-panel, .lps-settings-section) > .label-wrap {
+    min-height: 2.45rem;
+    padding: .55rem .75rem;
+    border-radius: 7px;
+    color: var(--lps-ink);
+    font-weight: 650;
+}
+
+#llm_prompt_studio :is(.lps-result-panel, .lps-utility-panel, .lps-import-panel, .lps-editor-panel, .lps-settings-section) > .label-wrap:hover {
+    background: color-mix(in srgb, var(--lps-surface-raised) 70%, transparent);
+}
+
+#llm_prompt_studio .lps-danger-panel {
+    margin-top: .7rem;
+    border: 1px solid color-mix(in srgb, var(--lps-danger) 42%, var(--lps-border));
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--lps-danger) 4%, var(--lps-surface));
+}
+
+#llm_prompt_studio .lps-danger-panel > .label-wrap {
+    color: color-mix(in srgb, var(--lps-danger) 78%, var(--lps-ink));
+}
+
+#llm_prompt_studio .lps-handoff-panel {
+    margin-top: .9rem;
+    border: 1px solid color-mix(in srgb, var(--lps-accent) 30%, var(--lps-border));
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--lps-accent) 3%, var(--lps-surface));
+}
+
+#llm_prompt_studio .lps-handoff-settings {
+    gap: .55rem;
+    margin: .65rem 0;
+    padding: .65rem;
+    border: 1px solid var(--lps-border);
+    border-radius: 7px;
+    background: var(--lps-surface-soft);
+}
+
+#llm_prompt_studio .lps-handoff-actions {
+    flex-wrap: wrap;
+    gap: .5rem;
+    margin: .65rem 0;
+}
+
+#llm_prompt_studio .lps-handoff-actions button {
+    min-height: 2.35rem;
+}
+
+#llm_prompt_studio .lps-table-card {
+    margin: .75rem 0;
+    border: 1px solid var(--lps-border);
+    border-radius: 8px;
+    background: var(--lps-surface);
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+#llm_prompt_studio .lps-table-card table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    color: var(--lps-ink);
+    background: var(--lps-surface-raised);
+    font-size: .86rem;
+    font-weight: 700;
+}
+
+#llm_prompt_studio .lps-table-card table tbody tr:hover td {
+    background: color-mix(in srgb, var(--lps-accent) 6%, transparent);
+}
+
+#llm_prompt_studio .lps-table-card :is(th, td) {
+    border-color: var(--lps-border);
+}
+
+#llm_prompt_studio .lps-settings-primary {
+    gap: .7rem;
+}
+
+#llm_prompt_studio .lps-settings-tab .lps-model-advanced {
+    margin: .8rem 0;
+    padding: .75rem;
+    border: 1px solid var(--lps-border);
+    border-radius: 8px;
+    background: var(--lps-surface-soft);
+}
+
+#llm_prompt_studio .lps-subheading h4 {
+    margin: .8rem 0 .25rem;
+    color: var(--lps-ink);
+    font-size: 1rem;
+}
+
+#llm_prompt_studio .lps-source-settings,
+#llm_prompt_studio .lps-template-editor {
+    border-color: var(--lps-border);
+}
+
+#llm_prompt_studio button {
+    border-radius: 7px;
+    transition: color .16s ease, background-color .16s ease, border-color .16s ease, box-shadow .16s ease, opacity .16s ease;
+}
+
+#llm_prompt_studio button:not(:disabled):hover {
+    filter: none;
+    box-shadow: 0 2px 8px color-mix(in srgb, #000 12%, transparent);
+}
+
+#llm_prompt_studio button:disabled {
+    box-shadow: none;
 }

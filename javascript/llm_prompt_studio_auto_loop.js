@@ -74,150 +74,13 @@
         "森林秘境场景", "未来都市场景", "温馨居家场景",
     ];
     let backgroundTimer = undefined;
-    let keepAliveBridge = null;
-
-    function createKeepAliveBridge() {
-        if (
-            typeof window.Worker !== "function"
-            || typeof window.Blob !== "function"
-            || typeof window.URL?.createObjectURL !== "function"
-        ) return null;
-        try {
-            const source = [
-                "const timers = new Map();",
-                "self.onmessage = function(event) {",
-                "  const message = event.data || {};",
-                "  if (message.type === 'interval') timers.set(message.id, setInterval(() => self.postMessage({id: message.id}), message.delay));",
-                "  if (message.type === 'timeout') timers.set(message.id, setTimeout(() => { self.postMessage({id: message.id}); timers.delete(message.id); }, message.delay));",
-                "  if (message.type === 'stop') { const timer = timers.get(message.id); clearInterval(timer); clearTimeout(timer); timers.delete(message.id); }",
-                "};",
-            ].join("\n");
-            const url = window.URL.createObjectURL(new window.Blob([source], { type: "text/javascript" }));
-            const worker = new window.Worker(url);
-            window.URL.revokeObjectURL(url);
-            const timers = new Map();
-            let sequence = 1 << 24;
-            const native = {
-                setTimeout: window.setTimeout.bind(window),
-                clearTimeout: window.clearTimeout.bind(window),
-                setInterval: window.setInterval.bind(window),
-                clearInterval: window.clearInterval.bind(window),
-                requestAnimationFrame: typeof window.requestAnimationFrame === "function"
-                    ? window.requestAnimationFrame.bind(window)
-                    : null,
-                cancelAnimationFrame: typeof window.cancelAnimationFrame === "function"
-                    ? window.cancelAnimationFrame.bind(window)
-                    : null,
-            };
-            const bridge = { native, failed: false };
-            const schedule = (type, callback, delay, args = []) => {
-                if (typeof callback !== "function") return native[type === "interval" ? "setInterval" : "setTimeout"](callback, delay, ...args);
-                if (bridge.failed) return native[type === "interval" ? "setInterval" : "setTimeout"](callback, delay, ...args);
-                const id = sequence++;
-                timers.set(id, { callback, args, repeat: type === "interval" });
-                worker.postMessage({
-                    type,
-                    id,
-                    delay: Math.max(type === "interval" ? 16 : 0, Number(delay) || 0),
-                });
-                return id;
-            };
-            const clear = (id, type) => {
-                const timer = timers.get(id);
-                if (!timer) {
-                    native[type === "interval" ? "clearInterval" : "clearTimeout"](id);
-                    return;
-                }
-                timers.delete(id);
-                if (bridge.failed) {
-                    native[type === "interval" ? "clearInterval" : "clearTimeout"](timer.nativeId);
-                } else {
-                    worker.postMessage({ type: "stop", id });
-                }
-            };
-            worker.onmessage = (event) => {
-                const timer = timers.get(event.data?.id);
-                if (!timer) return;
-                if (!timer.repeat) timers.delete(event.data.id);
-                timer.callback(...timer.args);
-            };
-            worker.onerror = () => {
-                bridge.failed = true;
-                for (const timer of timers.values()) {
-                    const fallback = timer.repeat ? native.setInterval : native.setTimeout;
-                    timer.nativeId = fallback(timer.callback, timer.repeat ? 500 : 0, ...timer.args);
-                }
-                worker.terminate();
-                window.__llmPromptStudioKeepAlive = false;
-            };
-            bridge.scheduleTimeout = (callback, delay, args) => schedule("timeout", callback, delay, args);
-            bridge.scheduleInterval = (callback, delay, args) => schedule("interval", callback, delay, args);
-            bridge.clearTimeout = (id) => clear(id, "timeout");
-            bridge.clearInterval = (id) => clear(id, "interval");
-            return bridge;
-        } catch {
-            return null;
-        }
-    }
 
     function enablePluginKeepAlive() {
-        if (keepAliveBridge) return !keepAliveBridge.failed;
-        keepAliveBridge = createKeepAliveBridge();
-        if (!keepAliveBridge) return false;
-        const { native } = keepAliveBridge;
-        // Older Forge builds only keep requestAnimationFrame alive. Route all
-        // page timers through the plugin worker while hidden so Gradio's
-        // progress callbacks and the next native Generate are not throttled.
-        window.setTimeout = function (callback, delay, ...args) {
-            return document.hidden && keepAliveBridge
-                ? keepAliveBridge.scheduleTimeout(callback, delay, args)
-                : native.setTimeout(callback, delay, ...args);
-        };
-        window.clearTimeout = function (id) {
-            if (keepAliveBridge) keepAliveBridge.clearTimeout(id);
-            else native.clearTimeout(id);
-        };
-        window.setInterval = function (callback, delay, ...args) {
-            return document.hidden && keepAliveBridge
-                ? keepAliveBridge.scheduleInterval(callback, delay, args)
-                : native.setInterval(callback, delay, ...args);
-        };
-        window.clearInterval = function (id) {
-            if (keepAliveBridge) keepAliveBridge.clearInterval(id);
-            else native.clearInterval(id);
-        };
-        if (native.requestAnimationFrame && native.cancelAnimationFrame) {
-            const pendingFrames = new Map();
-            let frameId = 1 << 24;
-            window.requestAnimationFrame = function (callback) {
-                if (!document.hidden) return native.requestAnimationFrame(callback);
-                const id = frameId++;
-                const channel = new MessageChannel();
-                channel.port1.onmessage = () => {
-                    if (!pendingFrames.delete(id)) return;
-                    callback(typeof window.performance?.now === "function" ? window.performance.now() : Date.now());
-                };
-                pendingFrames.set(id, channel);
-                channel.port2.postMessage(null);
-                return id;
-            };
-            window.cancelAnimationFrame = function (id) {
-                const channel = pendingFrames.get(id);
-                if (channel) {
-                    pendingFrames.delete(id);
-                    channel.port1.close();
-                    channel.port2.close();
-                    return;
-                }
-                native.cancelAnimationFrame(id);
-            };
-        }
-        try {
-            if (typeof opts !== "undefined" && opts && typeof opts === "object") opts.keep_alive = true;
-            if (window.opts && typeof window.opts === "object") window.opts.keep_alive = true;
-        } catch { /* Forge may expose opts as a non-writable global. */ }
-        window.__llmPromptStudioKeepAlive = true;
-        return true;
+        // Keep the background guarantee local to Studio's own wait() calls.
+        // Do not replace page-global timers or RAF: Forge, Gradio, and other
+        // extensions must retain their native scheduling semantics.
+        if (backgroundTimer === undefined) backgroundTimer = createBackgroundTimer();
+        return Boolean(backgroundTimer);
     }
 
     function root() {
@@ -389,6 +252,9 @@
     }
 
     function migrateQueue(stored) {
+        if (stored !== null && !Array.isArray(stored) && !Array.isArray(stored?.rows)) {
+            throw new Error("历史 Prompt 队列格式无效；原始存储已保留");
+        }
         const sourceRows = Array.isArray(stored) ? stored : stored?.rows;
         const preserveDistinctRows = !Array.isArray(stored) && Number(stored?.version || 0) >= 2;
         const requestIds = new Set(Array.isArray(stored?.requestIds) ? stored.requestIds.map(canonicalPrompt).filter(Boolean) : []);
@@ -466,21 +332,40 @@
     }
 
     function saveQueue() {
-        state.persistent = false;
-        state.lastSaveFailure = "";
-        return true;
+        const payload = {
+            version: 2,
+            rows: state.queue,
+            requestIds: Array.from(state.requestIds),
+        };
+        try {
+            window.localStorage.setItem(QUEUE_KEY, JSON.stringify(payload));
+            state.persistent = true;
+            state.lastSaveFailure = "";
+            return true;
+        } catch (error) {
+            state.persistent = false;
+            state.lastSaveFailure = String(error?.name || "storage");
+            return false;
+        }
     }
 
     function loadQueue() {
         try {
-            window.localStorage.removeItem(QUEUE_KEY);
-            state.queue = [];
-            state.requestIds = new Set();
+            const storedValue = window.localStorage.getItem(QUEUE_KEY);
+            const migrated = migrateQueue(storedValue ? JSON.parse(storedValue) : null);
+            state.queue = migrated.rows;
+            state.requestIds = migrated.requestIds;
+            state.persistent = true;
+            state.lastSaveFailure = "";
             renderQueue();
+            if (migrated.duplicateCount || migrated.emptyCount) {
+                render("warning", "历史 Prompt 队列已恢复", `已忽略 ${migrated.emptyCount} 条空记录，合并 ${migrated.duplicateCount} 条旧版重复记录`);
+            }
         } catch (error) {
             state.queue = [];
             state.requestIds = new Set();
             state.persistent = false;
+            state.lastSaveFailure = "invalid";
             renderQueue();
             render("error", "历史 Prompt 队列恢复失败", String(error?.message || error));
         }
@@ -505,8 +390,7 @@
 
     function forgeKeepAliveEnabled() {
         const options = forgeOptions();
-        if (window.__llmPromptStudioKeepAlive === false) return Boolean(window.__forgeKeepAliveActive);
-        return Boolean(options?.keep_alive || window.__forgeKeepAliveActive || window.__llmPromptStudioKeepAlive);
+        return Boolean(options?.keep_alive || window.__forgeKeepAliveActive);
     }
 
     function isForgeBusy(tab, run = null) {
@@ -1818,14 +1702,9 @@
     }
 
     function serverQueueRowsHtml(rows) {
-        return rows.length ? rows.map((row) => {
-            const images = (Array.isArray(row.images) ? row.images : []).map((value) => {
-                const raw = String(value || "");
-                const source = raw.startsWith("data:image/") ? raw : /^[A-Za-z0-9+/=\s]+$/.test(raw) ? `data:image/png;base64,${raw}` : "";
-                return source ? `<img class="lps-queue-image" src="${escapeHtml(source)}" alt="生成结果" loading="lazy">` : "";
-            }).join("");
-            return `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><code>${escapeHtml(row.prompt || row.request || "")}</code><small>${escapeHtml(row.error || "")}</small><div class="lps-queue-images">${images}</div></div>`;
-        }).join("") : '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
+        return rows.length ? rows.map((row) =>
+            `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><code>${escapeHtml(row.prompt || row.request || "")}</code><small>${escapeHtml(row.error || "")}</small></div>`
+        ).join("") : '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
     }
 
     function renderServerQueue(snapshot) {
@@ -1880,16 +1759,8 @@
 
     if (typeof window.addEventListener === "function") {
         window.addEventListener("storage", (event) => {
-            if (event.key !== QUEUE_KEY) return;
-            try {
-                if (event.newValue) JSON.parse(event.newValue);
-            } catch {
-                state.persistent = false;
-                state.lastSaveFailure = "invalid";
-                render("warning", "自动队列状态无法读取", "检测到损坏的队列数据，当前页继续使用内存队列");
-                return;
-            }
-            if (!state.active) loadQueue();
+            if (event.key !== QUEUE_KEY || state.active) return;
+            loadQueue();
         });
     }
     installForgeInterruptHandlers();
