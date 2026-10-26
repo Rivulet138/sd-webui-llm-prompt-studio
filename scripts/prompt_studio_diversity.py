@@ -136,6 +136,19 @@ def content_vector(text: str, skeleton: Iterable[str] = SKELETON_TOKENS) -> coll
     })
 
 
+def content_tokens(text: str, skeleton: Iterable[str] = SKELETON_TOKENS) -> list[str]:
+    """Return content tokens in source order using the same filtering as the gate."""
+    skeleton_tokens = set(skeleton)
+    tokens = []
+    for raw_token in _TOKEN_PATTERN.findall((text or "").lower()):
+        token = CONCEPT_ALIASES.get(raw_token, raw_token)
+        if token in STOP_TOKENS or token in skeleton_tokens:
+            continue
+        if len(token) >= 3 or "_" in token:
+            tokens.append(token)
+    return tokens
+
+
 def cosine(left: collections.Counter, right: collections.Counter) -> float:
     if not left or not right:
         return 0.0
@@ -191,7 +204,11 @@ def self_bleu(docs: Sequence[Sequence[str]], n: int = 4, max_samples: int = 200)
         grams = _ngrams(list(doc), n)
         if not grams:
             continue
-        hits = sum(min(1, corpus[gram] - 1) for gram in grams)
+        # Exclude every n-gram occurrence from the current document. Otherwise
+        # repeated phrases inside one prompt are incorrectly treated as
+        # evidence that other prompts copied it.
+        reference = corpus - collections.Counter(grams)
+        hits = sum(1 for gram in grams if reference[gram] > 0)
         scores.append(hits / len(grams))
     return sum(scores) / len(scores) if scores else 0.0
 
@@ -288,9 +305,11 @@ def diversity_report(texts: Sequence[str], skeleton: Iterable[str] = SKELETON_TO
     """Compute every metric for one prompt set."""
     cleaned = [str(text or "").strip() for text in texts]
     cleaned = [text for text in cleaned if text]
-    docs = [sorted(content_vector(text, skeleton).elements()) for text in cleaned]
+    docs = [content_tokens(text, skeleton) for text in cleaned]
     docs = [doc for doc in docs if doc]
     clusters = duplicate_clusters(cleaned, threshold, skeleton)
+    vendi_docs = docs[:400]
+    vendi = vendi_score(vendi_docs)
     report = {
         "count": len(cleaned),
         "scored": len(docs),
@@ -300,8 +319,9 @@ def diversity_report(texts: Sequence[str], skeleton: Iterable[str] = SKELETON_TO
         "distinct_3": round(distinct_n(docs, 3), 4),
         "self_bleu_3": round(self_bleu(docs, 3), 4),
         "self_bleu_4": round(self_bleu(docs, 4), 4),
-        "vendi": round(vendi_score(docs), 2),
-        "vendi_ratio": round(vendi_score(docs) / len(docs), 4) if docs else 0.0,
+        "vendi": round(vendi, 2),
+        "vendi_scored": len(vendi_docs),
+        "vendi_ratio": round(vendi / len(vendi_docs), 4) if vendi_docs else 0.0,
         "mean_content_cosine": round(mean_pairwise_cosine(cleaned, skeleton), 4),
         "duplicate_clusters": len(clusters),
         "duplicate_items": sum(len(cluster) - 1 for cluster in clusters),
@@ -325,7 +345,7 @@ def format_report(report: dict) -> str:
         "   (higher = more lexical variety)",
         f"  Self-BLEU-3/4       {report['self_bleu_3']:.3f} / {report['self_bleu_4']:.3f}"
         "   (lower = items copy each other less)",
-        f"  Vendi               {report['vendi']:.2f} of {report['count']} max"
+        f"  Vendi               {report['vendi']:.2f} of {report['vendi_scored']} max"
         f"   (= {report['vendi_ratio'] * 100:.1f}% effective, {verdict})",
         f"  mean content cosine {report['mean_content_cosine']:.3f}"
         "   (lower = more distinct)",

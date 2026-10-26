@@ -48,6 +48,10 @@ LOGGER = logging.getLogger(__name__)
 _NATIVE_CACHE_CONTEXTS: dict[str, dict[str, Any]] = {}
 _NATIVE_CACHE_CONTEXT_LOCK = threading.RLock()
 _NATIVE_CACHE_CONTEXT_TTL = 30 * 60
+_NATIVE_CACHE_MARKER_START = "\u2063\u2062"
+_NATIVE_CACHE_MARKER_END = "\u2062\u2063"
+_NATIVE_CACHE_MARKER_ZERO = "\u200b"
+_NATIVE_CACHE_MARKER_ONE = "\u200c"
 _STYLE_PATH = Path(__file__).resolve().parents[1] / "style.css"
 UI_CSS = _STYLE_PATH.read_text(encoding="utf-8") if _STYLE_PATH.is_file() else ""
 
@@ -3093,6 +3097,44 @@ def _immutable_technical_tokens(prompt: str) -> list[str]:
     return list(dict.fromkeys([*tags, *words]))
 
 
+def _finalize_generated_prompt(
+    result, preset, safety, remove_bad=True, remove_terms="", shuffle=False, spaces=False,
+    max_tags=0, structured_mode="Plain Prompt", region_count=1,
+):
+    """Validate, normalize, and format one provider response before it reaches the UI."""
+    preset = _canonical_preset(preset)
+    structured_mode = _canonical_output_mode(structured_mode)
+    result = str(result or "").strip()
+    lowered = result.casefold()
+    meta_markers = (
+        "let me ", "here is", "as an ai", "writing prompt", "i will ",
+        "restart inspection", "corrected prompt",
+    )
+    if any(marker in lowered for marker in meta_markers):
+        raise ValueError("Prompt 包含解释或自我审阅内容。")
+    if "daylight" in lowered and any(term in lowered for term in ("midnight", "moonlit", "nighttime")):
+        raise ValueError("Prompt 包含白天与夜晚冲突。")
+    if "indoors" in lowered and "outdoors" in lowered:
+        raise ValueError("Prompt 包含室内与室外冲突。")
+    if str(safety or "").strip().upper() == "SFW" and not is_sfw_output(result):
+        raise ValueError("SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。")
+    if preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
+        result = process_tags(
+            result,
+            _coerce_bool(remove_bad, True),
+            str(remove_terms or ""),
+            _coerce_bool(shuffle),
+            _coerce_bool(spaces),
+            int(max_tags or 0),
+        )
+    if structured_mode != "Plain Prompt":
+        result = regional_format(result, structured_mode, int(region_count or 1))
+    result = str(result or "").strip()
+    if not result:
+        raise ValueError("LLM 输出在标签清理或格式化后未返回可用 Prompt。")
+    return result
+
+
 def _processed_kind_for_preset(preset: str) -> str:
     preset = _canonical_preset(preset)
     if preset in {"Natural Language", "Krea 2 Natural"}:
@@ -3993,7 +4035,6 @@ def _png_batch_run(
         yield _png_batch_json(data), [], 1, "", "批次为空，请先导入逐图 Prompt。", gr.update(choices=[], value=[])
         return
     event_key, cancel_event = _png_batch_cancel_event(cancel_id)
-    cancel_event.clear()
     records = [dict(record) for record in data["records"]]
     independent = str(variation_mode or "faithful") == "independent"
     progress_interval = max(1, (len(records) + 99) // 100)
@@ -4073,7 +4114,6 @@ def _png_batch_run(
             f"已有结果跳过 {skipped_existing}（同目标），失败 {failed}，取消 {cancelled}。"
         ), gr.update(choices=choices, value=values)
     finally:
-        cancel_event.clear()
         with _PNG_BATCH_CANCEL_LOCK:
             if _PNG_BATCH_CANCEL_EVENTS.get(event_key) is cancel_event:
                 _PNG_BATCH_CANCEL_EVENTS.pop(event_key, None)
@@ -4218,6 +4258,26 @@ def _native_cache_cleanup_locked(now: float | None = None) -> None:
         _NATIVE_CACHE_CONTEXTS.pop(token, None)
 
 
+def _native_cache_extract_claim(processing) -> tuple[str, str] | None:
+    prompt = getattr(processing, "prompt", None)
+    if not isinstance(prompt, str) or not prompt.endswith(_NATIVE_CACHE_MARKER_END):
+        return None
+    start = prompt.rfind(_NATIVE_CACHE_MARKER_START)
+    if start < 0:
+        return None
+    original = prompt[:start]
+    encoded = prompt[start + len(_NATIVE_CACHE_MARKER_START):-len(_NATIVE_CACHE_MARKER_END)]
+    if len(encoded) != 128 or any(
+        char not in {_NATIVE_CACHE_MARKER_ZERO, _NATIVE_CACHE_MARKER_ONE} for char in encoded
+    ):
+        return None
+    bits = "".join("1" if char == _NATIVE_CACHE_MARKER_ONE else "0" for char in encoded)
+    token = "".join(f"{int(bits[index:index + 4], 2):x}" for index in range(0, 128, 4))
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        return None
+    return token, original
+
+
 def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     source = str(payload.get("source") or "").strip()
     database = _native_cache_database(source)
@@ -4293,18 +4353,21 @@ def apply_native_cache_context(processing) -> str | None:
     if existing:
         return str(existing)
     slot = "img2img" if type(processing).__name__.lower().endswith("img2img") else "txt2img"
+    claim = _native_cache_extract_claim(processing)
+    if claim is None:
+        return None
+    claim_token, original_prompt = claim
     with _NATIVE_CACHE_CONTEXT_LOCK:
         _native_cache_cleanup_locked()
-        context = next(
-            (
-                item for item in _NATIVE_CACHE_CONTEXTS.values()
-                if item.get("state") == "pending" and item.get("slot") == slot
-            ),
-            None,
-        )
-        if context is None:
+        context = _NATIVE_CACHE_CONTEXTS.get(claim_token)
+        if (
+            context is None
+            or context.get("state") != "pending"
+            or context.get("slot") != slot
+        ):
             return None
         context["state"] = "active"
+    processing.prompt = original_prompt
     records = context["records"]
     prompts = [
         _native_cache_merge_prompt(
@@ -4877,7 +4940,6 @@ def _inline_cache_process_stage(stage, cancel_id):
     completed_ids = {str(item["record"]["id"]) for item in stage.get("items", [])}
     pending = [task for task in stage["tasks"] if str(task["record"]["id"]) not in completed_ids]
     event_key, event = _png_batch_cancel_event(cancel_id)
-    event.clear()
     interval = max(1, (len(pending) + 99) // 100)
     stopped_by_error = False
     try:
@@ -5315,6 +5377,17 @@ def _create_inline_panel(slot, prompt_target):
                 _INLINE_TEMPLATE_EDITORS[slot] = _create_template_editor(
                     f"llm_prompt_studio_{slot}_inline", inline_template_choice,
                 )
+                with gr.Row(elem_classes=["lps-inline-actions"]):
+                    inline_generate_button = gr.Button(
+                        "生成 Prompt",
+                        variant="primary",
+                        elem_id=f"llm_prompt_studio_{slot}_inline_generate",
+                    )
+                    inline_stop_button = gr.Button(
+                        "停止",
+                        variant="stop",
+                        elem_id=f"llm_prompt_studio_{slot}_inline_stop",
+                    )
             inline_cache_enabled = gr.Checkbox(
                 label="启用缓存 Prompt 注入（使用 Forge 原生 Generate）", value=False,
                 elem_id=f"llm_prompt_studio_{slot}_inline_cache_enabled",
@@ -5347,6 +5420,32 @@ def _create_inline_panel(slot, prompt_target):
             )
             inline_write_mode.change(lambda mode: gr.update(visible=mode == "marker"), inputs=inline_write_mode, outputs=inline_marker, queue=False)
             inline_template_button.click(_template_request, inputs=inline_template_choice, outputs=request)
+            inline_generate_button.click(
+                fn=None,
+                inputs=[
+                    inline_source,
+                    request,
+                    inline_variation,
+                    inline_template_choice,
+                    inline_write_mode,
+                    inline_marker,
+                ],
+                outputs=[],
+                js=(
+                    f"(source, request, variation, template, writeMode, marker) => "
+                    f"window.llmPromptStudioAutoLoop.inlineOnce({{"
+                    f"slot: '{slot}', source, destination: 'prompt', request, variation, "
+                    f"template, count: 1, writeMode, marker}})"
+                ),
+                queue=False,
+            )
+            inline_stop_button.click(
+                fn=None,
+                inputs=[],
+                outputs=[],
+                js=f"() => window.llmPromptStudioAutoLoop.cancelInline('{slot}')",
+                queue=False,
+            )
 
 def _wd14_model_choices(directory="", current=""):
     choices, default = discover_local_models(directory)

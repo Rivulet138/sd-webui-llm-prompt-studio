@@ -16,6 +16,9 @@ import prompt_studio_diversity as metrics
 
 
 class MetricBasicsTests(unittest.TestCase):
+    def test_single_document_repetition_is_not_cross_document_self_bleu(self):
+        self.assertEqual(metrics.self_bleu([["amber", "amber", "amber"]], 2), 0.0)
+
     def test_distinct_n_falls_when_items_repeat(self):
         repeated = [["a", "b", "c", "d"], ["a", "b", "c", "d"]]
         varied = [["a", "b", "c", "d"], ["e", "f", "g", "h"]]

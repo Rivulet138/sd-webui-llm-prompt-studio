@@ -94,3 +94,37 @@ test("server queue renders status without accessing legacy image payloads", () =
     assert.match(markup, /one cat &lt;tree&gt;/);
     assert.doesNotMatch(markup, /<img|base64/);
 });
+
+test("native cache claims remain token-bound and recoverable", () => {
+    assert.match(source, /const NATIVE_CACHE_MARKER_START/);
+    assert.match(source, /const NATIVE_CACHE_MARKER_END/);
+    assert.match(source, /function nativeClaimSuffix\(token\)/);
+    assert.match(source, /function restoreNativeCacheClaim\(run\)/);
+    assert.match(source, /run\.nativeClaimSuffix = claimSuffix/);
+    assert.match(source, /run\.nativeClaimPrompt = claimPrompt/);
+});
+
+test("linked runs always remove their own prompt listeners", () => {
+    assert.match(source, /function finishLinkedRun\(run\)\s*\{[\s\S]*?run\.promptElement\.removeEventListener/);
+    assert.doesNotMatch(source, /if \(linkedRuns\[run\.slot\] !== run\) return/);
+    assert.match(source, /if \(linkedRuns\[run\.slot\] === run\) linkedRuns\[run\.slot\] = null/);
+});
+
+test("native generation restores claims and finishes linked runs", () => {
+    const handleNativeGenerate = source.match(/async function handleNativeGenerate\(slot, generate\)\s*\{([\s\S]*?)\n    \}\n\n\n    function installForgeInterruptHandlers/);
+    assert.ok(handleNativeGenerate, "handleNativeGenerate function should remain discoverable");
+    assert.match(handleNativeGenerate[1], /finally\s*\{[\s\S]*restoreNativeCacheClaim\(run\)/);
+    assert.match(handleNativeGenerate[1], /finally\s*\{[\s\S]*finishLinkedRun\(run\)/);
+});
+
+test("programmatic prompt writes synchronize linked-run state", () => {
+    assert.match(source, /function notifyPromptProgrammaticChange\(slot, value\)/);
+    assert.match(source, /function writePrompt\(prompt, target, mode, basePrompt = ""\)\s*\{[\s\S]*setValue\(`\$\{target\}_prompt`, next\);\s*notifyPromptProgrammaticChange\(target, next\);/);
+    assert.match(source, /setValue\(`\$\{slot\}_prompt`, next\);\s*notifyPromptProgrammaticChange\(slot, next\);/);
+});
+
+test("inline controls retain their public cancellation API", () => {
+    const h = harness();
+    assert.equal(typeof h.window.llmPromptStudioAutoLoop.inlineOnce, "function");
+    assert.equal(typeof h.window.llmPromptStudioAutoLoop.cancelInline, "function");
+});

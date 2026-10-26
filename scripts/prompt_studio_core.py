@@ -47,7 +47,6 @@ RETRYABLE_SSL_ERRORS = frozenset({
     "SSLV3_ALERT_BAD_RECORD_MAC",
     "DECRYPTION_FAILED_OR_BAD_RECORD_MAC",
 })
-UNVERIFIED_SSL_CONTEXT = ssl._create_unverified_context()
 _CANCEL_REQUEST_SLOTS = threading.BoundedSemaphore(LLM_CANCEL_REQUEST_LIMIT)
 
 BAD_TAGS = {
@@ -1922,8 +1921,7 @@ def _request_json_once(
     request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=request_headers, method="POST")
     response = None
     try:
-        request_context = UNVERIFIED_SSL_CONTEXT if url.lower().startswith("https://") else None
-        response = urllib.request.urlopen(request, timeout=max(1, int(timeout)), context=request_context)
+        response = urllib.request.urlopen(request, timeout=max(1, int(timeout)))
         if cancel_state is not None:
             cancel_state["response"] = response
             if cancel_state.get("cancelled"):
@@ -2063,8 +2061,7 @@ def discover_provider_models(
         headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        request_context = UNVERIFIED_SSL_CONTEXT if url.lower().startswith("https://") else None
-        with urllib.request.urlopen(request, timeout=max(1, int(timeout)), context=request_context) as response:
+        with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
             body = response.read(2 * 1024 * 1024 + 1)
         if len(body) > 2 * 1024 * 1024:
             raise RuntimeError("Model list exceeds 2 MiB")

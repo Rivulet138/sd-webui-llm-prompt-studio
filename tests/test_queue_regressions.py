@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -38,8 +39,8 @@ def ui_functions(*names, constants=(), **context):
             if any(getattr(target, "id", None) in wanted_constants for target in targets):
                 selected.append(node)
     selected.sort(key=lambda node: (node.lineno, node.col_offset))
-    namespace = dict(Any=Any, threading=threading, time=time, json=json, re=re,
-                     hashlib=hashlib, LOGGER=logging.getLogger("queue-test"), MAX_SERVER_QUEUE_REQUESTS=5000)
+    namespace = dict(Any=Any, StudioDB=StudioDB, threading=threading, time=time, json=json, re=re,
+                     hashlib=hashlib, uuid=uuid, LOGGER=logging.getLogger("queue-test"), MAX_SERVER_QUEUE_REQUESTS=5000)
     namespace.update(context)
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(ROOT / "scripts/prompt_studio_ui.py"), "exec"), namespace)
     return SimpleNamespace(**namespace)
@@ -183,6 +184,114 @@ class InputBoundaryTests(unittest.TestCase):
         self.assertEqual(api.receive_handoff(payload), {"legacy": True})
         legacy.assert_called_once_with(payload, "send")
         db.save_handoff.assert_not_called()
+
+
+class NativeCacheContextTests(unittest.TestCase):
+    class FakeDB:
+        def __init__(self, records):
+            self.records = list(records)
+
+        def list_prompts_after(self, _query, limit, after_id):
+            return [record for record in self.records if int(record["id"]) > int(after_id)][:limit]
+
+    class StableDiffusionProcessingTxt2Img:
+        pass
+
+    class StableDiffusionProcessingImg2Img:
+        pass
+
+    def setUp(self):
+        records = [
+            {"id": 1, "prompt": "cached one"},
+            {"id": 2, "prompt": "cached two"},
+        ]
+        self.db = self.FakeDB(records)
+        self.api = ui_functions(
+            "_coerce_bool", "_native_cache_database", "_native_cache_merge_prompt",
+            "_native_cache_cleanup_locked", "_native_cache_extract_claim", "_native_cache_prepare",
+            "apply_native_cache_context", "_native_cache_release",
+            constants=(
+                "_NATIVE_CACHE_CONTEXTS", "_NATIVE_CACHE_CONTEXT_LOCK", "_NATIVE_CACHE_CONTEXT_TTL",
+                "_NATIVE_CACHE_MARKER_START", "_NATIVE_CACHE_MARKER_END",
+                "_NATIVE_CACHE_MARKER_ZERO", "_NATIVE_CACHE_MARKER_ONE",
+            ),
+            DB=self.db, RESULT_DB=self.db,
+        )
+
+    def marker(self, token):
+        bits = "".join(f"{int(char, 16):04b}" for char in token)
+        return (
+            self.api._NATIVE_CACHE_MARKER_START
+            + "".join(
+                self.api._NATIVE_CACHE_MARKER_ONE if bit == "1" else self.api._NATIVE_CACHE_MARKER_ZERO
+                for bit in bits
+            )
+            + self.api._NATIVE_CACHE_MARKER_END
+        )
+
+    def prepare(self, **overrides):
+        payload = {
+            "slot": "txt2img", "source": "cache", "after_id": 0, "total_images": 1,
+            "base_prompt": "base", "write_mode": "append_end", "marker": "{{LLM}}",
+            **overrides,
+        }
+        return self.api._native_cache_prepare(payload)
+
+    def test_missing_marker_does_not_consume_pending_context(self):
+        prepared = self.prepare()
+        processing = self.StableDiffusionProcessingTxt2Img()
+        processing.prompt = "base"
+
+        self.assertIsNone(self.api.apply_native_cache_context(processing))
+        self.assertEqual(self.api._NATIVE_CACHE_CONTEXTS[prepared["token"]]["state"], "pending")
+
+    def test_marker_binds_exact_context_and_restores_prompt(self):
+        prepared = self.prepare()
+        processing = self.StableDiffusionProcessingTxt2Img()
+        processing.prompt = "base" + self.marker(prepared["token"])
+
+        self.assertEqual(self.api.apply_native_cache_context(processing), prepared["token"])
+        self.assertEqual(processing.prompt, "base")
+        self.assertEqual(processing.all_prompts, ["base, cached one"])
+        self.assertEqual(processing.main_prompt, "base, cached one")
+        self.assertEqual(self.api._NATIVE_CACHE_CONTEXTS[prepared["token"]]["state"], "active")
+
+    def test_reverse_token_order_consumes_the_matching_context(self):
+        first = self.prepare(base_prompt="first")
+        second = self.prepare(base_prompt="second")
+
+        second_processing = self.StableDiffusionProcessingTxt2Img()
+        second_processing.prompt = "second" + self.marker(second["token"])
+        self.api.apply_native_cache_context(second_processing)
+        self.assertEqual(second_processing.all_prompts, ["second, cached one"])
+
+        first_processing = self.StableDiffusionProcessingTxt2Img()
+        first_processing.prompt = "first" + self.marker(first["token"])
+        self.api.apply_native_cache_context(first_processing)
+        self.assertEqual(first_processing.all_prompts, ["first, cached one"])
+
+    def test_slot_mismatch_does_not_consume_context(self):
+        prepared = self.prepare(slot="txt2img")
+        processing = self.StableDiffusionProcessingImg2Img()
+        processing.prompt = "base" + self.marker(prepared["token"])
+
+        self.assertIsNone(self.api.apply_native_cache_context(processing))
+        self.assertEqual(self.api._NATIVE_CACHE_CONTEXTS[prepared["token"]]["state"], "pending")
+
+    def test_release_supports_rollback_and_commit(self):
+        rollback = self.prepare()
+        released = self.api._native_cache_release(rollback["token"], False)
+        self.assertEqual(released["released"], True)
+        self.assertEqual(released["committed"], False)
+        self.assertNotIn(rollback["token"], self.api._NATIVE_CACHE_CONTEXTS)
+
+        commit = self.prepare()
+        processing = self.StableDiffusionProcessingTxt2Img()
+        processing.prompt = "base" + self.marker(commit["token"])
+        self.api.apply_native_cache_context(processing)
+        committed = self.api._native_cache_release(commit["token"], True)
+        self.assertEqual(committed["released"], True)
+        self.assertEqual(committed["committed"], True)
 
 
 class RenderCancellationTests(unittest.TestCase):

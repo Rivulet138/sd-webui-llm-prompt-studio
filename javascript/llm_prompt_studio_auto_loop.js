@@ -4,6 +4,25 @@
     const FAILURE_PATTERN = /fail|error|timeout|refused|interrupted|失败|错误|超时|拒绝|中断/i;
     const SUCCESS_PATTERN = /completed|finished|done|success|生成完成|已完成/i;
     const CONTENT_BLOCK_PATTERN = /(SFW|NSFW|安全|成人|内容).*(拦截|拒绝|阻止|blocked|safety)|blocked.*(SFW|safety)/i;
+    const NATIVE_CACHE_MARKER_START = "\u2063\u2062";
+    const NATIVE_CACHE_MARKER_END = "\u2062\u2063";
+    const NATIVE_CACHE_MARKER_ZERO = "\u200b";
+    const NATIVE_CACHE_MARKER_ONE = "\u200c";
+
+    function nativeClaimSuffix(token) {
+        const normalized = String(token || "").trim().toLowerCase();
+        if (!/^[0-9a-f]{32}$/.test(normalized)) {
+            throw new Error("后端返回了无效的缓存上下文 token");
+        }
+        const bits = [...normalized]
+            .map((char) => Number.parseInt(char, 16).toString(2).padStart(4, "0"))
+            .join("");
+        return NATIVE_CACHE_MARKER_START
+            + [...bits].map((bit) => bit === "1"
+                ? NATIVE_CACHE_MARKER_ONE
+                : NATIVE_CACHE_MARKER_ZERO).join("")
+            + NATIVE_CACHE_MARKER_END;
+    }
 
     function isContentBlocked(value) {
         return CONTENT_BLOCK_PATTERN.test(String(value?.message || value || ""));
@@ -469,6 +488,33 @@
         return String(input(`${slot}_prompt`)?.value || "");
     }
 
+    function notifyPromptProgrammaticChange(slot, value) {
+        const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
+        const run = linkedRuns[normalizedSlot];
+        if (!run) return;
+        const next = String(value ?? "");
+        run.basePrompt = next;
+        run.lastWrittenPrompt = next;
+        run.promptEdited = false;
+    }
+
+    function restoreNativeCacheClaim(run) {
+        const suffix = String(run?.nativeClaimSuffix || "");
+        if (!suffix) return false;
+        const current = promptRawValue(run.slot);
+        if (!current.endsWith(suffix)) {
+            run.nativeClaimSuffix = "";
+            run.nativeClaimPrompt = "";
+            return false;
+        }
+        const restored = current.slice(0, -suffix.length);
+        setValue(`${run.slot}_prompt`, restored);
+        notifyPromptProgrammaticChange(run.slot, restored);
+        run.nativeClaimSuffix = "";
+        run.nativeClaimPrompt = "";
+        return true;
+    }
+
     function splitPromptParts(value) {
         return String(value || "")
             .split(/\s*,\s*|\r?\n/)
@@ -816,12 +862,11 @@
     }
 
     function finishLinkedRun(run) {
-        if (linkedRuns[run.slot] !== run) return;
         if (run.promptElement && run.promptListener) {
             run.promptElement.removeEventListener?.("input", run.promptListener);
             run.promptElement.removeEventListener?.("change", run.promptListener);
         }
-        linkedRuns[run.slot] = null;
+        if (linkedRuns[run.slot] === run) linkedRuns[run.slot] = null;
     }
 
     function nativeCacheEnabled(slot) {
@@ -902,7 +947,13 @@
         if (!token || !nextCursor || count !== totalImages) {
             throw new Error("后端未准备完整的缓存生图上下文，未启动本次生图");
         }
+        const claimSuffix = nativeClaimSuffix(token);
+        const claimPrompt = `${promptRawValue(config.slot)}${claimSuffix}`;
+        setValue(`${config.slot}_prompt`, claimPrompt);
         run.nativeContextToken = token;
+        run.nativeClaimSuffix = claimSuffix;
+        run.nativeClaimPrompt = claimPrompt;
+        run.lastWrittenPrompt = claimPrompt;
         run.nativeImageCount = count;
         run.pendingCacheCursor = nextCursor;
         run.pendingCacheSource = cacheCursorKey(config.slot, config.source === "processed_cache");
@@ -950,6 +1001,7 @@
             pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
             abortController: null, requestId: "", pendingNativeClick: false, nativeRetryTimer: null, forgeLaunching: false,
             forgeStarted: false, forgeTaskId: "", lastCompletedForgeTaskId: lastCompletedForgeTaskIds[slot], nativeContextToken: "", nativeImageCount: 0,
+            nativeClaimSuffix: "", nativeClaimPrompt: "",
         };
         run.promptElement = input(`${slot}_prompt`);
         run.promptListener = (event) => {
@@ -1075,6 +1127,7 @@
             discardPendingInlineCache(run);
         } finally {
             if (!completed) discardPendingInlineCache(run);
+            restoreNativeCacheClaim(run);
             const current = promptRawValue(slot);
             if (run.promptEdited) {
                 run.basePrompt = current;
@@ -1084,16 +1137,17 @@
             run.busy = false;
             run.forgeStarted = false;
             run.forgeTaskId = "";
-            if (run.pendingNativeClick) {
-                run.pendingNativeClick = false;
-                if (!run.cancelled && nativeCacheEnabled(slot)) {
-                    const pendingRun = run;
-                    wait(0).then(() => {
-                        if (linkedRuns[slot] === pendingRun && !pendingRun.cancelled) {
-                            void handleNativeGenerate(slot, generate);
-                        }
-                    });
-                }
+            const continueRun = run.pendingNativeClick && !run.cancelled && nativeCacheEnabled(slot);
+            run.pendingNativeClick = false;
+            if (continueRun) {
+                const pendingRun = run;
+                wait(0).then(() => {
+                    if (linkedRuns[slot] === pendingRun && !pendingRun.cancelled) {
+                        void handleNativeGenerate(slot, generate);
+                    }
+                });
+            } else {
+                finishLinkedRun(run);
             }
         }
     }
@@ -1191,6 +1245,7 @@
             }
             const next = composeInlinePrompt(original, prompt, config);
             setValue(`${slot}_prompt`, next);
+            notifyPromptProgrammaticChange(slot, next);
             commitInlineCacheCursor(run);
             const message = `${sourceName} Prompt 已写入正面提示词`;
             renderInline(slot, "success", message, "");
@@ -1243,6 +1298,7 @@
             ? `${String(basePrompt).replace(/[\s,]+$/, "")}, ${String(prompt).replace(/^[\s,]+/, "")}`
             : String(prompt).trim();
         setValue(`${target}_prompt`, next);
+        notifyPromptProgrammaticChange(target, next);
         targetInput.focus({ preventScroll: true });
         return next;
     }
