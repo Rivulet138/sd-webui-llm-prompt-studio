@@ -50,6 +50,9 @@ DIVERSITY_CONSTANTS = (
     "_RECIPE_USED_TERMS_LOCK",
     "_RECIPE_USED_TERMS_LIMIT",
     "_STATIC_REFERENCE_BLOCKLIST",
+    "_KEMONOMIMI_MARKERS",
+    "_KEMONOMIMI_REFERENCE_CATEGORY_HINTS",
+    "_KEMONOMIMI_REFERENCE_EXCLUDED_HINTS",
     "_SOURCE_DUPLICATION_WINDOW",
     "_RECENT_BATCH_OUTPUTS",
     "_RECENT_BATCH_OUTPUTS_LOCK",
@@ -59,6 +62,8 @@ DIVERSITY_CONSTANTS = (
 )
 
 DIVERSITY_FUNCTIONS = (
+    "_is_kemonimimi_request",
+    "_kemonimimi_reference_categories",
     "_coerce_bool",
     "_diversity_int",
     "_diversity_float",
@@ -195,7 +200,7 @@ class DiversityLayerTests(unittest.TestCase):
 
     def test_recipe_block_states_fixed_content_wins(self):
         block = self.api._recipe_directive_block([("action", "动作/基础动作", "crouching")])
-        self.assertIn("REQUIRED LOCAL RECIPE", block)
+        self.assertIn("OPTIONAL LOCAL RECIPE", block)
         self.assertIn("action or pose: crouching", block)
         self.assertIn("drop that item", block)
         self.assertEqual(self.api._recipe_directive_block([]), "")

@@ -106,11 +106,13 @@ GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创
 静态词库只作参考，仅在贴合画面时取用，不要堆砌无关元素。"""
 KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 生成一组可直接用于扩散模型的兽耳幼态可爱角色单图 Prompt。
 
-共同方向：每条只包含一个可见角色和一个完整瞬间；保持自然头身比例、精致大眼、柔和表情、清晰兽耳、蓬松尾巴、完整得体的服装与配饰。
-每条写清：外观、服装、动作、表情、地点、关键道具及互动、前景/中景/背景、空间层次、镜头、时间或天气、光照与主色彩；动作、姿态、手脚、耳尾、视线、道具与环境必须相互协调，背景只服务于主体与空间感。
-批次规划：每条至少在三类高层因素上不同（地点、动作、服装、道具、时间/天气、镜头、色彩），形成不同的生活化事件；避免只改颜色、耳型、地点名或同义词，避免重复构图与道具组合。
+共同方向：只描写一个可见角色和一个完整瞬间。表现二次元可爱萌系的小萝莉气质：圆润幼态的脸颊、清澈大眼、小巧鼻口、娇小而自然的身形，避免写实成人脸、成熟身材和夸张Q版比例。保留人类面部与四肢，以柔软兽耳和符合物种的尾巴体现特征，不变成动物头或全身覆毛；固定 Prompt 的明确设定优先。
+物种一致：原始 Prompt 已指定猫、狐、兔或幻想种族时严格保留；未指定时每条只选择一种。不混搭耳形、尾巴和其他物种特征，不机械添加尾巴；龙角、翅膀、鳞片等仅在明确的幻想种族设定中使用，不随机附加给普通兽耳角色。
+造型与画面：完整得体的服装，避免性化或成人化表达；一套服装只围绕一个主题，如和服与花簪，或衬衫与背带裙，不把多套风格和饰品混穿。人物占据主要画面，脸与兽耳清晰可读，尾巴自然连接身体，不遮住面部；手势与身体重心合理，手、道具与视线的关系明确。
+每条只需写清：主体外观、服装、一个清晰动作、一个表情或视线、一个连贯场景，以及服务主体的构图信息。场景可以是生活空间或符合角色设定的幻想地点；背景围绕同一主题，用一两处环境线索衬托人物，不能抢主体。最多一个关键道具，只有在确实有互动时才加入；时间、天气、光线、材质和空间层次按需补足，不强行填写前景/中景/背景，也不把背景写成物品清单。
+批次规划：在动作、场景、服装小变化、视线或构图中自然变化一到两项即可，保持固定主体和已指定物种一致；避免额外角色、无依据漂浮物、复杂世界观、叙事设定、分镜、拼图、多面板、道具堆砌和互不相关的元素。
 优先级：固定 Prompt、用户要求与安全限制优先，新增内容不得覆盖或改变它们。
-只写单图：禁止分镜、拼图、多面板；遵守当前输出预设的字数与格式；不新增风格、媒介、画质或艺术家词。"""
+只写单图：遵守当前输出预设的字数与格式；不新增风格、媒介、画质或艺术家词。"""
 KREA_ANIMA_POLISH_ROLE = """Role: Krea 2 / Anima detail-expansion prompt editor. Turn the input into one complete image prompt by decomposing visible elements instead of summarising them.
 
 Task: From the user's text, tags, or reference image description, produce one complete image prompt in the selected output language. Detail is the highest priority. Actively decompose every useful visible element instead of giving a short summary.
@@ -353,11 +355,11 @@ _VARIATION_DIMENSIONS = (
 _BATCH_VARIATION_FOCI = _VARIATION_DIMENSIONS  # Backward-compatible test/API name; selection is no longer cyclic.
 _COMPLETE_PROMPT_CONTRACT = (
     "Complete prompt contract: keep every source-fixed subject, identity, tag and restriction. "
-    "Make the recipe items visible, and choose enough visible grounding for this image "
-    "(action, expression, environment, props, composition, camera, time, weather, light) "
-    "instead of a generic summary. "
-    "Follow the selected output profile's format and length budget; one coherent single image per item, "
-    "no checklist, storyboard or collage."
+    "Make the recipe items visible only when they naturally support this image; choose one clear action, "
+    "one readable expression and one coherent setting. Add a prop, camera detail, time, weather, light, "
+    "color or material only when it improves the picture; do not force every category or fill the "
+    "foreground/midground/background. Follow the selected output profile's format and length budget; "
+    "one coherent single image per item, no checklist, storyboard or collage."
 )
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
@@ -411,6 +413,39 @@ _INSPIRATION_VARIATION_HINTS = (
     "采用低机位广角并强调前中后景", "采用近距离肖像构图并突出表情", "加入具有材质层次的环境细节",
     "使用逆光、轮廓光或彩色光源塑造氛围", "加入时间线索与独特的空间关系",
 )
+_KEMONOMIMI_MARKERS = (
+    "兽耳", "兽耳娘", "兽耳小萝莉", "兽耳幼态", "kemonomimi", "animal ears",
+    "fluffy tail", "猫耳", "狐耳", "兔耳", "犬耳", "cat ears", "fox ears",
+    "rabbit ears", "dog ears", "bunny ears", "wolf ears", "狼耳", "拟兽",
+)
+_KEMONOMIMI_TOPIC_POOL = (
+    "温馨居家", "校园日常", "街角小店", "雨天回家", "公园散步", "节庆活动",
+    "自然观察", "短途旅行", "午后阅读", "轻松运动",
+)
+_KEMONOMIMI_VARIATION_HINTS = (
+    "一个自然的生活化动作", "一个简单而清楚的地点", "一个轻微的表情或视线变化",
+    "一个适合主体的镜头距离或站位", "一处服装小变化", "一处自然光线条件",
+)
+_KEMONOMIMI_REFERENCE_CATEGORY_HINTS = (
+    "动作", "姿势", "运动", "场景", "环境", "表情", "镜头", "视角", "构图",
+    "光影", "光线", "天气", "颜色",
+)
+_KEMONOMIMI_REFERENCE_EXCLUDED_HINTS = (
+    "人物", "角色", "服饰", "服装", "物品", "道具", "武器", "职业", "种族",
+)
+
+
+def _is_kemonimimi_request(*texts) -> bool:
+    joined = " ".join(str(text or "").casefold().replace("_", " ") for text in texts)
+    return any(marker.casefold() in joined for marker in _KEMONOMIMI_MARKERS)
+
+
+def _kemonimimi_reference_categories() -> list[str]:
+    return [
+        name for name in DB.wildcard_categories()
+        if any(hint in name for hint in _KEMONOMIMI_REFERENCE_CATEGORY_HINTS)
+        and not any(hint in name for hint in _KEMONOMIMI_REFERENCE_EXCLUDED_HINTS)
+    ]
 
 
 def _choose_variation_lenses(used: set[str] | None = None, count: int = 2) -> tuple[str, ...]:
@@ -832,7 +867,7 @@ _RECIPE_LABELS = {
 }
 
 
-def _recipe_schedule(sequence: int, seed: int = 0, count: int | None = None) -> tuple[str, ...]:
+def _recipe_schedule(sequence: int, seed: int = 0, count: int | None = None, source: str = "") -> tuple[str, ...]:
     """Coverage-balanced dimension choice for item N of one batch.
 
     Picking each item's dimensions independently lets four of eight items land in
@@ -845,6 +880,9 @@ def _recipe_schedule(sequence: int, seed: int = 0, count: int | None = None) -> 
     settings = _diversity_settings()
     requested = int(settings["recipe_dimensions"] if count is None else count)
     dimensions = [dimension for dimension, _keywords, _extra in _RECIPE_DIMENSION_RULES]
+    if _is_kemonimimi_request(source):
+        requested = min(requested, 2)
+        dimensions.remove("prop")
     size = max(1, min(requested, len(dimensions)))
     combos = list(itertools.combinations(dimensions, size))
     if not combos:
@@ -866,7 +904,7 @@ def _weighted_category(sampler, names: list[str], groups: dict[str, list[str]]) 
 
 def _lexicon_recipe(
     used_terms: set[str] | None = None, count: int | None = None,
-    dimensions: Iterable[str] | None = None,
+    dimensions: Iterable[str] | None = None, source: str = "",
 ) -> list[tuple[str, str, str]]:
     """Sample one local-lexicon term per independent visual dimension for one item.
 
@@ -880,6 +918,10 @@ def _lexicon_recipe(
         return []
     requested = int(settings["recipe_dimensions"] if count is None else count)
     planned = [str(item) for item in (dimensions or ()) if str(item)]
+    character_focused = _is_kemonimimi_request(source)
+    if character_focused:
+        requested = min(requested, 2)
+        planned = [item for item in planned if item != "prop"][:max(1, requested)]
     try:
         groups = DB.wildcard_terms_by_category()
     except Exception:
@@ -896,10 +938,15 @@ def _lexicon_recipe(
     sampler = random.SystemRandom()
     pools: list[tuple[str, list[str]]] = []
     for dimension, keywords, extra in _RECIPE_DIMENSION_RULES:
+        if character_focused and dimension == "prop":
+            continue
         names = [
             name for name in groups
             if any(key in name for key in (*keywords, *extra))
             and not any(blocked in name for blocked in _RECIPE_EXCLUDED_CATEGORY_HINTS)
+            and (not character_focused or not any(
+                blocked in name for blocked in _KEMONOMIMI_REFERENCE_EXCLUDED_HINTS
+            ))
             and groups[name]
         ]
         if names:
@@ -931,7 +978,7 @@ def _lexicon_recipe(
 
 
 def _recipe_directive_block(recipe: Iterable[tuple[str, str, str]] | None) -> str:
-    """Render a sampled recipe as a system-controlled per-item requirement."""
+    """Render a sampled recipe as optional, source-compatible visual hints."""
     items = [item for item in (recipe or ()) if item and str(item[2]).strip()]
     if not items:
         return ""
@@ -940,11 +987,11 @@ def _recipe_directive_block(recipe: Iterable[tuple[str, str, str]] | None) -> st
         for dimension, _name, term in items
     ]
     return (
-        "\nREQUIRED LOCAL RECIPE for this single item (sampled in code from the indexed local "
-        "lexicon). Make every listed item clearly visible in the image and keep the subject, "
+        "\nOPTIONAL LOCAL RECIPE for this single item (sampled in code from the indexed local "
+        "lexicon). Use a listed hint only when it naturally supports this one image; keep the subject, "
         "identity, clothing, LoRA and explicit user constraints exactly as supplied. If a listed "
-        "item contradicts the fixed source or an explicit requirement, drop that item instead of "
-        "changing the fixed content, and pick a different compatible option in the same dimension:\n"
+        "item is unrelated, adds clutter, or contradicts the fixed source or an explicit requirement, "
+        "drop that item without replacement instead of changing the fixed content:\n"
         + "\n".join(lines)
         + "\nKeep the result inside this profile's length budget, and never introduce art-style, "
           "medium, quality or artist words (for example masterpiece, best quality, 8k, artstation, "
@@ -2380,17 +2427,24 @@ def _build_inspiration_sources(
         parsed, dedupe_stats = _source_duplication(parsed)
         return parsed[:200], {**stats, **dedupe_stats}
     topics = [item.strip() for item in str(topic_pool or "").replace(",", "\n").splitlines() if item.strip()]
-    topics = topics or list(_INSPIRATION_TOPIC_POOL)
+    character_focused = _is_kemonimimi_request(source_text, base_prompt, shared_request, topic_pool)
+    topics = topics or list(_KEMONOMIMI_TOPIC_POOL if character_focused else _INSPIRATION_TOPIC_POOL)
+    variation_hints = _KEMONOMIMI_VARIATION_HINTS if character_focused else _INSPIRATION_VARIATION_HINTS
+    reference_categories = _kemonimimi_reference_categories() if character_focused and sample_static else None
+    reference_limit = 2 if character_focused else 8
     rng = random.SystemRandom()
     rng.shuffle(topics)
     used_terms: set[str] = set()
     sources: list[str] = []
     for index in range(count):
         topic = topics[index % len(topics)]
-        variation_hint = _INSPIRATION_VARIATION_HINTS[index % len(_INSPIRATION_VARIATION_HINTS)]
+        variation_hint = variation_hints[index % len(variation_hints)]
         sampled: list[str] = []
-        if sample_static:
-            categorized = DB.wildcard_samples_by_category(1, exclude=used_terms, limit=8, max_categories=8)
+        if sample_static and (not character_focused or reference_categories):
+            categorized = DB.wildcard_samples_by_category(
+                1, exclude=used_terms, categories=reference_categories,
+                limit=reference_limit, max_categories=reference_limit,
+            )
             categories = list(categorized)
             rng.shuffle(categories)
             for category in categories:
@@ -2400,8 +2454,10 @@ def _build_inspiration_sources(
                     if term and term.casefold() not in used_terms:
                         sampled.append(f"[{category}] {term}")
                         used_terms.add(term.casefold())
-        reference = "；".join(sampled[:8])
-        source = f"随机题材：{topic}；本条变化重点：{variation_hint}。请创作一条完整、可直接生图的单图 Prompt，主动补足动作、表情、服装、道具、环境、前中后景、镜头、时间天气和光线。"
+        reference = "；".join(sampled[:reference_limit])
+        source = f"随机题材：{topic}；本条变化重点：{variation_hint}。请创作一条完整、可直接生图的单图 Prompt，围绕主体、一个清晰动作和一个连贯场景展开，其他细节只在自然支持画面时添加，不为填满维度而添加物品。"
+        if character_focused:
+            source += " 保留固定的年龄、身份和物种；以角色为视觉中心，最多一个有明确互动的关键道具，背景只作衬托。"
         if reference:
             source += f" 静态词库本条抽样参考（可按语义取舍）：{reference}。"
         if anchor:
@@ -2530,7 +2586,7 @@ def _batch_generate(
             if not continuous:
                 return
             if random_sources:
-                sources[:] = _build_inspiration_sources("", 8, topic_pool, base_prompt, lock_known, sample_static)[0]
+                sources[:] = _build_inspiration_sources("", 8, topic_pool, base_prompt, lock_known, sample_static, shared_request)[0]
 
     def cache_updates():
         if continuous:
@@ -2598,13 +2654,14 @@ def _batch_generate(
                     _independent_batch_directive(
                         index, used_lenses,
                         _lexicon_recipe(
-                            used_recipe_terms, dimensions=_recipe_schedule(index, recipe_seed),
+                            used_recipe_terms, dimensions=_recipe_schedule(index, recipe_seed, source=source),
+                            source=source,
                         ),
                     ) + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{total_label} 条。"
                         "批次上下文中的结果只用于排除重复，不要复制其措辞、构图、动作或物品组合；"
                         "请根据原要求自由选择变化，不要把任何变化维度当作硬性模板。"
-                        + ("已有主体/角色 Tag、LoRA、权重和明确属性是锁定内容，只补全动作、表情、道具、环境、构图、天气和光线。" if lock_known and str(base_prompt or "").strip() else "")
+                        + ("已有主体/角色 Tag、LoRA、权重和明确属性是锁定内容；仅添加服务同一画面的必要细节，不必补齐道具、天气或空间层次。" if lock_known and str(base_prompt or "").strip() else "")
                     ),
                     preserve_inference_settings=True,
                 )
@@ -3212,15 +3269,27 @@ def _static_prompt_reference(
     exclude_terms: list[str] | None = None,
 ) -> list[str]:
     """Provide optional, category-balanced lexicon references, excluding batch concepts."""
-    related = [
-        term for term in DB.wildcard_matches(str(source or ""), max(0, min(30, int(related_limit or 0))))
-        if str(term or "").strip().casefold() not in _STATIC_REFERENCE_BLOCKLIST
-    ]
+    character_focused = _is_kemonimimi_request(source)
+    categories = _kemonimimi_reference_categories() if character_focused else None
+    if character_focused and not categories:
+        return []
+    related_count = max(0, min(1 if character_focused else 30, int(related_limit or 0)))
     excluded = {str(item).strip().casefold() for item in (exclude_terms or []) if str(item).strip()}
+    related = []
+    for category in (categories if character_focused else [None]):
+        if len(related) >= related_count:
+            break
+        for term in DB.wildcard_matches(str(source or ""), related_count, category=category):
+            if (str(term or "").strip().casefold() not in _STATIC_REFERENCE_BLOCKLIST
+                    and str(term or "").strip().casefold() not in excluded
+                    and term not in related):
+                related.append(term)
+                if len(related) >= related_count:
+                    break
     sample_excluded = excluded | {str(item).strip().casefold() for item in related if str(item).strip()}
-    requested = max(0, min(30 - len(related), int(sample_limit or 0)))
+    requested = max(0, min(1 if character_focused else 30 - len(related), int(sample_limit or 0)))
     categorized = DB.wildcard_samples_by_category(
-        12, exclude=sample_excluded, limit=requested,
+        12, exclude=sample_excluded, categories=categories, limit=requested,
     )
     category_order = list(categorized)
     random.SystemRandom().shuffle(category_order)
@@ -3328,8 +3397,8 @@ def _generate(
                     effective_batch_directive
                     + "\nDIVERSITY RETRY: the previous candidate repeated content that an earlier item of "
                       "this batch already used. Keep the subject, identity and every explicit constraint, "
-                      "and make this item clearly different in the required recipe dimensions and in the "
-                      "variation lenses listed above.",
+                      "and make a meaningful, source-compatible change in action, setting or composition. "
+                      "Recipe hints and variation lenses remain optional; do not add clutter to satisfy them.",
                     operation_instruction,
                 )
             elif retry_reason == "response":
@@ -3442,14 +3511,14 @@ def _generate_auto_loop(
             provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, True, "auto_loop", source_ref, True, _AUTO_LOOP_CANCEL,
-            _independent_creative_directive(recipe=_lexicon_recipe()),
+            _independent_creative_directive(recipe=_lexicon_recipe(source=request)),
         )
     return _generate(
         request, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
         provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
             remove_bad, remove_terms, shuffle, spaces, max_tags,
             structured_mode, region_count, 0, False, "", "", False, _AUTO_LOOP_CANCEL,
-            _independent_creative_directive(recipe=_lexicon_recipe()),
+            _independent_creative_directive(recipe=_lexicon_recipe(source=request)),
     )
 
 
@@ -4705,7 +4774,7 @@ def _inline_generate(
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         remove_bad, remove_terms, shuffle, spaces, max_tags,
         structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
-        INLINE_DELTA_DIRECTIVE + "\n\n" + _independent_creative_directive(recipe=_lexicon_recipe()),
+        INLINE_DELTA_DIRECTIVE + "\n\n" + _independent_creative_directive(recipe=_lexicon_recipe(source=inline_source)),
         connection_settings=connection, preserve_inference_settings=True,
     )
     return generated, system, status
