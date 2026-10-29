@@ -186,10 +186,31 @@
     }
 
     async function studioFetch(url, options = {}) {
-        const response = await window.fetch(url, {
-            credentials: "same-origin",
-            ...options,
-        });
+        const timeoutMs = Math.max(1000, Number(options.timeoutMs ?? 15000));
+        const externalSignal = options.signal;
+        const controller = new AbortController();
+        const fetchOptions = { ...options };
+        delete fetchOptions.timeoutMs;
+        fetchOptions.credentials = "same-origin";
+        fetchOptions.signal = controller.signal;
+        const abortExternal = () => controller.abort();
+        if (externalSignal) {
+            if (externalSignal.aborted) controller.abort();
+            else externalSignal.addEventListener("abort", abortExternal, { once: true });
+        }
+        const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+        let response;
+        try {
+            response = await window.fetch(url, fetchOptions);
+        } catch (error) {
+            if (controller.signal.aborted) {
+                throw new Error(`Studio API 请求超时或已取消：${url}`);
+            }
+            throw error;
+        } finally {
+            window.clearTimeout(timer);
+            externalSignal?.removeEventListener?.("abort", abortExternal);
+        }
         if (response.status === 401 || response.status === 403) {
             throw new Error(`Studio API 认证失败 (HTTP ${response.status})，请先在当前页面完成登录或检查 --api-auth 配置`);
         }
@@ -403,15 +424,6 @@
         return String(find(`html_log_${tab}`)?.textContent || "").trim();
     }
 
-    function currentForgeOutput(tab) {
-        const ids = [`${tab}_gallery`, `generation_info_${tab}`, `html_info_${tab}`];
-        const hosts = ids.map((id) => find(id)).filter(Boolean);
-        return hosts.length ? hosts.map((host) => {
-            const field = host.querySelector?.("textarea, input");
-            return [host.innerHTML, field?.value, host.textContent, host.value].map((value) => String(value || "")).join("|");
-        }).join("\n") : "";
-    }
-
     function ownsActiveForgeTask(run) {
         if (!run?.forgeStarted || !run.target) return false;
         if (run.forgeTaskId) return currentForgeTaskId(run.target) === run.forgeTaskId;
@@ -455,14 +467,13 @@
 
 
 
-    async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000, beforeLog = "", beforeOutput = "", launchObserved = false) {
+    async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000, beforeLog = "", launchObserved = false) {
         const statusHost = find(`${tab}_status`);
         // A Generate click can be deferred by Gradio until a later animation
         // frame. A changed button/interrupt control only proves that the click
         // was accepted, not that Forge has submitted the job. Do not treat
         // that UI change as a completed generation or release the cache claim.
         let sawBusy = Boolean(taskId);
-        let noOutputSince = 0;
         const budget = createTimeoutBudget(timeoutMs);
         const launchBudget = createTimeoutBudget(10000);
         while (true) {
@@ -474,32 +485,20 @@
             sawBusy ||= busy;
             const currentStatus = String(statusHost?.textContent || "");
             const currentLog = currentForgeLog(tab);
-            const currentOutput = currentForgeOutput(tab);
-            const outputChanged = currentOutput !== beforeOutput;
             const logChanged = currentLog !== beforeLog;
             const statusCompleted = currentStatus !== beforeStatus && SUCCESS_PATTERN.test(currentStatus);
             if (taskReplaced) {
                 throw new Error(`${tab} generation task ownership changed; prompt returned to pending`);
             }
-            if (!sawBusy && !taskId && !statusCompleted && !outputChanged && launchBudget.expired()) {
+            if (!sawBusy && !taskId && !statusCompleted && !logChanged && launchBudget.expired()) {
                 throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
             }
-            if (!busy && (sawBusy || statusCompleted || (launchObserved && outputChanged))) {
+            if (!busy && (sawBusy || statusCompleted || (launchObserved && logChanged))) {
                 const failure = [currentStatus, logChanged ? currentLog : ""]
                     .filter(Boolean).join(" ");
                 if (FAILURE_PATTERN.test(failure) || /out of memory|traceback|exception|cuda/i.test(failure)) {
                     throw new Error(failure);
                 }
-                if (taskId && beforeOutput && !outputChanged && !statusCompleted && !logChanged) {
-                    const now = typeof window.performance?.now === "function" ? window.performance.now() : Date.now();
-                    if (!noOutputSince) noOutputSince = now;
-                    if (now - noOutputSince < 1500) {
-                        await waitForUiSignal(250);
-                        continue;
-                    }
-                    throw new Error("Forge 任务结束但没有收到输出，可能是进度连接中断");
-                }
-                noOutputSince = 0;
                 return;
             }
             if (budget.expired()) break;
@@ -725,7 +724,6 @@
     async function runForgeGeneration(tab, run, generate, afterClick = null) {
         const beforeStatus = String(find(`${tab}_status`)?.textContent || "");
         const beforeLog = currentForgeLog(tab);
-        const beforeOutput = currentForgeOutput(tab);
         const previousTaskId = currentForgeTaskId(tab);
         const wasGenerateDisabled = Boolean(generate.disabled);
         let taskId = "";
@@ -754,12 +752,11 @@
             while (!taskId || taskId === previousTaskId) {
                 const launchEvidence = (!wasGenerateDisabled && Boolean(generate.disabled))
                     || String(find(`${tab}_status`)?.textContent || "") !== beforeStatus
-                    || currentForgeLog(tab) !== beforeLog
-                    || currentForgeOutput(tab) !== beforeOutput;
+                    || currentForgeLog(tab) !== beforeLog;
                 if (launchEvidence) {
                     // A very fast Forge task may create and remove its task ID
-                    // between two samples. The changed native controls/output
-                    // still prove that this click was submitted.
+                    // between two samples. Changed native controls/status/log
+                    // still prove that the click was submitted.
                     launchObserved = true;
                     taskId = "";
                     break;
@@ -774,7 +771,7 @@
             if (run.cancelled && ownsActiveForgeTask(run)) findButton(`${tab}_interrupt`)?.click();
             if (typeof afterClick === "function") afterClick();
             assertActive(run);
-            await waitForForgeGeneration(tab, run, beforeStatus, taskId, 1800000, beforeLog, beforeOutput, launchObserved);
+            await waitForForgeGeneration(tab, run, beforeStatus, taskId, 1800000, beforeLog, launchObserved);
         } finally {
             run.forgeLaunching = false;
             if (typeof afterClick === "function") afterClick();
@@ -1636,7 +1633,7 @@
 
     function serverQueueRowsHtml(rows) {
         return rows.length ? rows.map((row) =>
-            `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><code>${escapeHtml(row.prompt || row.request || "")}</code><small>${escapeHtml(row.error || "")}</small></div>`
+            `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><small>${escapeHtml(row.error || "")}</small></div>`
         ).join("") : '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
     }
 
@@ -1663,8 +1660,9 @@
                 if (watcher.cancelled) break;
                 renderServerQueue(snapshot);
                 const counts = snapshot.counts || {};
-                const total = Number(snapshot.jobs?.length || 0);
-                const finished = Number(counts.completed || 0) + Number(counts.error || 0) + Number(counts.cancelled || 0);
+                const total = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
+                const finished = Number(counts.completed || 0) + Number(counts.error || 0)
+                    + Number(counts.cancelled || 0) + Number(counts.expired || 0);
                 if (total && finished >= total) break;
             } catch (error) {
                 if (watcher.cancelled) break;
