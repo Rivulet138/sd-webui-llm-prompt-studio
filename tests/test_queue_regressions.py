@@ -187,13 +187,6 @@ class InputBoundaryTests(unittest.TestCase):
 
 
 class NativeCacheContextTests(unittest.TestCase):
-    class FakeDB:
-        def __init__(self, records):
-            self.records = list(records)
-
-        def list_prompts_after(self, _query, limit, after_id):
-            return [record for record in self.records if int(record["id"]) > int(after_id)][:limit]
-
     class StableDiffusionProcessingTxt2Img:
         pass
 
@@ -205,11 +198,17 @@ class NativeCacheContextTests(unittest.TestCase):
             {"id": 1, "prompt": "cached one"},
             {"id": 2, "prompt": "cached two"},
         ]
-        self.db = self.FakeDB(records)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = StudioDB(Path(self.tmp.name) / "native.db")
+        for record in records:
+            self.db.save_prompt(record["prompt"])
         self.api = ui_functions(
             "_coerce_bool", "_native_cache_database", "_native_cache_merge_prompt",
             "_native_cache_cleanup_locked", "_native_cache_extract_claim", "_native_cache_prepare",
-            "apply_native_cache_context", "_native_cache_release",
+            "apply_native_cache_context", "_native_cache_release", "_native_cache_get_context",
+            "prepare_native_cache_processing", "complete_native_cache_context", "_native_cache_fail",
+            "track_native_cache_image", "_native_cache_state", "_native_cache_slot",
             constants=(
                 "_NATIVE_CACHE_CONTEXTS", "_NATIVE_CACHE_CONTEXT_LOCK", "_NATIVE_CACHE_CONTEXT_TTL",
                 "_NATIVE_CACHE_MARKER_START", "_NATIVE_CACHE_MARKER_END",
@@ -236,6 +235,112 @@ class NativeCacheContextTests(unittest.TestCase):
             **overrides,
         }
         return self.api._native_cache_prepare(payload)
+
+    def native_script(self, shared):
+        tree = ast.parse((ROOT / "scripts/prompt_studio_native.py").read_text(encoding="utf-8"))
+        namespace = {**vars(self.api), "shared": shared,
+                     "scripts": SimpleNamespace(Script=object, AlwaysVisible=object())}
+        exec(compile(ast.Module(body=[node for node in tree.body if isinstance(node, ast.ClassDef)],
+                                type_ignores=[]), "prompt_studio_native.py", "exec"), namespace)
+        return namespace["Script"]()
+
+    def test_native_hook_rejects_cancelled_or_missing_claim_and_interrupts_forge(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                token = self.prepare()["token"] if cancelled else "f" * 32
+                if cancelled:
+                    self.api._native_cache_release(token, False)
+                p = self.StableDiffusionProcessingTxt2Img()
+                p.prompt = "base" + self.marker(token)
+                shared = SimpleNamespace(state=SimpleNamespace(interrupt=Mock()))
+                bridge = self.native_script(shared)
+                with self.assertRaises(ValueError):
+                    bridge.process(p)
+                shared.state.interrupt.assert_called_once_with()
+                self.assertEqual(p.prompt, "base")
+                self.assertIsNone(self.db.get_native_cache_cursor("txt2img", "cache"))
+
+    def test_before_hook_strips_claim_before_inherited_hires_setup(self):
+        token = self.prepare()["token"]
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt, p.hr_prompt = "base" + self.marker(token), ""
+        self.native_script(SimpleNamespace()).before_process(p)
+        self.assertEqual(p.prompt, "base")
+        self.assertTrue(p._llm_prompt_studio_inherit_hr)
+
+    def test_style_failure_interrupts_without_changing_negative_fields(self):
+        prepared = self.prepare()
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt, p.styles = "base" + self.marker(prepared["token"]), ["style"]
+        p.negative_prompt = negative = ["native negative"]
+        shared = SimpleNamespace(state=SimpleNamespace(interrupt=Mock()),
+                                 prompt_styles=SimpleNamespace(apply_styles_to_prompt=Mock(side_effect=RuntimeError("bad style"))))
+        modules = ModuleType("modules")
+        modules.shared = shared
+        bridge = self.native_script(shared)
+        bridge.before_process(p)
+        with patch.dict(sys.modules, {"modules": modules}):
+            with self.assertRaisesRegex(RuntimeError, "bad style"):
+                bridge.process(p)
+        shared.state.interrupt.assert_called_once_with()
+        self.assertIs(p.negative_prompt, negative)
+        self.assertEqual(self.db.get_native_cache_job(prepared["token"])["state"], "failed")
+        self.assertIsNone(self.db.get_native_cache_cursor("txt2img", "cache"))
+
+    def test_styles_applied_once_and_active_release_does_not_commit_or_cancel(self):
+        prepared = self.prepare()
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt, p.styles = "base" + self.marker(prepared["token"]), ["style"]
+        style = Mock(side_effect=lambda prompt, styles: "styled " + prompt)
+        modules = ModuleType("modules")
+        modules.shared = SimpleNamespace(prompt_styles=SimpleNamespace(apply_styles_to_prompt=style))
+        with patch.dict(sys.modules, {"modules": modules}):
+            self.api.apply_native_cache_context(p)
+            self.api.apply_native_cache_context(p)
+        style.assert_called_once_with("base, cached one", ["style"])
+        for commit in (True, False):
+            result = self.api._native_cache_release(prepared["token"], commit)
+            self.assertFalse(result["committed"])
+            self.assertFalse(result["released"])
+            self.assertEqual(result["state"], "active")
+
+    def test_native_comments_filter_positive_prompts_and_keep_raw_infotext(self):
+        for comments_after in (False, True):
+            with self.subTest(comments_after=comments_after):
+                prepared = self.prepare(base_prompt="base # comment")
+                p = self.StableDiffusionProcessingTxt2Img()
+                p.prompt = "base # comment" + self.marker(prepared["token"])
+                p.negative_prompt = negative = "negative # native"
+                p._all_negative_prompts_c = raw_negative = [negative]
+                shared = SimpleNamespace(opts=SimpleNamespace(enable_prompt_comments=True, save_prompt_comments=True))
+                modules = ModuleType("modules")
+                modules.shared = shared
+                comments = ModuleType("modules.processing_scripts.comments")
+                comments.strip_comments = Mock(side_effect=lambda text: text.split("#", 1)[0].rstrip())
+                bridge = self.native_script(shared)
+                with patch.dict(sys.modules, {"modules": modules, "modules.processing_scripts.comments": comments}):
+                    bridge.before_process(p)
+                    bridge.process(p)
+                if comments_after:
+                    p._all_prompts_c = p.all_prompts.copy()
+                bridge.before_process_batch(p, batch_number=0)
+                self.assertEqual(p.all_prompts, ["base"])
+                self.assertEqual(p.main_prompt, "base")
+                self.assertEqual(p._all_prompts_c, ["base # comment, cached one"])
+                self.assertIs(p.negative_prompt, negative)
+                self.assertIs(p._all_negative_prompts_c, raw_negative)
+
+    def test_native_image_indices_ignore_extra_gallery_images(self):
+        prepared = self.prepare(total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.batch_size, p.n_iter = 1, 2
+        bridge = self.native_script(SimpleNamespace())
+        bridge.before_process(p)
+        bridge.process(p)
+        bridge.postprocess_image(p, SimpleNamespace(index=0))
+        bridge.postprocess(p, SimpleNamespace(images=["grid", "one", "extension output"], index_of_first_image=1))
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 1)
 
     def test_missing_marker_does_not_consume_pending_context(self):
         prepared = self.prepare()
@@ -283,15 +388,123 @@ class NativeCacheContextTests(unittest.TestCase):
         released = self.api._native_cache_release(rollback["token"], False)
         self.assertEqual(released["released"], True)
         self.assertEqual(released["committed"], False)
-        self.assertNotIn(rollback["token"], self.api._NATIVE_CACHE_CONTEXTS)
+        self.assertEqual(self.db.get_native_cache_job(rollback["token"])["state"], "cancelled")
 
         commit = self.prepare()
         processing = self.StableDiffusionProcessingTxt2Img()
         processing.prompt = "base" + self.marker(commit["token"])
         self.api.apply_native_cache_context(processing)
+        self.assertFalse(self.api._native_cache_release(commit["token"], True)["committed"])
+        self.api.complete_native_cache_context(processing, SimpleNamespace(images=[object()], index_of_first_image=0))
         committed = self.api._native_cache_release(commit["token"], True)
         self.assertEqual(committed["released"], True)
         self.assertEqual(committed["committed"], True)
+
+
+    def test_invalid_merge_is_rejected_before_job_creation(self):
+        with self.assertRaisesRegex(ValueError, "标记"):
+            self.prepare(write_mode="marker", base_prompt="no marker")
+        with self.assertRaises(ValueError):
+            self.prepare(write_mode="unknown")
+
+    def test_only_positive_fields_change_and_explicit_hires_is_preserved(self):
+        prepared = self.prepare(total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.batch_size, p.n_iter = 1, 2
+        original = {
+            "negative_prompt": ["negative A", "negative B"],
+            "all_negative_prompts": ["styled negative A", "styled negative B"],
+            "main_negative_prompt": "main negative", "hr_prompt": "explicit hires",
+            "all_hr_prompts": ["explicit hires A", "explicit hires B"],
+            "hr_negative_prompt": "hires negative", "all_hr_negative_prompts": ["hires negatives"],
+        }
+        for key, value in original.items():
+            setattr(p, key, value)
+        self.api.prepare_native_cache_processing(p)
+        self.api.apply_native_cache_context(p)
+        for key, value in original.items():
+            self.assertIs(getattr(p, key), value, key)
+        self.assertEqual(p.all_prompts, ["base, cached one", "base, cached two"])
+
+    def test_inherited_hires_uses_positive_per_image_prompts(self):
+        prepared = self.prepare(total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.hr_prompt, p.batch_size, p.n_iter = "", 2, 1
+        self.api.prepare_native_cache_processing(p)
+        p.hr_prompt = p.prompt
+        self.api.apply_native_cache_context(p)
+        self.assertEqual(p.all_hr_prompts, p.all_prompts)
+        self.assertIsInstance(p.hr_prompt, str)
+
+    def test_completion_persists_without_browser_and_release_is_idempotent(self):
+        prepared = self.prepare(total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.batch_size, p.n_iter = 1, 2
+        self.api.apply_native_cache_context(p)
+        self.api._NATIVE_CACHE_CONTEXTS.clear()
+        self.api.complete_native_cache_context(p, SimpleNamespace(images=["grid", "one", "two"], index_of_first_image=1))
+        fresh = StudioDB(self.db.path)
+        self.assertEqual(fresh.get_native_cache_cursor("txt2img", "cache"), 2)
+        first = self.api._native_cache_release(prepared["token"], True)
+        self.assertEqual(first, self.api._native_cache_release(prepared["token"], True))
+        self.assertEqual(first, self.api._native_cache_release(prepared["token"], False))
+
+    def test_partial_completion_commits_only_produced_prefix(self):
+        prepared = self.prepare(total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.batch_size, p.n_iter = 1, 2
+        self.api.apply_native_cache_context(p)
+        self.api.complete_native_cache_context(p, SimpleNamespace(images=["one"], index_of_first_image=0))
+        result = self.api._native_cache_release(prepared["token"], True)
+        self.assertEqual(result["next_cursor"], 1)
+        self.assertEqual(result["completed_count"], 1)
+        self.assertEqual(result["state"], "partial")
+
+    def test_skipped_first_batch_does_not_consume_later_records(self):
+        prepared = self.prepare(total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.batch_size, p.n_iter = 1, 2
+        self.api.apply_native_cache_context(p)
+        self.api.track_native_cache_image(p, SimpleNamespace(index=1))
+        self.api.complete_native_cache_context(p, SimpleNamespace(images=["second"], index_of_first_image=0))
+        self.assertIsNone(self.db.get_native_cache_cursor("txt2img", "cache"))
+
+    def test_server_cursor_is_used_when_client_does_not_override(self):
+        prepared = self.prepare()
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        self.api.apply_native_cache_context(p)
+        self.api.complete_native_cache_context(p, SimpleNamespace(images=["one"], index_of_first_image=0))
+        next_job = self.prepare(after_id=None)
+        self.assertEqual(next_job["after_id"], 1)
+        self.assertEqual(next_job["records"][0]["id"], 2)
+
+    def test_configuration_survives_database_reopen(self):
+        config = {"source": "processed_cache", "cache_enabled": True, "write_mode": "marker", "marker": "<cache>"}
+        self.api._native_cache_state("img2img", config)
+        reopened = StudioDB(Path(self.tmp.name) / "native.db")
+        with patch.dict(self.api._native_cache_state.__globals__, DB=reopened):
+            self.assertEqual(self.api._native_cache_state("img2img")["config"], config)
+            self.assertEqual(self.api._native_cache_state("txt2img")["config"]["source"], "llm")
+            self.assertFalse(self.api._native_cache_state("txt2img")["config"]["cache_enabled"])
+        with self.assertRaises(ValueError):
+            self.api._native_cache_state("other", config)
+
+    def test_selectable_script_and_changed_batch_shape_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.prepare(selected_script="Prompts from file or textbox")
+        prepared = self.prepare(total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.batch_size, p.n_iter = 1, 1
+        with self.assertRaises(ValueError):
+            self.api.apply_native_cache_context(p)
+        self.assertNotEqual(self.db.get_native_cache_job(prepared["token"])["state"], "active")
 
 
 class RenderCancellationTests(unittest.TestCase):

@@ -458,6 +458,13 @@ class StudioDB:
                     path TEXT PRIMARY KEY, modified_at REAL NOT NULL, terms_json TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS native_cache_jobs (
+                    token TEXT PRIMARY KEY,
+                    context_json TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS deletion_journal (
                     id INTEGER PRIMARY KEY, deleted_at INTEGER NOT NULL, reason TEXT DEFAULT '', records_json TEXT NOT NULL
                 );
@@ -538,6 +545,71 @@ class StudioDB:
         fields = ["prompt", "negative_prompt", "output_mode", "base_model", "tags"]
         normalized = "\x1f".join(str(record.get(field) or "").strip() for field in fields)
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def save_native_cache_job(self, context: dict[str, Any]) -> None:
+        """Persist a new pending context without replacing an existing token."""
+        now = int(time.time())
+        pending = {**context, "state": "pending"}
+        with self.lock, self._connection() as conn:
+            conn.execute(
+                "INSERT INTO native_cache_jobs(token,context_json,state,created_at,updated_at) "
+                "VALUES(?,?,'pending',?,?)",
+                (context["token"], json.dumps(pending, ensure_ascii=False), now, now),
+            )
+
+    def get_native_cache_job(self, token: str) -> dict[str, Any] | None:
+        with self.lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT context_json,state FROM native_cache_jobs WHERE token=?", (token,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {**json.loads(row["context_json"]), "state": row["state"]}
+
+    def transition_native_cache_job(self, token: str, expected_state: str, state: str) -> bool:
+        """Compare-and-swap a job state, including intermediate applying claims."""
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE native_cache_jobs SET state=?, updated_at=? WHERE token=? AND state=?",
+                (state, int(time.time()), token, expected_state),
+            )
+        return cursor.rowcount > 0
+
+    def complete_native_cache_job(self, token: str, completed_count: int) -> dict[str, Any] | None:
+        """Commit an active job's consumed prefix and cursor in one transaction."""
+        with self.lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT context_json,state FROM native_cache_jobs WHERE token=?", (token,),
+            ).fetchone()
+            if row is None:
+                return None
+            context = {**json.loads(row["context_json"]), "state": row["state"]}
+            if row["state"] in {"completed", "partial", "failed"}:
+                return context
+            if row["state"] != "active":
+                return None
+            records = context["records"]
+            count = max(0, min(int(completed_count), len(records)))
+            next_cursor = int(records[count - 1]["id"]) if count else int(context.get("after_id") or 0)
+            state = ("completed" if count == len(records) else "partial") if count else "failed"
+            context.update(state=state, completed_count=count, committed=bool(count), next_cursor=next_cursor)
+            conn.execute(
+                "UPDATE native_cache_jobs SET context_json=?, state=?, updated_at=? WHERE token=?",
+                (json.dumps(context, ensure_ascii=False), state, int(time.time()), token),
+            )
+            if count:
+                # set_setting opens a separate connection, so write on this transaction instead.
+                conn.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (f"native_cache_cursor:{context['slot']}:{context['source']}", json.dumps(next_cursor)),
+                )
+        return context
+
+    def get_native_cache_cursor(self, slot: str, source: str) -> int | None:
+        cursor = self.get_setting(f"native_cache_cursor:{slot}:{source}")
+        return int(cursor) if cursor is not None else None
 
     def enqueue_server_queue(self, batch_id: str, jobs: Iterable[dict[str, Any]]) -> int:
         """Persist a server-owned queue before returning control to the browser."""
@@ -941,8 +1013,12 @@ class StudioDB:
                 if before == after:
                     continue
                 record[field] = after
+                score_update = (
+                    ", score=0, score_source='unrated', score_reason='', score_model=''"
+                    if record["score_source"] == "llm" else ""
+                )
                 conn.execute(
-                    f"UPDATE prompts SET {field}=?, content_hash=?, updated_at=? WHERE id=?",
+                    f"UPDATE prompts SET {field}=?, content_hash=?, updated_at=?{score_update} WHERE id=?",
                     (after, self._record_hash(record), int(time.time()), record["id"]),
                 )
                 changed += 1

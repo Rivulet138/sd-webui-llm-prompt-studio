@@ -24,6 +24,33 @@
             + NATIVE_CACHE_MARKER_END;
     }
 
+    function nativeClaimPrefix(value) {
+        const text = String(value ?? "");
+        const start = text.lastIndexOf(NATIVE_CACHE_MARKER_START);
+        if (start < 0) return null;
+        const encodedStart = start + NATIVE_CACHE_MARKER_START.length;
+        const end = encodedStart + 128;
+        if (text.length < end + NATIVE_CACHE_MARKER_END.length
+            || text.slice(end, end + NATIVE_CACHE_MARKER_END.length) !== NATIVE_CACHE_MARKER_END
+            || !/^[\s,，]*$/.test(text.slice(end + NATIVE_CACHE_MARKER_END.length))) {
+            return null;
+        }
+        const encoded = text.slice(encodedStart, end);
+        if (![...encoded].every(char => char === NATIVE_CACHE_MARKER_ZERO || char === NATIVE_CACHE_MARKER_ONE)) {
+            return null;
+        }
+        return text.slice(0, start);
+    }
+
+    function stripStaleNativeClaim(value) {
+        let current = String(value ?? "");
+        while (true) {
+            const stripped = nativeClaimPrefix(current);
+            if (stripped == null) return current;
+            current = stripped;
+        }
+    }
+
     function isContentBlocked(value) {
         return CONTENT_BLOCK_PATTERN.test(String(value?.message || value || ""));
     }
@@ -52,6 +79,8 @@
     const inlineCacheCursors = { txt2img: 0, img2img: 0 };
     const processedCacheCursors = { txt2img: 0, img2img: 0 };
     const CACHE_CURSOR_STORAGE_KEY = "llm_prompt_studio_cache_cursors_v1";
+    const nativeCacheUi = {};
+    const NATIVE_CACHE_CONFIG_FIELDS = ["source", "cache_enabled", "write_mode", "marker"];
     const serverQueueWatchers = new Map();
     const CHOICE_ALIASES = Object.freeze({
         "Danbooru 标签": "Danbooru Tags",
@@ -114,6 +143,8 @@
         if (!host) return fallback;
         const checked = host.querySelector('input[type="radio"]:checked, input[type="checkbox"]:checked');
         if (checked && checked.type !== "checkbox") return normalizeChoiceValue(checked.value, fallback);
+        const selected = host.querySelector(".single-select");
+        if (selected?.textContent.trim()) return normalizeChoiceValue(selected.textContent.trim(), fallback);
         const element = host.querySelector("textarea, input, select");
         return element ? normalizeChoiceValue(element.value, fallback) : fallback;
     }
@@ -265,7 +296,7 @@
         const tone = kind === "success" ? "success" : kind === "error" ? "error" : "warning";
         const run = linkedRuns[normalizedSlot];
         if (run && !run.cancelled) {
-            detail = [`${run.busy ? "正在处理" : "已启用缓存注入"} · 已完成 ${run.completed} 轮`, detail].filter(Boolean).join(" · ");
+            detail = ["累计完成 " + run.completed + " 张图", detail].filter(Boolean).join(" · ");
         }
         host.innerHTML = `<div class="lps-status lps-status--${tone}" role="status" aria-live="polite"><strong>${escapeHtml(headline)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ""}</div>`;
     }
@@ -338,6 +369,7 @@
     }
 
     function normalizeCacheCursor(value, fallback = 0) {
+        if (value == null || String(value).trim() === "") return fallback;
         const number = Number(value);
         return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
     }
@@ -425,7 +457,11 @@
 
     async function waitForForgeGeneration(tab, run, beforeStatus, taskId = "", timeoutMs = 1800000, beforeLog = "", beforeOutput = "", launchObserved = false) {
         const statusHost = find(`${tab}_status`);
-        let sawBusy = Boolean(taskId) || launchObserved;
+        // A Generate click can be deferred by Gradio until a later animation
+        // frame. A changed button/interrupt control only proves that the click
+        // was accepted, not that Forge has submitted the job. Do not treat
+        // that UI change as a completed generation or release the cache claim.
+        let sawBusy = Boolean(taskId);
         let noOutputSince = 0;
         const budget = createTimeoutBudget(timeoutMs);
         const launchBudget = createTimeoutBudget(10000);
@@ -439,20 +475,22 @@
             const currentStatus = String(statusHost?.textContent || "");
             const currentLog = currentForgeLog(tab);
             const currentOutput = currentForgeOutput(tab);
+            const outputChanged = currentOutput !== beforeOutput;
+            const logChanged = currentLog !== beforeLog;
             const statusCompleted = currentStatus !== beforeStatus && SUCCESS_PATTERN.test(currentStatus);
             if (taskReplaced) {
                 throw new Error(`${tab} generation task ownership changed; prompt returned to pending`);
             }
-            if (!sawBusy && !taskId && !statusCompleted && launchBudget.expired()) {
+            if (!sawBusy && !taskId && !statusCompleted && !outputChanged && launchBudget.expired()) {
                 throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
             }
-            if (!busy && (sawBusy || statusCompleted)) {
-                const failure = [currentStatus, currentLog !== beforeLog ? currentLog : ""]
+            if (!busy && (sawBusy || statusCompleted || (launchObserved && outputChanged))) {
+                const failure = [currentStatus, logChanged ? currentLog : ""]
                     .filter(Boolean).join(" ");
                 if (FAILURE_PATTERN.test(failure) || /out of memory|traceback|exception|cuda/i.test(failure)) {
                     throw new Error(failure);
                 }
-                if (taskId && beforeOutput && currentOutput === beforeOutput && !statusCompleted && currentLog === beforeLog) {
+                if (taskId && beforeOutput && !outputChanged && !statusCompleted && !logChanged) {
                     const now = typeof window.performance?.now === "function" ? window.performance.now() : Date.now();
                     if (!noOutputSince) noOutputSince = now;
                     if (now - noOutputSince < 1500) {
@@ -502,12 +540,12 @@
         const suffix = String(run?.nativeClaimSuffix || "");
         if (!suffix) return false;
         const current = promptRawValue(run.slot);
-        if (!current.endsWith(suffix)) {
+        const restored = stripStaleNativeClaim(current);
+        if (restored === current || !current.includes(suffix)) {
             run.nativeClaimSuffix = "";
             run.nativeClaimPrompt = "";
             return false;
         }
-        const restored = current.slice(0, -suffix.length);
         setValue(`${run.slot}_prompt`, restored);
         notifyPromptProgrammaticChange(run.slot, restored);
         run.nativeClaimSuffix = "";
@@ -701,6 +739,7 @@
             // Consume this bypass only for the native click that is about to
             // be dispatched. Keep it after the hidden-page guard so a failed
             // launch cannot leak a bypass into the next user click.
+            if (run.native) validateNativeForgeScript(tab);
             nativeGenerateBypass[tab] += 1;
             generate.click();
             taskId = currentForgeTaskId(tab);
@@ -710,6 +749,8 @@
             // observe the previous task ID and be rejected as task ownership
             // changing when that ID is replaced.
             const launchBudget = createTimeoutBudget(10000);
+            await wait(0);
+            taskId = currentForgeTaskId(tab);
             while (!taskId || taskId === previousTaskId) {
                 const launchEvidence = (!wasGenerateDisabled && Boolean(generate.disabled))
                     || String(find(`${tab}_status`)?.textContent || "") !== beforeStatus
@@ -875,6 +916,196 @@
         return source === "cache" || source === "processed_cache";
     }
 
+    function nativeCacheUiState(slot) {
+        return nativeCacheUi[slot] ||= {
+            attempted: false, loading: null, snapshot: null, bound: new WeakSet(), applied: new Map(),
+            edited: new Set(), pendingEdits: new Set(), values: {}, observed: {}, manualCursors: {},
+            saveTimer: null, saveChain: Promise.resolve(), savedConfig: "",
+        };
+    }
+
+    function nativeCacheSetting(slot, field) {
+        return field === "cache_enabled" ? componentChecked(inlineId(slot, field))
+            : field === "marker" ? input(inlineId(slot, field))?.value ?? "{{LLM}}"
+                : componentValue(inlineId(slot, field));
+    }
+
+    async function fetchNativeCacheState(slot) {
+        const response = await studioFetch('/llm-prompt-studio/v1/native-cache/state?slot=' + encodeURIComponent(slot), { cache: "no-store" });
+        let data = null;
+        try { data = await response.json(); } catch { /* Report HTTP and schema errors below. */ }
+        if (!response.ok) throw new Error(String(data?.detail || '读取缓存设置失败：HTTP ' + response.status));
+        if (!data?.config || !data?.cursors) throw new Error("缓存设置返回格式无效，请更新插件并重启 Forge");
+        return data;
+    }
+
+    async function restoreNativeCacheControl(slot, field, value, ui) {
+        const host = find(inlineId(slot, field));
+        const element = input(inlineId(slot, field));
+        if (!element) return false;
+        if (ui.pendingEdits.has(field)) return false;
+        if (field === "cache_enabled") {
+            if (element.checked !== Boolean(value)) element.click();
+        } else if (host.querySelector('input[type="radio"]')) {
+            const choice = Array.from(host.querySelectorAll('input[type="radio"]'))
+                .find(node => normalizeChoiceValue(node.value) === value);
+            if (!choice) throw new Error('未找到缓存设置选项：' + value);
+            if (!choice.checked) choice.click();
+        } else if (field === "write_mode" && element.tagName !== "SELECT") {
+            if (componentValue(inlineId(slot, field)) === value) return true;
+            const before = ui.values[field];
+            element.focus?.();
+            element.click();
+            await wait(0);
+            // Gradio mounts dropdown options on focus. A user selection made
+            // during that render takes precedence over the saved setting.
+            if (ui.pendingEdits.has(field) || (ui.edited.has(field) && ui.values[field] !== before)) return false;
+            const choice = Array.from(host.querySelectorAll('[role="option"]')).find(node =>
+                normalizeChoiceValue(node.getAttribute?.("aria-label") || node.textContent.replace(/✓/g, "")) === value);
+            if (!choice) throw new Error('未找到缓存合并选项：' + value + '，请刷新页面重试');
+            choice.dispatchEvent(new Event("mousedown", { bubbles: true, cancelable: true }));
+            choice.click();
+            await wait(0);
+        } else {
+            setValue(inlineId(slot, field), value);
+        }
+        return true;
+    }
+
+    function showNativeCacheProgress(slot, source) {
+        const ui = nativeCacheUiState(slot);
+        if (source !== "cache" && source !== "processed_cache") return null;
+        const manual = ui.manualCursors[source];
+        const cursor = manual ? manual.value : normalizeCacheCursor(ui.snapshot?.cursors[source], null);
+        showCacheCursor(slot, cursor == null ? "" : cursor);
+        return cursor;
+    }
+
+    async function restoreNativeCacheState(slot) {
+        const ui = nativeCacheUiState(slot);
+        if (ui.loading) return ui.loading;
+        ui.attempted = true;
+        ui.loading = (async () => {
+            try {
+                const fetched = !ui.snapshot;
+                if (!ui.snapshot) {
+                    ui.snapshot = await fetchNativeCacheState(slot);
+                    ui.savedConfig = JSON.stringify(ui.snapshot.config);
+                }
+                for (const field of NATIVE_CACHE_CONFIG_FIELDS) {
+                    const host = find(inlineId(slot, field));
+                    if (!host || ui.applied.get(field) === host) continue;
+                    const value = ui.edited.has(field) ? ui.values[field] : ui.snapshot.config[field];
+                    if (await restoreNativeCacheControl(slot, field, value, ui)) {
+                        ui.applied.set(field, host);
+                        ui.observed[field] = nativeCacheSetting(slot, field);
+                    }
+                }
+                showNativeCacheProgress(slot, nativeCacheSetting(slot, "source"));
+                if (fetched && ui.edited.size) scheduleNativeCacheSave(slot);
+                return ui.snapshot;
+            } catch (error) {
+                renderInline(slot, "error", "缓存设置恢复失败", String(error?.message || error) + ' · 请刷新页面，或修改设置后重试');
+                throw error;
+            } finally {
+                ui.loading = null;
+            }
+        })();
+        return ui.loading;
+    }
+
+    function scheduleNativeCacheSave(slot) {
+        const ui = nativeCacheUiState(slot);
+        if (ui.saveTimer != null) window.clearTimeout(ui.saveTimer);
+        ui.saveTimer = window.setTimeout(() => {
+            ui.saveTimer = null;
+            ui.saveChain = ui.saveChain.then(async () => {
+                if (!ui.snapshot) await restoreNativeCacheState(slot);
+                const config = Object.fromEntries(NATIVE_CACHE_CONFIG_FIELDS.map(field => [field,
+                    ui.edited.has(field) ? ui.values[field] : ui.snapshot.config[field],
+                ]));
+                const serialized = JSON.stringify(config);
+                if (serialized === ui.savedConfig) return;
+                const response = await studioFetch("/llm-prompt-studio/v1/native-cache/state", {
+                    method: "POST", headers: { "Content-Type": "application/json" }, cache: "no-store",
+                    body: JSON.stringify({ slot, config }),
+                });
+                if (!response.ok) {
+                    const data = await response.json();
+                    throw new Error(String(data?.detail || 'HTTP ' + response.status));
+                }
+                ui.savedConfig = serialized;
+                ui.snapshot.config = config;
+            }).catch(error => {
+                renderInline(slot, "error", "缓存设置保存失败", String(error?.message || error) + ' · 本页设置仍有效，请检查连接并修改设置重试');
+            });
+        }, 250);
+    }
+
+    function installNativeCacheState() {
+        for (const slot of ["txt2img", "img2img"]) {
+            const ui = nativeCacheUiState(slot);
+            let mounted = false;
+            for (const field of [...NATIVE_CACHE_CONFIG_FIELDS, "cache_cursor"]) {
+                const host = find(inlineId(slot, field));
+                if (!host || !input(inlineId(slot, field))) continue;
+                mounted = true;
+                if (ui.bound.has(host)) continue;
+                ui.bound.add(host);
+                if (field !== "cache_cursor") ui.observed[field] = nativeCacheSetting(slot, field);
+                const edit = () => {
+                    if (field === "cache_cursor") {
+                        const source = nativeCacheSetting(slot, "source");
+                        const raw = String(input(inlineId(slot, field))?.value || "").trim();
+                        const value = raw === "" ? null : normalizeCacheCursor(raw, null);
+                        if (raw && value == null) return;
+                        ui.manualCursors[source] = { value };
+                        return;
+                    }
+                    const value = nativeCacheSetting(slot, field);
+                    if (ui.observed[field] === value) return;
+                    ui.observed[field] = value;
+                    ui.values[field] = value;
+                    ui.edited.add(field);
+                    if (field === "source" && ui.snapshot) showNativeCacheProgress(slot, value);
+                    scheduleNativeCacheSave(slot);
+                };
+                for (const type of ["input", "change"]) host.addEventListener(type, event => {
+                    if (event.isTrusted !== true) return;
+                    if (field === "write_mode" && input(inlineId(slot, field))?.tagName !== "SELECT") return;
+                    edit();
+                });
+                if (field === "write_mode") {
+                    for (const type of ["mousedown", "keydown"]) host.addEventListener(type, event => {
+                        if (event.isTrusted !== true) return;
+                        if (type === "keydown" ? event.key !== "Enter" : !event.target?.closest?.('[role="option"]')) return;
+                        ui.pendingEdits.add(field);
+                        void wait(0).then(() => {
+                            edit();
+                            ui.pendingEdits.delete(field);
+                        });
+                    });
+                }
+            }
+            if (mounted && (!ui.attempted || ui.snapshot)) void restoreNativeCacheState(slot).catch(() => {});
+        }
+    }
+
+    function selectedForgeScript(slot) {
+        const tab = find('tab_' + slot) || find(slot);
+        const host = tab?.querySelector("#script_list");
+        return String(host?.querySelector(".single-select")?.textContent.trim()
+            || host?.querySelector("select, input, textarea")?.value || "None").trim();
+    }
+
+    function validateNativeForgeScript(slot) {
+        const script = selectedForgeScript(slot);
+        if (script.toLowerCase() !== "none") {
+            throw new Error('缓存注入不支持 Forge Script 多任务扩展：' + script + '；请将 Script 设为 None 后再生成');
+        }
+        return script;
+    }
+
     function nativeCacheConfig(slot) {
         if (!nativeCacheEnabled(slot)) return null;
         const source = normalizeChoiceValue(componentValue(inlineId(slot, "source"), "cache"));
@@ -892,21 +1123,6 @@
         });
     }
 
-    function initializeNativeCacheCursor(config, run) {
-        const processed = config.source === "processed_cache";
-        const sourceKey = cacheCursorKey(config.slot, processed);
-        if (run.cacheCursorSource === sourceKey) return run.cacheCursor;
-        const requested = config.cacheCursor == null
-            ? persistedCacheCursor(config.slot, processed)
-            : normalizeCacheCursor(config.cacheCursor, 0);
-        const cursors = processed ? processedCacheCursors : inlineCacheCursors;
-        cursors[config.slot] = requested;
-        run.cacheCursorSource = sourceKey;
-        run.cacheCursor = requested;
-        showCacheCursor(config.slot, requested);
-        return requested;
-    }
-
     function readNativeBatchSettings(slot) {
         const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
         const number = (suffix, fallback) => {
@@ -920,9 +1136,19 @@
     }
 
     async function requestNativeCacheContext(config, run) {
+        const ui = nativeCacheUiState(config.slot);
+        const snapshot = await fetchNativeCacheState(config.slot);
+        assertActive(run);
+        if (ui.snapshot) ui.snapshot.cursors = snapshot.cursors;
+        else ui.snapshot = snapshot;
+        showNativeCacheProgress(config.slot, config.source);
+        const selectedScript = validateNativeForgeScript(config.slot);
         const settings = readNativeBatchSettings(config.slot);
         const totalImages = Math.max(1, settings.batch_size * settings.batch_count);
-        const afterId = initializeNativeCacheCursor(config, run);
+        // Only a visible user edit may override the backend cursor. Restored
+        // UI values and localStorage are never authoritative for native jobs.
+        const manual = ui.manualCursors[config.source];
+        const afterId = manual?.value ?? null;
         const response = await studioFetch("/llm-prompt-studio/v1/native-cache/prepare", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -931,6 +1157,7 @@
                 slot: config.slot,
                 source: config.source,
                 after_id: afterId,
+                selected_script: selectedScript,
                 total_images: totalImages,
                 base_prompt: run.basePrompt,
                 write_mode: config.writeMode,
@@ -942,18 +1169,27 @@
         try { data = await response.json(); } catch { data = null; }
         if (!response.ok) throw new Error(String(data?.detail || `准备缓存生图失败：HTTP ${response.status}`));
         const token = String(data?.token || "").trim();
-        const nextCursor = normalizeCacheCursor(data?.next_cursor, 0);
+        const nextCursor = normalizeCacheCursor(data?.next_cursor, null);
+        const actualAfterId = normalizeCacheCursor(data?.after_id, null);
         const count = Number(data?.count || 0);
-        if (!token || !nextCursor || count !== totalImages) {
+        run.nativeContextToken = token;
+        if (!token || nextCursor == null || actualAfterId == null || count !== totalImages) {
             throw new Error("后端未准备完整的缓存生图上下文，未启动本次生图");
         }
+        if (ui.manualCursors[config.source] === manual) delete ui.manualCursors[config.source];
+        ui.snapshot.cursors[config.source] = actualAfterId;
+        run.cacheCursorSource = cacheCursorKey(config.slot, config.source === "processed_cache");
+        run.cacheCursor = actualAfterId;
+        showNativeCacheProgress(config.slot, config.source);
         const claimSuffix = nativeClaimSuffix(token);
         const claimPrompt = `${promptRawValue(config.slot)}${claimSuffix}`;
         setValue(`${config.slot}_prompt`, claimPrompt);
-        run.nativeContextToken = token;
         run.nativeClaimSuffix = claimSuffix;
         run.nativeClaimPrompt = claimPrompt;
         run.lastWrittenPrompt = claimPrompt;
+        // Gradio serializes the textbox state on the next render turn. Yield
+        // once so the native Generate request cannot capture the old prompt.
+        await wait(0);
         run.nativeImageCount = count;
         run.pendingCacheCursor = nextCursor;
         run.pendingCacheSource = cacheCursorKey(config.slot, config.source === "processed_cache");
@@ -974,19 +1210,38 @@
             let data = null;
             try { data = await response.json(); } catch { data = null; }
             if (commit && data?.committed !== true) {
-                throw new Error("Forge 后端没有应用缓存 Prompt，未推进读取位置");
+                throw new Error("后端尚未确认缓存批次完成，请等待 Forge 完成后刷新读取进度");
+            }
+            if (data?.committed === true) {
+                const cursor = normalizeCacheCursor(data.next_cursor, null);
+                const count = normalizeCacheCursor(data.completed_count, null);
+                if (cursor == null || count == null) throw new Error("后端完成进度无效，请刷新读取进度");
+                run.pendingCacheCursor = cursor;
+                run.activeCacheCursor = cursor;
+                run.nativeCompletedCount = count;
+                const sourceKey = run.activeCacheSource || run.pendingCacheSource;
+                if (sourceKey) {
+                    const [slot, source] = sourceKey.split(":");
+                    const ui = nativeCacheUiState(slot);
+                    if (ui.snapshot) ui.snapshot.cursors[source] = cursor;
+                }
             }
             run.nativeContextToken = "";
+            return data;
         } catch (error) {
             if (!commit) run.nativeContextToken = "";
             if (commit) throw error;
+            run.nativeReleaseError = String(error?.message || error);
+            return null;
         }
     }
 
     function startLinkedRun(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         const normalizedConfig = inlineConfig(slot, config);
-        const currentPrompt = promptRawValue(slot);
+        const rawPrompt = promptRawValue(slot);
+        const currentPrompt = stripStaleNativeClaim(rawPrompt);
+        if (currentPrompt !== rawPrompt) setValue(`${slot}_prompt`, currentPrompt);
         const existing = linkedRuns[slot];
         if (existing && !existing.cancelled) {
             existing.config = normalizedConfig;
@@ -1030,9 +1285,8 @@
             run.nativeRetryTimer.cancelled = true;
             run.nativeRetryTimer = null;
         }
-        discardPendingInlineCache(run);
         if (interruptForge && ownsActiveForgeTask(run)) findButton(`${normalizedSlot}_interrupt`)?.click();
-        renderInline(normalizedSlot, "warning", "缓存 Prompt 生图已停止", `已完成 ${run.completed} 轮 · 当前缓存未提交`);
+        renderInline(normalizedSlot, "warning", "缓存 Prompt 生图已停止", "后端保留已完成图片的读取进度，请等待 Forge 结束后刷新确认");
         if (!run.busy) finishLinkedRun(run);
     }
 
@@ -1073,6 +1327,7 @@
         let config;
         try {
             config = nativeCacheConfig(slot);
+            if (config) validateNativeForgeScript(slot);
         } catch (error) {
             renderInline(slot, "error", "缓存 Prompt 注入未执行", String(error?.message || error));
             return;
@@ -1093,11 +1348,6 @@
         run.cancelled = false;
         run.busy = true;
         run.config = config;
-        const configuredCursor = config.cacheCursor;
-        if (run.cacheCursorSource && Number.isSafeInteger(configuredCursor) && configuredCursor !== run.cacheCursor) {
-            run.cacheCursorSource = "";
-            run.cacheCursorOverride = configuredCursor;
-        }
         const currentPrompt = promptRawValue(slot);
         if (run.promptEdited) {
             run.basePrompt = currentPrompt;
@@ -1111,19 +1361,31 @@
             assertActive(run);
             run.activeCacheCursor = run.pendingCacheCursor;
             run.activeCacheSource = run.pendingCacheSource;
+            validateNativeForgeScript(slot);
             await runForgeGeneration(slot, run, generate);
             assertActive(run);
-            await releaseNativeCacheContext(run, true);
+            const released = await releaseNativeCacheContext(run, true);
             commitInlineCacheCursor(run);
-            run.completed += run.nativeImageCount || 1;
-            completed = true;
-            renderInline(slot, "success", "本批生图完成", `${run.nativeImageCount || 1} 张图 · 已提交缓存 ID ${run.cacheCursor} · 使用 Forge 原生参数`);
+            const count = released.completed_count;
+            run.completed += count;
+            completed = count > 0;
+            const partial = count < run.nativeImageCount;
+            if (!completed) run.pendingNativeClick = false;
+            renderInline(slot, partial ? "warning" : "success", partial ? "本批仅完成部分图片" : "本批生图完成",
+                count + ' / ' + run.nativeImageCount + ' 张图 · 后端已保存读取进度 ID ' + run.cacheCursor);
         } catch (error) {
             const message = String(error?.message || error);
-            if (message !== "已取消") {
-                renderInline(slot, "error", "缓存 Prompt 生图未完成", `${message} · 当前缓存未提交，可重试`);
+            run.pendingNativeClick = false;
+            const released = await releaseNativeCacheContext(run, false);
+            if (released?.committed === true) {
+                commitInlineCacheCursor(run);
+                run.completed += released.completed_count;
             }
-            await releaseNativeCacheContext(run, false);
+            const progress = released?.committed === true
+                ? released.completed_count + ' / ' + run.nativeImageCount + ' 张图 · 后端已保存读取进度 ID ' + run.cacheCursor
+                : "后端可能仍在完成生图并自动保存已完成图片的读取进度，请等待 Forge 结束后刷新确认";
+            renderInline(slot, message === "已取消" ? "warning" : "error", "缓存 Prompt 生图已停止",
+                message + ' · ' + progress + (run.nativeReleaseError ? ' · ' + run.nativeReleaseError : ''));
             discardPendingInlineCache(run);
         } finally {
             if (!completed) discardPendingInlineCache(run);
@@ -1137,7 +1399,7 @@
             run.busy = false;
             run.forgeStarted = false;
             run.forgeTaskId = "";
-            const continueRun = run.pendingNativeClick && !run.cancelled && nativeCacheEnabled(slot);
+            const continueRun = completed && run.pendingNativeClick && !run.cancelled && nativeCacheEnabled(slot);
             run.pendingNativeClick = false;
             if (continueRun) {
                 const pendingRun = run;
@@ -1276,7 +1538,7 @@
         }
         if (linked) {
             stopLinkedRun(normalizedSlot, true);
-            return `缓存 Prompt 生图已停止 · 已完成 ${linked.completed} 轮 · 当前缓存未提交`;
+            return "缓存 Prompt 生图已停止 · 后端保留已完成图片的读取进度，请等待 Forge 结束后刷新确认";
         }
         renderInline(normalizedSlot, "warning", "Prompt 任务已停止", run?.unlimited ? `无限 · 已完成 ${run.completed} 条` : "");
         return "Prompt 任务已停止";
@@ -1285,6 +1547,8 @@
     function syncCacheCursor(slot, source) {
         const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
         if (source !== "cache" && source !== "processed_cache") return null;
+        const ui = nativeCacheUiState(normalizedSlot);
+        if (ui.snapshot || ui.attempted) return showNativeCacheProgress(normalizedSlot, source);
         const cursor = persistedCacheCursor(normalizedSlot, source === "processed_cache");
         showCacheCursor(normalizedSlot, cursor);
         return cursor;
@@ -1416,9 +1680,11 @@
 
     installForgeInterruptHandlers();
     installNativeGenerateInterceptors();
+    installNativeCacheState();
     if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(() => {
         installForgeInterruptHandlers();
         installNativeGenerateInterceptors();
+        installNativeCacheState();
     });
     window.llmPromptStudioAutoLoop = {
         inlineOnce,

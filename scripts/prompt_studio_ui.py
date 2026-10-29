@@ -386,6 +386,7 @@ _DIVERSITY_SKELETON_TOKENS = frozenset(
 _MAX_CONTENT_SIMILARITY = 0.55
 _DIVERSITY_SETTINGS_KEY = "prompt_diversity_v1"
 _DIVERSITY_MEMORY_SETTING = "prompt_diversity_memory_v1"
+_SYSTEM_PROMPT_PROFILES_SETTING = "prompt_system_profiles_v1"
 _DIVERSITY_SETTINGS_DEFAULTS = {
     "recipe_enabled": True,
     "recipe_dimensions": 3,
@@ -1471,55 +1472,24 @@ def _filtered_cache_updates(query: str = "", min_score: float = 0, output_mode: 
     )
 
 
-CACHE_EDIT_FIELDS = {"正向提示词": "prompt", "负面提示词": "negative_prompt", "源标签": "tags", "格式": "output_mode", "目标模型": "base_model"}
 CACHE_EDIT_OPERATIONS = {"查找替换": "replace", "追加": "append", "前置": "prepend", "整体设为": "set"}
 
 
-def _preview_cache_edit(scope, record_id, field, operation, find, value, query, min_score, output_mode, base_model):
-    config = [scope, record_id, field, operation, find, value, query, min_score, output_mode, base_model]
-    if scope == "当前记录":
-        try:
-            record = DB.get_prompt(int(record_id))
-        except (TypeError, ValueError):
-            record = None
-        records = [record] if record else []
-    else:
-        records = _cache_records(query, min_score, output_mode, base_model)
+def _apply_cache_edit(operation, find, value, query, min_score, output_mode, base_model):
+    records = _cache_records(query, min_score, output_mode, base_model)
+    find = str(find or "")
+    if find:
+        records = [record for record in records if find in str(record.get("prompt") or "")]
     if not records:
-        return "没有可修改的记录，请选择记录或调整筛选。", {}
+        return "没有命中的记录。", gr.update(), gr.update()
     if operation == "查找替换" and not find:
-        return "查找内容不能为空。", {}
-    if field in {"格式", "目标模型"} and operation != "整体设为":
-        return "格式和目标模型仅支持“整体设为”。", {}
-    target = CACHE_EDIT_FIELDS[field]
-    value = _canonical_preset(value) if target == "output_mode" else _canonical_base_model(value) if target == "base_model" else value
-    previews = []
-    affected = 0
-    for record in records:
-        before = str(record[target] or "")
-        after = (before.replace(find, value) if operation == "查找替换" else
-                 before + value if operation == "追加" else value + before if operation == "前置" else value)
-        if target == "prompt" and not after.strip():
-            return "修改会产生空提示词，请调整操作。", {}
-        if before != after:
-            affected += 1
-            if len(previews) < 3:
-                previews.append(f"#{record['id']}: {' '.join(after.split())[:160]}")
-    message = f"范围：{scope}，共 {len(records)} 条；实际变化 {affected} 条（包含所有分页）。\n" + "\n".join(previews)
-    return message, {"config": config, "records": records}
-
-
-def _apply_cache_edit(preview, scope, record_id, field, operation, find, value, query, min_score, output_mode, base_model):
-    config = [scope, record_id, field, operation, find, value, query, min_score, output_mode, base_model]
-    if not preview or preview.get("config") != config:
-        return "操作或筛选已变化，请先预览修改。", gr.update(), gr.update(), {}
-    value = _canonical_preset(value) if field == "格式" else _canonical_base_model(value) if field == "目标模型" else value
+        return "查找替换必须填写查找内容。", gr.update(), gr.update()
     try:
-        count = DB.edit_prompts(preview["records"], CACHE_EDIT_FIELDS[field], CACHE_EDIT_OPERATIONS[operation], find, value)
+        count = DB.edit_prompts(records, "prompt", CACHE_EDIT_OPERATIONS[operation], find, value)
     except ValueError as error:
-        return str(error), gr.update(), gr.update(), {}
+        return str(error), gr.update(), gr.update()
     table, choices = _filtered_cache_updates(query, min_score, output_mode, base_model)
-    return f"已修改 {count} 条记录；列表已返回第一页。重新点击记录可载入最新内容。", table, choices, {}
+    return f"已批量修改 {count} 条记录。", table, choices
 
 
 def _clear_cache_filters():
@@ -1635,6 +1605,9 @@ def _workflow_settings() -> dict[str, Any]:
         "wd_endpoint", "wd_model", "wildcard_path",
     ]:
         values[key] = str(values.get(key) or "")
+    profile = str(_system_prompt_profiles().get(_system_prompt_profile_key(values["preset"], values["base_model"])) or "").strip()
+    if profile:
+        values["system_override"] = profile
     return values
 
 
@@ -2135,17 +2108,6 @@ def _export_selected(ids, file_format):
         return f"已导出选中的 {len(existing)} 条记录{suffix}：{path}", path
     except Exception as error:
         return f"导出失败：{_safe_error(error)}", None
-
-
-def _preview_positions(position_spec):
-    try:
-        records = DB.get_by_positions(position_spec)
-        return (
-            f"范围预览命中 {len(records)} 条记录。删除前请核对下表。",
-            gr.update(value=_as_rows(records)), gr.update(choices=_cache_choices(records), value=[]),
-        )
-    except ValueError as error:
-        return f"序号范围格式错误：{error}", gr.update(), gr.update()
 
 
 def _delete_positions(position_spec, query="", min_score=0, output_mode="全部", base_model="全部"):
@@ -2944,6 +2906,18 @@ def _index_wildcards(path):
         return f"索引失败：{_safe_error(error)}", gr.update(), gr.update()
 
 
+def _auto_index_wildcards():
+    """Build the configured static lexicon before the UI can request samples."""
+    try:
+        configured = _workflow_settings().get("wildcard_path") or DEFAULT_WILDCARDS
+        files, terms = DB.index_wildcards(configured)
+        LOGGER.info("Static wildcard index ready: %s files, %s terms, path=%s", files, terms, configured)
+        return files, terms
+    except Exception as error:
+        LOGGER.warning("Static wildcard auto-index skipped: %s", _safe_error(error))
+        return 0, 0
+
+
 def _search_wildcards(query, category="全部"):
     matches = DB.wildcard_matches(query, category=None if category == "全部" else category)
     return gr.update(choices=matches, value=[])
@@ -3224,11 +3198,70 @@ def _system_prompt_override_value(preset, text, base_model="Auto / checkpoint de
     return "" if value == _system_prompt_editor_value(preset, base_model=base_model).strip() else value
 
 
+def _system_prompt_profile_key(preset, base_model):
+    resolved, model = _resolve_preset_model(preset, base_model)
+    return f"{resolved}\x1f{model}"
+
+
+def _system_prompt_profiles():
+    stored = DB.get_setting(_SYSTEM_PROMPT_PROFILES_SETTING, {}) or {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def _load_system_prompt_profile(preset, base_model):
+    key = _system_prompt_profile_key(preset, base_model)
+    custom = str(_system_prompt_profiles().get(key) or "").strip()
+    if custom:
+        return custom, custom
+    default = _system_prompt_editor_value(preset, base_model=base_model)
+    return "", default
+
+
+def _save_system_prompt_profile(preset, base_model, text):
+    value = str(text or "").strip()
+    if not value:
+        return "", "System Prompt 不能为空。"
+    if len(value) > 100000:
+        return gr.update(), "System Prompt 不能超过 100000 个字符。"
+    profiles = _system_prompt_profiles()
+    profiles[_system_prompt_profile_key(preset, base_model)] = value
+    DB.set_setting(_SYSTEM_PROMPT_PROFILES_SETTING, profiles)
+    values = _workflow_settings()
+    values.update({"preset": _canonical_preset(preset), "base_model": _canonical_base_model(base_model), "system_override": value})
+    DB.set_setting("workflow_settings_v1", {**values, "version": 2})
+    return value, "已保存当前输出预设与模型对应的 System Prompt。"
+
+
+def _reset_system_prompt_profile(preset, base_model):
+    profiles = _system_prompt_profiles()
+    profiles.pop(_system_prompt_profile_key(preset, base_model), None)
+    DB.set_setting(_SYSTEM_PROMPT_PROFILES_SETTING, profiles)
+    values = _workflow_settings()
+    values["system_override"] = ""
+    DB.set_setting("workflow_settings_v1", {**values, "version": 2})
+    return _load_system_prompt_profile(preset, base_model) + ("已恢复当前输出预设的默认 System Prompt。",)
+
+
+def _prompt_profile_change(preset, base_model):
+    override, editor = _load_system_prompt_profile(preset, base_model)
+    return override, editor, preset, base_model, override, editor
+
+
+def _prompt_profile_save(preset, base_model, text):
+    override, status = _save_system_prompt_profile(preset, base_model, text)
+    return override, status, preset, base_model, override, text
+
+
+def _prompt_profile_reset(preset, base_model):
+    override, editor, status = _reset_system_prompt_profile(preset, base_model)
+    return override, editor, status, preset, base_model, override, editor
+
+
 def _load_system_prompt_editor():
     values = _workflow_settings()
     preset, model = values["preset"], values["base_model"]
-    override = _system_prompt_override_value(preset, values["system_override"], model)
-    return preset, model, override, _system_prompt_editor_value(preset, override, model)
+    override, editor = _load_system_prompt_profile(preset, model)
+    return preset, model, override, editor
 
 
 def _aligned_preset(preset: str, base_model: str) -> tuple[str, bool]:
@@ -4301,6 +4334,8 @@ def _native_cache_merge_prompt(base_prompt: str, cached_prompt: str, write_mode:
     base = str(base_prompt or "").strip()
     cached = str(cached_prompt or "").strip()
     mode = str(write_mode or "append_end").strip()
+    if mode not in {"replace", "marker", "append_start", "append_end"}:
+        raise ValueError("不支持的缓存 Prompt 写入方式")
     if mode == "replace":
         return cached
     if mode == "marker":
@@ -4327,15 +4362,56 @@ def _native_cache_cleanup_locked(now: float | None = None) -> None:
         _NATIVE_CACHE_CONTEXTS.pop(token, None)
 
 
+def _native_cache_slot(slot: str) -> str:
+    if slot not in {"txt2img", "img2img"}:
+        raise ValueError("无效的 Forge 生图面板")
+    return slot
+
+
+def _native_cache_state(slot: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    slot = _native_cache_slot(slot)
+    key = f"native_cache_config:{slot}"
+    defaults = {"source": "llm", "cache_enabled": False, "write_mode": "append_end", "marker": "{{LLM}}"}
+    saved = DB.get_setting(key, {})
+    current = {**defaults, **(saved if isinstance(saved, dict) else {})}
+    if config is not None:
+        if not isinstance(config, dict):
+            raise ValueError("缓存配置必须是对象")
+        current.update({name: config[name] for name in defaults if name in config})
+        if current["source"] not in {"llm", "cache", "processed_cache"}:
+            raise ValueError("无效的缓存来源")
+        if current["write_mode"] not in {"replace", "marker", "append_start", "append_end"}:
+            raise ValueError("无效的缓存写入方式")
+        current["cache_enabled"] = _coerce_bool(current["cache_enabled"], False)
+        current["marker"] = str(current["marker"] or "{{LLM}}")
+        DB.set_setting(key, current)
+    return {
+        "config": current,
+        "cursors": {source: DB.get_native_cache_cursor(slot, source) for source in ("cache", "processed_cache")},
+    }
+
+
+def _native_cache_get_context(token: str) -> dict[str, Any] | None:
+    context = DB.get_native_cache_job(str(token or ""))
+    if context is not None:
+        _NATIVE_CACHE_CONTEXTS[context["token"]] = context
+    return context
+
+
 def _native_cache_extract_claim(processing) -> tuple[str, str] | None:
     prompt = getattr(processing, "prompt", None)
-    if not isinstance(prompt, str) or not prompt.endswith(_NATIVE_CACHE_MARKER_END):
+    if not isinstance(prompt, str):
         return None
-    start = prompt.rfind(_NATIVE_CACHE_MARKER_START)
-    if start < 0:
+    end = prompt.rfind(_NATIVE_CACHE_MARKER_END)
+    if end < 0 or prompt[end + len(_NATIVE_CACHE_MARKER_END):].strip(" \t\r\n,，"):
+        return None
+    encoded_end = end
+    encoded_start = encoded_end - 128
+    start = encoded_start - len(_NATIVE_CACHE_MARKER_START)
+    if start < 0 or prompt[start:encoded_start] != _NATIVE_CACHE_MARKER_START:
         return None
     original = prompt[:start]
-    encoded = prompt[start + len(_NATIVE_CACHE_MARKER_START):-len(_NATIVE_CACHE_MARKER_END)]
+    encoded = prompt[encoded_start:encoded_end]
     if len(encoded) != 128 or any(
         char not in {_NATIVE_CACHE_MARKER_ZERO, _NATIVE_CACHE_MARKER_ONE} for char in encoded
     ):
@@ -4350,14 +4426,21 @@ def _native_cache_extract_claim(processing) -> tuple[str, str] | None:
 def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     source = str(payload.get("source") or "").strip()
     database = _native_cache_database(source)
+    slot = _native_cache_slot(str(payload.get("slot") or "txt2img"))
+    if str(payload.get("selected_script") or "None").strip().lower() not in {"none", "", "0"}:
+        raise ValueError("缓存注入暂不支持可选 Script；请将 Forge Script 设为 None")
     try:
-        total_images = max(1, int(payload.get("total_images") or 1))
-        after_id = max(0, int(payload.get("after_id") or 0))
+        total_images = int(payload.get("total_images") or 1)
+        stored_cursor = DB.get_native_cache_cursor(slot, source)
+        after_id = int(payload["after_id"] if payload.get("after_id") is not None else stored_cursor or 0)
+        if total_images < 1 or total_images > 100000 or after_id < 0:
+            raise ValueError("invalid range")
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError("缓存读取序号和本次图片数量必须是有效整数") from error
     base_prompt = str(payload.get("base_prompt") or "")
     write_mode = str(payload.get("write_mode") or "append_end").strip()
     marker = str(payload.get("marker") or "{{LLM}}")
+    _native_cache_merge_prompt(base_prompt, "", write_mode, marker)
     # Native Forge Generate forever is a cycling consumer. Once it reaches
     # the end of a cache library, start again from the first record so the
     # browser's native loop remains infinite. The API keeps strict exhaustion
@@ -4390,7 +4473,8 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     token = uuid.uuid4().hex
     context = {
         "token": token,
-        "slot": str(payload.get("slot") or "txt2img"),
+        "slot": slot,
+        "after_id": after_id,
         "source": source,
         "base_prompt": base_prompt,
         "write_mode": write_mode,
@@ -4402,14 +4486,39 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     }
     with _NATIVE_CACHE_CONTEXT_LOCK:
         _native_cache_cleanup_locked()
+        DB.save_native_cache_job(context)
         _NATIVE_CACHE_CONTEXTS[token] = context
     return {
         "token": token,
         "count": total_images,
+        "after_id": after_id,
         "next_cursor": context["next_cursor"],
         "records": usable,
         "wrapped": wrapped,
     }
+
+
+def prepare_native_cache_processing(processing) -> str | None:
+    """Remove the claim before Forge resolves inherited Hires prompts."""
+    claim = _native_cache_extract_claim(processing)
+    if claim is None:
+        return None
+    processing._llm_prompt_studio_native_cache_claim = claim
+    processing._llm_prompt_studio_inherit_hr = getattr(processing, "hr_prompt", None) == ""
+    processing.prompt = claim[1]
+    return claim[0]
+
+
+def _native_cache_fail(processing) -> None:
+    claim = getattr(processing, "_llm_prompt_studio_native_cache_claim", None) or _native_cache_extract_claim(processing)
+    token = getattr(processing, "_llm_prompt_studio_native_cache_token", "") or (claim[0] if claim else "")
+    if claim:
+        processing.prompt = claim[1]
+    if token:
+        with _NATIVE_CACHE_CONTEXT_LOCK:
+            for state in ("pending", "applying"):
+                DB.transition_native_cache_job(token, state, "failed")
+            _native_cache_get_context(token)
 
 
 def apply_native_cache_context(processing) -> str | None:
@@ -4422,20 +4531,27 @@ def apply_native_cache_context(processing) -> str | None:
     if existing:
         return str(existing)
     slot = "img2img" if type(processing).__name__.lower().endswith("img2img") else "txt2img"
-    claim = _native_cache_extract_claim(processing)
+    claim = getattr(processing, "_llm_prompt_studio_native_cache_claim", None) or _native_cache_extract_claim(processing)
     if claim is None:
         return None
+    processing._llm_prompt_studio_native_cache_claim = claim
     claim_token, original_prompt = claim
     with _NATIVE_CACHE_CONTEXT_LOCK:
         _native_cache_cleanup_locked()
-        context = _NATIVE_CACHE_CONTEXTS.get(claim_token)
+        context = _native_cache_get_context(claim_token)
         if (
             context is None
             or context.get("state") != "pending"
             or context.get("slot") != slot
         ):
             return None
-        context["state"] = "active"
+        batch_size = max(1, int(getattr(processing, "batch_size", 1) or 1))
+        n_iter = max(1, int(getattr(processing, "n_iter", len(context["records"]) // batch_size) or 1))
+        if batch_size * n_iter != len(context["records"]):
+            raise ValueError("Forge 批次数量已变化，缓存注入已取消，请重新生成")
+        script_args = getattr(processing, "script_args", ())
+        if script_args and script_args[0] not in (None, 0):
+            raise ValueError("缓存注入暂不支持可选 Script；请将 Forge Script 设为 None")
     processing.prompt = original_prompt
     records = context["records"]
     prompts = [
@@ -4444,37 +4560,34 @@ def apply_native_cache_context(processing) -> str | None:
         )
         for record in records
     ]
-    batch_size = max(1, int(getattr(processing, "batch_size", 1) or 1))
-    negative = getattr(processing, "negative_prompt", "")
-    negative_prompts = negative if isinstance(negative, list) else [negative]
-    negative_prompts = [
-        negative_prompts[index % len(negative_prompts)] if negative_prompts else ""
-        for index in range(len(prompts))
-    ]
     try:
         from modules import shared
-        styles = getattr(processing, "styles", [])
-        prompts = [shared.prompt_styles.apply_styles_to_prompt(prompt, styles) for prompt in prompts]
-        negative_prompts = [
-            shared.prompt_styles.apply_negative_styles_to_prompt(prompt, styles)
-            for prompt in negative_prompts
-        ]
-    except (ImportError, AttributeError):
-        # Unit-test doubles and non-Forge callers do not provide prompt styles.
-        pass
-    processing.all_prompts = list(prompts)
-    processing.all_negative_prompts = list(negative_prompts)
-    processing.main_prompt = prompts[0]
-    processing.main_negative_prompt = negative_prompts[0]
-    if hasattr(processing, "hr_prompt"):
-        # Forge's comments script treats hr_prompt as a scalar string. Keep
-        # that public field scalar while the per-image list lives in all_hr_*.
-        processing.hr_prompt = prompts[0]
-        processing.hr_negative_prompt = negative_prompts[0]
-        processing.all_hr_prompts = list(prompts)
-        processing.all_hr_negative_prompts = list(negative_prompts)
-    processing.n_iter = max(1, (len(prompts) + batch_size - 1) // batch_size)
-    setattr(processing, "_llm_prompt_studio_native_cache_token", context["token"])
+    except ImportError:
+        shared = None
+    if shared is not None and getattr(processing, "styles", []):
+        prompts = [shared.prompt_styles.apply_styles_to_prompt(prompt, processing.styles) for prompt in prompts]
+    raw_prompts = None
+    if shared is not None and getattr(getattr(shared, "opts", None), "enable_prompt_comments", False):
+        from modules.processing_scripts.comments import strip_comments
+
+        if shared.opts.save_prompt_comments:
+            raw_prompts = list(prompts)
+        prompts = [strip_comments(prompt) for prompt in prompts]
+    with _NATIVE_CACHE_CONTEXT_LOCK:
+        if not DB.transition_native_cache_job(claim_token, "pending", "applying"):
+            raise ValueError("缓存任务已失效，请重新生成")
+        processing.all_prompts = list(prompts)
+        processing.main_prompt = prompts[0]
+        if raw_prompts is not None:
+            processing._llm_prompt_studio_native_cache_raw_prompts = raw_prompts
+            processing._all_prompts_c = list(raw_prompts)
+        if getattr(processing, "_llm_prompt_studio_inherit_hr", False):
+            processing.hr_prompt = prompts[0]
+            processing.all_hr_prompts = list(prompts)
+        processing._llm_prompt_studio_native_cache_token = context["token"]
+        if not DB.transition_native_cache_job(claim_token, "applying", "active"):
+            raise ValueError("缓存任务激活失败，已停止本次生图")
+        _native_cache_get_context(claim_token)
     LOGGER.info(
         "Native cache Prompt injection applied: %s images, source=%s, cursor=%s",
         len(prompts), context["source"], context["next_cursor"],
@@ -4482,23 +4595,48 @@ def apply_native_cache_context(processing) -> str | None:
     return context["token"]
 
 
+def track_native_cache_image(processing, image) -> None:
+    if not getattr(processing, "_llm_prompt_studio_native_cache_token", ""):
+        return
+    indices = getattr(processing, "_llm_prompt_studio_native_cache_indices", None)
+    if indices is None:
+        indices = set()
+        processing._llm_prompt_studio_native_cache_indices = indices
+    indices.add(int(image.index))
+
+
+def complete_native_cache_context(processing, processed) -> None:
+    token = getattr(processing, "_llm_prompt_studio_native_cache_token", "")
+    if not token:
+        return
+    indices = getattr(processing, "_llm_prompt_studio_native_cache_indices", None)
+    if indices is not None:
+        count = 0
+        while count in indices:
+            count += 1
+    else:
+        count = max(0, len(processed.images) - int(getattr(processed, "index_of_first_image", 0) or 0))
+    with _NATIVE_CACHE_CONTEXT_LOCK:
+        DB.complete_native_cache_job(token, count)
+        _native_cache_get_context(token)
+
+
 def _native_cache_release(token: str, commit: bool = False) -> dict[str, Any]:
     key = str(token or "").strip()
-    if not key:
-        return {"released": False, "next_cursor": 0}
     with _NATIVE_CACHE_CONTEXT_LOCK:
-        context = _NATIVE_CACHE_CONTEXTS.get(key)
+        context = _native_cache_get_context(key)
         if context is None:
-            return {"released": False, "next_cursor": 0}
-        if commit and context.get("state") != "active":
-            return {"released": False, "committed": False, "next_cursor": int(context.get("next_cursor") or 0)}
-        if commit:
-            context["state"] = "committed"
-        _NATIVE_CACHE_CONTEXTS.pop(key, None)
+            return {"released": False, "committed": False, "next_cursor": 0, "completed_count": 0, "state": "missing"}
+        if not commit and context["state"] == "pending":
+            DB.transition_native_cache_job(key, "pending", "cancelled")
+            context = _native_cache_get_context(key)
+        completed = context["state"] in {"completed", "partial"}
         return {
-            "released": True,
-            "committed": bool(commit),
-            "next_cursor": int(context.get("next_cursor") or 0),
+            "released": context["state"] not in {"pending", "applying", "active"},
+            "committed": completed,
+            "next_cursor": int(context.get("next_cursor") if completed else context.get("after_id") or 0),
+            "completed_count": int(context.get("completed_count") or 0),
+            "state": context["state"],
         }
 
 
@@ -4526,7 +4664,21 @@ def _save_custom_template(name, content, preserve_fixed_prompt=True, obey_user_p
         return ("模板名称不能为空且不能超过 64 个字符。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
     if not content or len(content) > 12000:
         return ("模板内容不能为空且不能超过 12000 个字符。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
-    if name.startswith("custom:") or name in {label for label, _ in BUILTIN_TEMPLATE_CHOICES} or name in {"general", "kemonimimi"}:
+    if name in {"general", "kemonimimi"}:
+        builtins = _builtin_templates()
+        builtins[name] = _template_record({
+            "content": content,
+            "preserve_fixed_prompt": preserve_fixed_prompt,
+            "obey_user_prompt": obey_user_prompt,
+            "variation_dimensions": variation_dimensions,
+            "style_rules": style_rules,
+            "forbidden_content": forbidden_content,
+            "conflict_policy": conflict_policy,
+            "duplicate_policy": duplicate_policy,
+        }, fallback=builtins[name])
+        DB.set_setting(BUILTIN_TEMPLATES_SETTING, builtins)
+        return (f"内置模板“{name}”已保存。", *(_template_dropdown_update(value=name) for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+    if name.startswith("custom:") or name in {label for label, _ in BUILTIN_TEMPLATE_CHOICES}:
         return ("该名称保留给内置模板，请换一个名称。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
     templates = _custom_templates()
     # Store a structured record so future editor fields can evolve without
@@ -4571,6 +4723,12 @@ def _template_dropdown_update(value=None):
 
 def _load_custom_template_editor(template_name):
     key = str(template_name or "")
+    if key in _builtin_templates():
+        record = _builtin_templates()[key]
+        return (key, record.get("content", ""), record.get("preserve_fixed_prompt", True),
+                record.get("obey_user_prompt", True), ", ".join(record.get("variation_dimensions", [])),
+                record.get("style_rules", ""), record.get("forbidden_content", ""),
+                record.get("conflict_policy", "reject_and_retry"), record.get("duplicate_policy", "skip_and_continue"))
     if not key.startswith("custom:"):
         return "", _template_request(key), True, True, "action, environment_detail, camera, composition, lighting, atmosphere", "", "", "reject_and_retry", "skip_and_continue"
     name = key[7:]
@@ -4583,8 +4741,8 @@ def _load_custom_template_editor(template_name):
 
 def _create_template_editor(prefix, choice):
     initial = _load_custom_template_editor(_default_template_choice())
-    with gr.Accordion("编辑 / 保存自定义模板", open=False, elem_classes=["lps-template-editor"]):
-        name = gr.Textbox(label="模板名称", value=initial[0], max_lines=1, placeholder="填写新名称可另存为模板", elem_id=f"{prefix}_template_name")
+    with gr.Accordion("编辑模板", open=False, elem_classes=["lps-template-editor"]):
+        name = gr.Textbox(label="模板标识", value=initial[0], max_lines=1, placeholder="内置模板不可改名；自定义模板填写名称", elem_id=f"{prefix}_template_name")
         content = gr.Textbox(label="模板内容", value=initial[1], lines=3, max_lines=12, elem_id=f"{prefix}_template_content")
         with gr.Row():
             preserve = gr.Checkbox(label="固定 Prompt 完全保留", value=initial[2])
@@ -4907,7 +5065,7 @@ def _processed_result_view(query=""):
     )
 
 
-def _processed_result_manage(action, field, operation, find, value, selected_ids, query="", scope="selected"):
+def _processed_result_manage(action, operation, find, value, selected_ids, query="", scope="selected"):
     """Single bulk-management entry point for processed-result edits/deletes."""
     records = _processed_result_records(query)
     selected = {str(item) for item in _selected_values(selected_ids)}
@@ -4924,7 +5082,7 @@ def _processed_result_manage(action, field, operation, find, value, selected_ids
             message = f"已批量删除 {changed} 条处理结果。"
         else:
             changed = RESULT_DB.edit_prompts(
-                records, str(field or "prompt"), str(operation or "replace"),
+                records, "prompt", str(operation or "replace"),
                 str(find or ""), str(value or ""),
             )
             message = f"已批量修改 {changed} 条处理结果。"
@@ -5255,7 +5413,7 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
             model = gr.Dropdown(label="目标模型", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id=f"{prefix}_model")
             action = gr.Radio(label="操作", choices=ACTION_UI_CHOICES, value="Polish", elem_id=f"{prefix}_action")
         instruction = gr.Textbox(label="处理要求（可选）", lines=1, max_lines=6, elem_id=f"{prefix}_instruction")
-        with gr.Accordion("处理结果库独立 LLM 参数", open=False, elem_classes=["lps-settings-section"]):
+        with gr.Accordion("处理结果库独立 LLM 参数", open=False, visible=False, elem_classes=["lps-settings-section"]):
             gr.Markdown("仅影响缓存 Prompt 处理并写入处理结果库；服务商、地址、模型和凭据继承主连接，推理参数独立保存。")
             with gr.Row(elem_classes=["lps-model-settings-row"]):
                 cache_temperature = gr.Number(label="温度", value=cache_inference["temperature"], minimum=0, maximum=2, step=0.05)
@@ -5386,10 +5544,6 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
             inputs=[stage, result_id, result, queue_controls["settings"], queue_controls["ids"]],
             outputs=[stage, queue_controls["ids"], enqueue_status],
             js="(stage, resultId, result, settings, ids) => [stage, resultId, result, window.llmPromptStudioAutoLoop.readTxt2imgSettings() || settings, ids]",
-        )
-        enqueue_event.then(
-            lambda ids: (_inline_cache_queue_status(ids), gr.update(open=True)),
-            inputs=queue_controls["ids"], outputs=[queue_controls["status"], queue_controls["panel"]], queue=False,
         )
 
 
@@ -6318,6 +6472,7 @@ def _clear_finished_handoffs():
 
 
 def on_app_started(_, app):
+    _auto_index_wildcards()
     try:
         from fastapi import Depends, HTTPException
         from fastapi.security import HTTPBasic
@@ -6375,6 +6530,20 @@ def on_app_started(_, app):
         def prompt_studio_inline_cancel(payload: dict[str, Any]):
             try:
                 return _api_inline_cancel(payload)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.get("/llm-prompt-studio/v1/native-cache/state", dependencies=api_dependencies)
+        def prompt_studio_native_cache_state(slot: str = "txt2img"):
+            try:
+                return _native_cache_state(slot)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @app.post("/llm-prompt-studio/v1/native-cache/state", dependencies=api_dependencies)
+        def prompt_studio_native_cache_save_state(payload: dict[str, Any]):
+            try:
+                return _native_cache_state(str(payload.get("slot") or "txt2img"), payload.get("config"))
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -6474,12 +6643,7 @@ def on_ui_tabs():
         gr.Markdown("## LLM 提示词工作室", elem_classes=["lps-heading", "lps-brand-heading"])
         processed_result_queue_ids = gr.State([])
         processed_result_generation_settings = gr.Textbox(value="{}", visible=False)
-        result_queue_panel = gr.Accordion("缓存结果生图队列", open=False, render=False,
-                                         elem_id="llm_prompt_studio_result_queue")
-        processed_result_queue_status = gr.Markdown("尚未提交生图队列。", render=False,
-            elem_id="llm_prompt_studio_processed_result_queue_status")
-        result_queue_controls = dict(ids=processed_result_queue_ids, settings=processed_result_generation_settings,
-            panel=result_queue_panel, status=processed_result_queue_status)
+        result_queue_controls = dict(ids=processed_result_queue_ids, settings=processed_result_generation_settings)
         with gr.Tabs(elem_id="llm_prompt_studio_main_tabs"):
             with gr.Tab("生成", elem_id="llm_prompt_studio_generate_tab"):
                 with gr.Row(elem_classes=["lps-main-workbench"]):
@@ -6504,58 +6668,47 @@ def on_ui_tabs():
                             template_button = gr.Button("套用模板", elem_id="llm_prompt_studio_template_button")
                         with gr.Accordion("自定义快速模板", open=False, elem_classes=["lps-template-editor"]):
                             template_initial = _load_custom_template_editor(_default_template_choice())
-                            template_name = gr.Textbox(
-                                label="模板名称", value=template_initial[0], max_lines=1, placeholder="填写新名称可另存为模板",
-                                elem_id="llm_prompt_studio_template_name",
-                            )
-                            template_content = gr.Textbox(
-                                label="模板内容", value=template_initial[1], lines=2, max_lines=10,
-                                placeholder="填写会反复调用的创作要求、固定风格或输出约束",
-                                elem_id="llm_prompt_studio_template_content",
-                            )
+                            template_name = gr.Textbox(label="模板标识", value=template_initial[0], max_lines=1, placeholder="内置模板不可改名；自定义模板填写名称")
+                            template_content = gr.Textbox(label="模板内容", value=template_initial[1], lines=2, max_lines=10)
                             with gr.Row():
                                 template_preserve_fixed = gr.Checkbox(label="固定 Prompt 完全保留", value=template_initial[2])
                                 template_obey_user = gr.Checkbox(label="严格遵从用户提示词", value=template_initial[3])
-                            template_variation_dimensions = gr.Textbox(
-                                label="变化维度（逗号分隔）", value=template_initial[4],
-                                lines=2, elem_id="llm_prompt_studio_template_variation_dimensions",
-                            )
+                            template_variation_dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=template_initial[4], lines=2)
                             template_style_rules = gr.Textbox(label="风格规则（可选）", value=template_initial[5], lines=2)
                             template_forbidden_content = gr.Textbox(label="禁止内容（可选）", value=template_initial[6], lines=2)
                             with gr.Row():
                                 template_conflict_policy = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=template_initial[7])
                                 template_duplicate_policy = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=template_initial[8])
                             with gr.Row():
-                                template_save = gr.Button("保存模板", variant="primary", elem_id="llm_prompt_studio_template_save")
-                                template_default = gr.Button("设为默认模板", elem_id="llm_prompt_studio_template_default")
-                                template_delete = gr.Button("删除所选自定义模板", variant="stop", elem_id="llm_prompt_studio_template_delete")
-                            template_status = gr.Markdown(elem_id="llm_prompt_studio_template_status")
+                                template_save = gr.Button("保存模板", variant="primary")
+                                template_default = gr.Button("设为默认模板")
+                                template_delete = gr.Button("删除所选自定义模板", variant="stop")
+                            template_status = gr.Markdown()
                     with gr.Column(scale=2, elem_classes=["lps-rules-column", "lps-panel"]):
                         with gr.Row():
                             preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
                             base_model = gr.Dropdown(label="模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
                         with gr.Accordion("编辑 System Prompt", open=False, elem_classes=["lps-preset-editor"]):
                             system_override = gr.State(_system_prompt_override_value(workflow["preset"], workflow["system_override"], workflow["base_model"]))
-                            system_editor = gr.Textbox(
-                                label="当前生效内容", lines=5, max_lines=20,
+                            system_editor = gr.Textbox(label="当前生效内容", lines=5, max_lines=20,
                                 value=_system_prompt_editor_value(workflow["preset"], workflow["system_override"], workflow["base_model"]),
-                                elem_id="llm_prompt_studio_system_override",
-                            )
+                                elem_id="llm_prompt_studio_system_override")
                             restore_preset = gr.Button("恢复所选预设", size="sm", elem_id="llm_prompt_studio_restore_preset")
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"], elem_id="llm_prompt_studio_safety")
                         structured_mode = gr.Dropdown(label="输出格式", choices=OUTPUT_UI_CHOICES, value=workflow["structured_mode"])
                         with gr.Accordion("高级 Prompt 约束", open=False):
                             nsfw_injection = gr.Textbox(label="NSFW System Prompt 注入", lines=2, value=workflow["nsfw_injection"], placeholder="仅在 NSFW 模式下生效")
-                            user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"], placeholder="例如：只返回最多 35 个标签，不使用权重")
+                            user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"])
                         region_count = gr.Number(label="区域数量", minimum=1, maximum=8, value=workflow["region_count"], precision=0, visible=workflow["structured_mode"] != "Plain Prompt", elem_id="llm_prompt_studio_region_count")
                         with gr.Accordion("标签后处理", open=False):
                             remove_bad = gr.Checkbox(label="移除不良标签", value=workflow["remove_bad"])
-                            remove_terms = gr.Textbox(label="额外排除标签 / 通配规则", value=workflow["remove_terms"], placeholder="watermark, *_text")
+                            remove_terms = gr.Textbox(label="额外排除标签 / 通配规则", value=workflow["remove_terms"])
                             shuffle = gr.Checkbox(label="随机打乱标签", value=workflow["shuffle"])
-                            spaces = gr.Checkbox(label='将“_”转换为空格', value=workflow["spaces"])
+                            spaces = gr.Checkbox(label="将下划线转换为空格", value=workflow["spaces"])
                             max_tags = gr.Slider(label="最大标签数（0 表示不限）", minimum=0, maximum=200, value=workflow["max_tags"], step=1)
                         save_score = gr.Number(value=0, visible=False)
                         cache_result = gr.State(True)
+                        batch_base_prompt = source_tags
                 with gr.Row(elem_classes=["lps-generation-destination", "lps-toolbar"]):
                     generation_destination = gr.Radio(
                         label="生成去向", choices=[("仅保存到缓存", "cache"), ("生成并加入生图队列", "queue")],
@@ -6593,22 +6746,15 @@ def on_ui_tabs():
                 system_preview = gr.Textbox(visible=False, elem_id="llm_prompt_studio_system_preview")
                 batch_task_id = gr.State(lambda: uuid.uuid4().hex)
                 batch_issue_state = gr.State([])
-                with gr.Accordion("本次结果", open=False, elem_classes=["lps-result-panel"]):
-                    batch_queue = gr.Dataframe(
-                        value=[], headers=["序号", "输入", "生成结果", "状态"],
-                        datatype=["number", "str", "str", "str"], interactive=False, wrap=True,
-                        label="生成记录", elem_id="llm_prompt_studio_generation_results",
-                    )
-                    batch_issues = gr.Dataframe(
-                        headers=["序号", "输入", "状态", "原因", "尝试次数"],
-                        datatype=["number", "str", "str", "str", "number"], interactive=False, wrap=True,
-                        label="待重试记录",
-                    )
-                    batch_issue_selection = gr.CheckboxGroup(label="选择重试项", choices=[])
-                    with gr.Row():
-                        batch_select_all_issues = gr.Button("全选")
-                        batch_clear_issue_selection = gr.Button("清空选择")
-                        batch_retry_selected = gr.Button("重试所选", variant="primary")
+                batch_queue = gr.Dataframe(
+                    value=[], headers=["序号", "输入", "生成结果", "状态"],
+                    datatype=["number", "str", "str", "str"], interactive=False, visible=False,
+                )
+                batch_issues = gr.Dataframe(
+                    headers=["序号", "输入", "状态", "原因", "尝试次数"],
+                    datatype=["number", "str", "str", "str", "number"], interactive=False, visible=False,
+                )
+                batch_issue_selection = gr.CheckboxGroup(choices=[], visible=False)
                 with gr.Accordion("生图队列", open=True, visible=False, elem_id="llm_prompt_studio_generation_queue", elem_classes=["lps-result-panel"]) as generation_queue_panel:
                     with gr.Row():
                         server_queue_refresh = gr.Button("刷新进度", elem_id="llm_prompt_studio_server_queue_refresh")
@@ -6617,13 +6763,41 @@ def on_ui_tabs():
                     server_queue_generation_settings = gr.Textbox(value="{}", visible=False, elem_id="llm_prompt_studio_server_queue_generation_settings")
                     server_queue_status = gr.HTML("", elem_id="llm_prompt_studio_server_queue_status", elem_classes=["lps-status"])
                     server_queue_log = gr.HTML("", elem_id="llm_prompt_studio_server_queue_log", elem_classes=["lps-auto-loop-log"])
-                with gr.Accordion("工作参数", open=False, elem_classes=["lps-secondary-panel", "lps-utility-panel"]):
-                    with gr.Row():
-                        save_workflow = gr.Button("保存当前参数")
-                        reset_workflow = gr.Button("恢复默认")
-                    workflow_status = gr.Markdown(elem_id="llm_prompt_studio_workflow_status")
                 with gr.Column(elem_id="llm_prompt_studio_cache_processing", elem_classes=["lps-cache-workbench"]):
                     _create_inline_cache_panel("txt2img", _PROMPT_TARGETS.get("txt2img"), result_queue_controls)
+
+            generation_template_choice = template_choice
+            generation_template_button = template_button
+            generation_template_name = template_name
+            generation_template_content = template_content
+            generation_template_preserve_fixed = template_preserve_fixed
+            generation_template_obey_user = template_obey_user
+            generation_template_variation_dimensions = template_variation_dimensions
+            generation_template_style_rules = template_style_rules
+            generation_template_forbidden_content = template_forbidden_content
+            generation_template_conflict_policy = template_conflict_policy
+            generation_template_duplicate_policy = template_duplicate_policy
+            generation_template_save = template_save
+            generation_template_default = template_default
+            generation_template_delete = template_delete
+            generation_template_status = template_status
+            generation_preset = preset
+            generation_base_model = base_model
+            generation_system_override = system_override
+            generation_system_editor = system_editor
+            generation_restore_preset = restore_preset
+            generation_safety = safety
+            generation_structured_mode = structured_mode
+            generation_region_count = region_count
+            generation_nsfw_injection = nsfw_injection
+            generation_user_instruction = user_instruction
+            generation_remove_bad = remove_bad
+            generation_remove_terms = remove_terms
+            generation_shuffle = shuffle
+            generation_spaces = spaces
+            generation_max_tags = max_tags
+            generation_save_score = save_score
+            generation_cache_result = cache_result
 
             with gr.Tab("缓存", elem_id="llm_prompt_studio_library_tab"):
                 with gr.Accordion("导入与插件批次", open=False, elem_id="llm_prompt_studio_png_batch_tab", elem_classes=["lps-import-panel"]):
@@ -6684,11 +6858,6 @@ def on_ui_tabs():
                             datatype=["number", "str", "str", "number", "str", "str", "str", "str"],
                             interactive=False, wrap=True, label="Ranbooru 缓存预览",
                         )
-                    with gr.Accordion("导入 prompt_batch.v1 JSON", open=False, elem_classes=["lps-source-settings"]):
-                        png_batch_file = gr.File(
-                            label="选择 Prompt JSON 文件", file_types=[".json"], type="filepath", height=100,
-                            elem_id="llm_prompt_studio_png_batch_file",
-                        )
                     png_batch_payload = gr.Textbox(
                         value=_png_batch_json({"schema_version": PNG_BATCH_SCHEMA, "producer": {"name": "LLM Prompt Studio"}, "records": []}),
                         visible=False, elem_id="llm_prompt_studio_png_batch_payload",
@@ -6718,14 +6887,9 @@ def on_ui_tabs():
                     )
                     png_batch_table = gr.Dataframe(headers=["序号", "文件", "原始正向 Prompt", "状态", "LLM 结果", "错误"], datatype=["number", "str", "str", "str", "str", "str"], interactive=False, wrap=True, height=360, elem_id="llm_prompt_studio_png_batch_table", elem_classes=["lps-table"])
                     gr.Markdown("", elem_id="llm_prompt_studio_png_batch_results")
-                    png_batch_status = gr.HTML("请选择 PNG Collector、Ranbooru 或 JSON 文件作为批次来源。", elem_id="llm_prompt_studio_png_batch_status", elem_classes=["lps-status"])
+                    png_batch_status = gr.HTML("请选择 PNG Collector 或 Ranbooru 作为批次来源。", elem_id="llm_prompt_studio_png_batch_status", elem_classes=["lps-status"])
                     png_batch_append_succeeded = gr.Checkbox(value=False, visible=False, elem_id="llm_prompt_studio_png_batch_append_succeeded")
                     png_batch_cancel_id = gr.State(lambda: uuid.uuid4().hex)
-                    png_batch_file.change(
-                        _png_batch_load,
-                        inputs=png_batch_file,
-                        outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
-                    )
 
                 with gr.Row(elem_classes=["lps-filter-bar"]):
                     cache_query = gr.Textbox(label="搜索 Prompt、负面词、源标签或外部来源", scale=4)
@@ -6741,7 +6905,6 @@ def on_ui_tabs():
                     cache_page = gr.Number(label="页码", value=1, minimum=1, precision=0, scale=0, min_width=100)
                 cache_status = gr.Markdown(f"缓存 {len(initial_records)} 条", elem_id="llm_prompt_studio_cache_status", elem_classes=["lps-status"])
                 selected_records = gr.Dropdown(label="选择缓存记录（支持多选）", choices=_cache_choices(initial_records), value=[], multiselect=True, visible=False)
-                delete_preview_state = gr.State([])
                 table = gr.Dataframe(
                     value=_as_rows(initial_records), label="已缓存 Prompt",
                     headers=["序号", "ID", "格式", "模型", "正向提示词", "来源"],
@@ -6751,8 +6914,8 @@ def on_ui_tabs():
                 with gr.Accordion("编辑 / 删除当前记录", open=True, elem_classes=["lps-editor-panel"]):
                     with gr.Row():
                         record_id = gr.Textbox(label="当前内部 ID", interactive=False)
-                        record_output_mode = gr.Dropdown(label="格式", choices=PRESET_UI_CHOICES, value=workflow["preset"], allow_custom_value=True)
-                        record_base_model = gr.Dropdown(label="目标模型", choices=MODEL_UI_CHOICES, value=workflow["base_model"], allow_custom_value=True)
+                        record_output_mode = gr.Dropdown(label="格式", choices=PRESET_UI_CHOICES, value=workflow["preset"], allow_custom_value=True, visible=False)
+                        record_base_model = gr.Dropdown(label="目标模型", choices=MODEL_UI_CHOICES, value=workflow["base_model"], allow_custom_value=True, visible=False)
                         record_score = gr.Number(value=0, visible=False)
                     record_tags = gr.Textbox(label="源标签", visible=False)
                     record_prompt = gr.Textbox(label="正向提示词", lines=6, max_lines=30, elem_classes=["lps-output"])
@@ -6761,26 +6924,18 @@ def on_ui_tabs():
                         load_selected = gr.Button("载入所选单条", visible=False)
                         save = gr.Button("保存当前记录", variant="primary")
                         save_as_new = gr.Button("另存为新记录")
-                        preview_selected = gr.Button("预览删除当前记录")
                         delete_selected = gr.Button("确认删除当前记录", variant="stop")
-                    selection_preview = gr.Textbox(label="删除预览", lines=1, max_lines=2, interactive=False)
-                with gr.Accordion("批量修改 / 删除", open=False, elem_classes=["lps-editor-panel"]):
-                    edit_snapshot = gr.State({})
+                with gr.Accordion("批量编辑 / 删除", open=False, elem_classes=["lps-editor-panel"]):
                     with gr.Row():
-                        edit_scope = gr.Radio(label="修改范围", choices=["当前记录", "全部筛选结果"], value="全部筛选结果")
-                        edit_field = gr.Dropdown(label="字段", choices=list(CACHE_EDIT_FIELDS), value="正向提示词")
+                        edit_find = gr.Textbox(label="正向 Prompt 查找（留空=全部）", placeholder="只处理命中的记录")
                         edit_operation = gr.Dropdown(label="修改方式", choices=list(CACHE_EDIT_OPERATIONS), value="查找替换")
                     with gr.Row():
-                        edit_find = gr.Textbox(label="查找文字（精确匹配）")
-                        edit_value = gr.Textbox(label="替换 / 写入内容（追加时自行包含空格或逗号）")
+                        edit_value = gr.Textbox(label="正向 Prompt 替换 / 写入内容（追加时自行包含空格或逗号）")
                     with gr.Row():
-                        edit_preview_button = gr.Button("预览修改范围")
-                        edit_apply = gr.Button("应用修改", variant="primary")
-                    edit_preview_text = gr.Textbox(label="修改预览", lines=3, max_lines=5, interactive=False)
+                        edit_apply = gr.Button("批量编辑", variant="primary")
                     with gr.Row():
                         position_spec = gr.Textbox(label="删除范围（全库序号或范围）", placeholder="1-100,205,300-320")
-                        preview_positions = gr.Button("预览删除范围")
-                        delete_positions = gr.Button("删除这些序号", variant="stop")
+                        delete_positions = gr.Button("删除", variant="stop")
                 with gr.Accordion("插件实时交接箱", open=False, elem_classes=["lps-handoff-panel"]):
                     gr.Markdown("外部插件原始 Prompt 使用独立推理参数（默认继承主连接）。", elem_classes=["lps-status"])
                     with gr.Row(elem_classes=["lps-model-settings-row", "lps-handoff-settings"]):
@@ -6817,15 +6972,8 @@ def on_ui_tabs():
                         datatype=["number", "str", "number", "str", "str", "number", "str", "str", "str", "str"],
                         interactive=False, wrap=True, label="实时交接、错误与跳过汇总", elem_id="llm_prompt_studio_handoff_table", elem_classes=["lps-table", "lps-table-card"],
                     )
-                with gr.Accordion("JSON / CSV 导入导出", open=False):
-                    with gr.Row():
-                        import_file = gr.File(label="导入文件", file_types=[".json", ".csv"], type="filepath")
-                        import_dedupe = gr.Checkbox(label="导入时跳过重复记录", value=True)
-                        import_button = gr.Button("导入文件")
-                    with gr.Row():
-                        export_format = gr.Radio(label="导出格式", choices=["JSON", "CSV"], value="JSON")
-                        export_button = gr.Button("导出全部缓存")
-                    export_file = gr.File(label="导出文件", interactive=False)
+                with gr.Accordion("导出缓存", open=False):
+                    export_button = gr.DownloadButton("导出全部缓存", variant="primary")
 
             with gr.Tab("处理结果库", elem_id="llm_prompt_studio_processed_results_tab", elem_classes=["lps-results-tab"]):
                 with gr.Row(elem_classes=["lps-form-row", "lps-filter-bar"]):
@@ -6862,17 +7010,13 @@ def on_ui_tabs():
                             label="操作", choices=[("批量修改", "edit"), ("批量删除", "delete")],
                             value="edit", elem_id="llm_prompt_studio_processed_result_manage_action",
                         )
-                        processed_result_manage_field = gr.Dropdown(
-                            label="字段", choices=[("正面 Prompt", "prompt"), ("负面 Prompt", "negative_prompt"), ("标签", "tags"), ("格式", "output_mode"), ("模型", "base_model")],
-                            value="prompt", elem_id="llm_prompt_studio_processed_result_manage_field",
-                        )
                         processed_result_manage_operation = gr.Dropdown(
                             label="修改方式", choices=[("查找替换", "replace"), ("追加", "append"), ("前置", "prepend"), ("覆盖", "set")],
                             value="replace", elem_id="llm_prompt_studio_processed_result_manage_operation",
                         )
                     with gr.Row(elem_classes=["lps-form-row"]):
-                        processed_result_manage_find = gr.Textbox(label="查找内容", elem_id="llm_prompt_studio_processed_result_manage_find")
-                        processed_result_manage_value = gr.Textbox(label="替换 / 写入内容", elem_id="llm_prompt_studio_processed_result_manage_value")
+                        processed_result_manage_find = gr.Textbox(label="正向 Prompt 查找", elem_id="llm_prompt_studio_processed_result_manage_find")
+                        processed_result_manage_value = gr.Textbox(label="正向 Prompt 替换 / 写入内容", elem_id="llm_prompt_studio_processed_result_manage_value")
                         processed_result_manage_apply = gr.Button("执行批量管理", variant="primary", elem_id="llm_prompt_studio_processed_result_manage_apply")
                 processed_result_append_payload = gr.State("")
 
@@ -6929,6 +7073,24 @@ def on_ui_tabs():
                     with gr.Row():
                         fallback_test = gr.Button("测试备用连接", elem_id="llm_prompt_studio_fallback_test")
                         fallback_clear_credentials = gr.Button("清除备用 API Key", elem_id="llm_prompt_studio_fallback_clear")
+                processed_cache_settings = _processed_cache_inference_settings()
+                with gr.Accordion("处理结果库独立 LLM 参数", open=False, elem_classes=["lps-settings-section"]):
+                    gr.Markdown("仅影响缓存 Prompt 处理并写入处理结果库；服务商、地址、模型和凭据继承主连接，推理参数独立保存。")
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        settings_cache_temperature = gr.Number(label="温度", value=processed_cache_settings["temperature"], minimum=0, maximum=2, step=0.05)
+                        settings_cache_top_p = gr.Number(label="Top P", value=processed_cache_settings["top_p"], minimum=0, maximum=1, step=0.01)
+                        settings_cache_top_k = gr.Number(label="Top K", value=processed_cache_settings["top_k"], minimum=0, maximum=100000, precision=0)
+                        settings_cache_max_tokens = gr.Number(label="最大 Token", value=processed_cache_settings["max_tokens"], minimum=0, maximum=262144, precision=0)
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        settings_cache_timeout = gr.Number(label="超时（秒）", value=processed_cache_settings["timeout"], minimum=5, maximum=600, precision=0)
+                        settings_cache_retry_count = gr.Number(label="重试次数", value=processed_cache_settings["retry_count"], minimum=0, maximum=5, precision=0)
+                        settings_cache_thinking_enabled = gr.Checkbox(label="启用思考", value=processed_cache_settings["thinking_enabled"])
+                        settings_cache_send_temperature = gr.Checkbox(label="发送温度", value=processed_cache_settings["send_temperature"])
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        settings_cache_thinking_budget = gr.Number(label="思考预算", value=processed_cache_settings["thinking_budget"], minimum=0, maximum=262144, precision=0)
+                        settings_cache_reasoning_effort = gr.Dropdown(label="推理强度", choices=[("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high")], value=processed_cache_settings["reasoning_effort"])
+                        settings_cache_save = gr.Button("保存处理结果库参数", variant="primary")
+                    settings_cache_status = gr.Markdown(elem_classes=["lps-status"])
                 with gr.Row(elem_classes=["lps-primary-actions", "lps-action-bar"]):
                     test = gr.Button("测试连接", elem_id="llm_prompt_studio_test_connection")
                     save_connection = gr.Button("保存并应用", variant="primary")
@@ -6939,86 +7101,101 @@ def on_ui_tabs():
                     elem_id="llm_prompt_studio_connection_status",
                     elem_classes=["lps-status"],
                 )
-            diversity_state = _diversity_settings()
             with gr.Tab("提示词", elem_id="llm_prompt_studio_prompt_tab", elem_classes=["lps-settings-tab"]):
-                gr.Markdown("### 提示词与多样性", elem_classes=["lps-heading"])
-                gr.Markdown(_PROMPT_LAYER_NOTE, elem_classes=["lps-status"])
-                with gr.Accordion("批量多样性参数", open=True, elem_classes=["lps-settings-section"]):
-                    gr.Markdown(
-                        "保存后对**下一次**生成生效；单条生成不受配方影响。取值超出范围会自动夹紧。",
-                        elem_classes=["lps-status"],
+                gr.Markdown("### Prompt 配置", elem_classes=["lps-heading"])
+                with gr.Row(elem_classes=["lps-template-picker"]):
+                    template_choice = gr.Dropdown(
+                        label="模板提示词", choices=_template_choices(),
+                        value=_default_template_choice(), elem_id="llm_prompt_studio_template_choice",
                     )
+                    template_button = gr.Button("套用到创作要求", elem_id="llm_prompt_studio_template_button")
+                with gr.Accordion("编辑模板提示词", open=True, elem_classes=["lps-template-editor"]):
+                    template_initial = _load_custom_template_editor(_default_template_choice())
+                    template_name = gr.Textbox(label="模板标识", value=template_initial[0], max_lines=1, placeholder="内置模板不可改名；自定义模板填写名称")
+                    template_content = gr.Textbox(label="模板提示词", value=template_initial[1], lines=8, max_lines=30,
+                                                  placeholder="这里写反复使用的创作要求、固定风格和输出约束")
                     with gr.Row():
-                        diversity_recipe_enabled = gr.Checkbox(
-                            label="启用词库配方",
-                            value=diversity_state["recipe_enabled"],
-                            elem_id="llm_prompt_studio_diversity_recipe_enabled",
-                        )
-                        diversity_memory_enabled = gr.Checkbox(
-                            label="跨批次记忆",
-                            value=diversity_state["memory_enabled"],
-                            elem_id="llm_prompt_studio_diversity_memory_enabled",
-                        )
+                        template_preserve_fixed = gr.Checkbox(label="保留固定 Prompt", value=template_initial[2])
+                        template_obey_user = gr.Checkbox(label="遵从用户要求", value=template_initial[3])
+                    template_variation_dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=template_initial[4], lines=2)
+                    template_style_rules = gr.Textbox(label="风格规则", value=template_initial[5], lines=2)
+                    template_forbidden_content = gr.Textbox(label="禁止内容", value=template_initial[6], lines=2)
                     with gr.Row():
-                        diversity_recipe_dimensions = gr.Slider(
-                            label="配方维度数（每条抽几项）", minimum=1, maximum=6, step=1,
-                            value=diversity_state["recipe_dimensions"],
-                            elem_id="llm_prompt_studio_diversity_recipe_dimensions",
-                        )
-                        diversity_retry_limit = gr.Slider(
-                            label="内容重复时重试次数", minimum=0, maximum=3, step=1,
-                            value=diversity_state["retry_limit"],
-                            elem_id="llm_prompt_studio_diversity_retry_limit",
-                        )
-                        diversity_similarity_threshold = gr.Slider(
-                            label="内容相似度阈值（越低越严格）", minimum=0.2, maximum=0.95, step=0.05,
-                            value=diversity_state["similarity_threshold"],
-                            elem_id="llm_prompt_studio_diversity_similarity_threshold",
-                        )
+                        template_conflict_policy = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=template_initial[7])
+                        template_duplicate_policy = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=template_initial[8])
+                    with gr.Row(elem_classes=["lps-primary-actions"]):
+                        template_save = gr.Button("保存模板", variant="primary")
+                        template_default = gr.Button("设为默认模板")
+                        template_delete = gr.Button("删除自定义模板", variant="stop")
+                    template_status = gr.Markdown(elem_classes=["lps-status"])
+                with gr.Accordion("System Prompt 与模型预设", open=True, elem_classes=["lps-preset-editor"]):
                     with gr.Row():
-                        diversity_temperature_floor = gr.Checkbox(
-                            label="批量内温度不低于 1.25",
-                            value=diversity_state["batch_temperature_floor"],
-                            elem_id="llm_prompt_studio_diversity_batch_temperature_floor",
-                        )
-                        diversity_fold_duplicates = gr.Checkbox(
-                            label="自动折叠重复输入",
-                            value=diversity_state["source_fold_duplicates"],
-                            elem_id="llm_prompt_studio_diversity_source_fold_duplicates",
-                        )
-                    with gr.Row(elem_classes=["lps-primary-actions", "lps-action-bar"]):
-                        diversity_save_button = gr.Button("保存多样性参数", variant="primary", elem_id="llm_prompt_studio_diversity_save")
-                        diversity_reset_button = gr.Button("恢复默认", elem_id="llm_prompt_studio_diversity_reset")
-                    diversity_status = gr.Markdown(
-                        "修改后点「保存多样性参数」；当前值保存在 settings 的 prompt_diversity_v1。",
-                        elem_id="llm_prompt_studio_diversity_status", elem_classes=["lps-status"],
+                        preset = gr.Dropdown(label="输出预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
+                        base_model = gr.Dropdown(label="对应模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
+                    system_override = gr.State(_system_prompt_override_value(workflow["preset"], workflow["system_override"], workflow["base_model"]))
+                    system_editor = gr.Textbox(
+                        label="自定义 System Prompt", lines=16, max_lines=50,
+                        value=_system_prompt_editor_value(workflow["preset"], workflow["system_override"], workflow["base_model"]),
+                        placeholder="编辑当前输出预设与模型组合的 System Prompt",
                     )
-                with gr.Accordion("系统提示词预览", open=False, elem_classes=["lps-settings-section"]):
-                    gr.Markdown(
-                        "展示当前设置下真正发给模型的系统提示词（六层拼装结果，不含本批次配方）。",
-                        elem_classes=["lps-status"],
-                    )
-                    prompt_preview_button = gr.Button("刷新预览", elem_id="llm_prompt_studio_prompt_preview_button")
-                    prompt_preview_box = gr.Textbox(
-                        label="组装后的系统提示词", lines=12, max_lines=40, show_copy_button=True,
-                        value=_prompt_preview_text(), elem_id="llm_prompt_studio_prompt_preview",
-                    )
-                with gr.Accordion("缓存库多样性统计", open=False, elem_classes=["lps-settings-section"]):
-                    gr.Markdown(
-                        "只读统计最近 N 条缓存：distinct-n / Self-BLEU / Vendi / 内容余弦。"
-                        "Vendi 接近条数说明真的多样，接近 1 说明几乎每条都是同一画面。",
-                        elem_classes=["lps-status"],
-                    )
-                    with gr.Row():
-                        diversity_report_limit = gr.Number(
-                            label="统计最近条数", value=500, minimum=10, maximum=5000, precision=0,
-                            elem_id="llm_prompt_studio_diversity_report_limit",
-                        )
-                        diversity_report_button = gr.Button("统计当前缓存库", elem_id="llm_prompt_studio_diversity_report")
-                    diversity_report_output = gr.Markdown(
-                        "点上方按钮开始统计；该操作不写库、不调用 LLM。",
-                        elem_id="llm_prompt_studio_diversity_report_output",
-                    )
+                    with gr.Row(elem_classes=["lps-primary-actions"]):
+                        system_profile_save = gr.Button("保存当前预设", variant="primary")
+                        restore_preset = gr.Button("恢复默认预设")
+                    system_profile_status = gr.Markdown("选择不同输出预设和模型后，可分别保存独立 System Prompt。", elem_classes=["lps-status"])
+                prompt_template_choice = template_choice
+                prompt_template_button = template_button
+                prompt_template_name = template_name
+                prompt_template_content = template_content
+                prompt_template_preserve_fixed = template_preserve_fixed
+                prompt_template_obey_user = template_obey_user
+                prompt_template_variation_dimensions = template_variation_dimensions
+                prompt_template_style_rules = template_style_rules
+                prompt_template_forbidden_content = template_forbidden_content
+                prompt_template_conflict_policy = template_conflict_policy
+                prompt_template_duplicate_policy = template_duplicate_policy
+                prompt_template_save = template_save
+                prompt_template_default = template_default
+                prompt_template_delete = template_delete
+                prompt_template_status = template_status
+                prompt_preset = preset
+                prompt_base_model = base_model
+                prompt_system_override = system_override
+                prompt_system_editor = system_editor
+                prompt_profile_save = system_profile_save
+                prompt_restore_preset = restore_preset
+                prompt_profile_status = system_profile_status
+                template_choice = generation_template_choice
+                template_button = generation_template_button
+                template_name = generation_template_name
+                template_content = generation_template_content
+                template_preserve_fixed = generation_template_preserve_fixed
+                template_obey_user = generation_template_obey_user
+                template_variation_dimensions = generation_template_variation_dimensions
+                template_style_rules = generation_template_style_rules
+                template_forbidden_content = generation_template_forbidden_content
+                template_conflict_policy = generation_template_conflict_policy
+                template_duplicate_policy = generation_template_duplicate_policy
+                template_save = generation_template_save
+                template_default = generation_template_default
+                template_delete = generation_template_delete
+                template_status = generation_template_status
+                preset = generation_preset
+                base_model = generation_base_model
+                system_override = generation_system_override
+                system_editor = generation_system_editor
+                restore_preset = generation_restore_preset
+                safety = generation_safety
+                structured_mode = generation_structured_mode
+                region_count = generation_region_count
+                nsfw_injection = generation_nsfw_injection
+                user_instruction = generation_user_instruction
+                remove_bad = generation_remove_bad
+                remove_terms = generation_remove_terms
+                shuffle = generation_shuffle
+                spaces = generation_spaces
+                max_tags = generation_max_tags
+                save_score = generation_save_score
+                cache_result = generation_cache_result
             with gr.Tab("更多", elem_id="llm_prompt_studio_tools_tab"):
                 with gr.Tabs(elem_id="llm_prompt_studio_tools_tabs"):
                     with gr.Tab("静态词库", elem_id="llm_prompt_studio_wildcards_tab"):
@@ -7102,40 +7279,45 @@ def on_ui_tabs():
                                 wd_batch_records = gr.State([])
                                 wd_batch_id = gr.State(lambda: uuid.uuid4().hex, delete_callback=_wd14_release_batch)
 
-        with result_queue_panel.render():
-            with gr.Row(elem_classes=["lps-form-row"]):
-                processed_result_refresh_queue = gr.Button("刷新生图进度", size="sm")
-                processed_result_cancel_queue = gr.Button("取消等待中的生图", variant="stop", size="sm")
-            processed_result_queue_status.render()
-            gr.Markdown("生成图片保存在 Forge 输出目录；此处仅显示队列进度。")
-
-        workflow_inputs = [
-            preset, system_override, base_model, safety, nsfw_injection, user_instruction,
-            structured_mode, region_count, remove_bad, remove_terms, shuffle, spaces, max_tags,
-            save_score, cache_result,
-            batch_skip_existing, batch_skip_failed,
-            wd_endpoint, wd_model, wd_threshold, wildcard_path,
-        ]
         template_button.click(_template_request, inputs=template_choice, outputs=request)
+        prompt_template_button.click(_template_request, inputs=prompt_template_choice, outputs=request)
         _bind_template_editors([
             dict(choice=template_choice,
                  fields=[template_name, template_content, template_preserve_fixed, template_obey_user,
                          template_variation_dimensions, template_style_rules, template_forbidden_content,
                          template_conflict_policy, template_duplicate_policy],
                  save=template_save, default=template_default, delete=template_delete, status=template_status),
+            dict(choice=prompt_template_choice,
+                 fields=[prompt_template_name, prompt_template_content, prompt_template_preserve_fixed, prompt_template_obey_user,
+                         prompt_template_variation_dimensions, prompt_template_style_rules, prompt_template_forbidden_content,
+                         prompt_template_conflict_policy, prompt_template_duplicate_policy],
+                 save=prompt_template_save, default=prompt_template_default, delete=prompt_template_delete, status=prompt_template_status),
             *_INLINE_TEMPLATE_EDITORS.values(),
         ], interface=ui)
-        save_workflow.click(_save_workflow_settings, inputs=workflow_inputs, outputs=workflow_status)
-        reset_workflow.click(_reset_workflow_settings, outputs=[*workflow_inputs, workflow_status]).then(
-            _system_prompt_editor_value, inputs=[preset, system_override, base_model], outputs=system_editor, queue=False,
-        )
         structured_mode.change(lambda mode: gr.update(visible=_canonical_output_mode(mode) != "Plain Prompt"), inputs=structured_mode, outputs=region_count, queue=False)
-        for event in (preset.input, restore_preset.click):
-            event(lambda p, m: (_system_prompt_editor_value(p, base_model=m), ""),
-                  inputs=[preset, base_model], outputs=[system_editor, system_override], queue=False)
-        system_editor.input(_system_prompt_override_value, inputs=[preset, system_editor, base_model], outputs=system_override, queue=False)
-        base_model.input(_system_prompt_editor_value, inputs=[preset, system_override, base_model], outputs=system_editor, queue=False)
+        preset.input(_load_system_prompt_profile, inputs=[preset, base_model], outputs=[system_override, system_editor], queue=False)
+        base_model.input(_load_system_prompt_profile, inputs=[preset, base_model], outputs=[system_override, system_editor], queue=False)
+        system_editor.input(lambda text: str(text or "").strip(), inputs=system_editor, outputs=system_override, queue=False)
+        prompt_preset.input(_prompt_profile_change, inputs=[prompt_preset, prompt_base_model], outputs=[prompt_system_override, prompt_system_editor, preset, base_model, system_override, system_editor], queue=False)
+        prompt_base_model.input(_prompt_profile_change, inputs=[prompt_preset, prompt_base_model], outputs=[prompt_system_override, prompt_system_editor, preset, base_model, system_override, system_editor], queue=False)
+        prompt_system_editor.input(lambda text: str(text or "").strip(), inputs=prompt_system_editor, outputs=prompt_system_override, queue=False)
+        prompt_profile_save.click(
+            _prompt_profile_save,
+            inputs=[prompt_preset, prompt_base_model, prompt_system_editor],
+            outputs=[prompt_system_override, prompt_profile_status, preset, base_model, system_override, system_editor],
+        )
+        generation_restore_preset.click(
+            _reset_system_prompt_profile,
+            inputs=[preset, base_model],
+            outputs=[system_override, system_editor, prompt_profile_status],
+        )
+        prompt_restore_preset.click(
+            _prompt_profile_reset,
+            inputs=[prompt_preset, prompt_base_model],
+            outputs=[prompt_system_override, prompt_system_editor, prompt_profile_status, preset, base_model, system_override, system_editor],
+        )
         ui.load(_load_system_prompt_editor, outputs=[preset, base_model, system_override, system_editor])
+        ui.load(_load_system_prompt_profile, inputs=[prompt_preset, prompt_base_model], outputs=[prompt_system_override, prompt_system_editor])
         provider.change(
             _load_provider_settings, inputs=provider,
             outputs=[endpoint, model, fallback_provider, fallback_endpoint, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort, test_status, top_p, top_k],
@@ -7167,25 +7349,14 @@ def on_ui_tabs():
             inputs=[provider, endpoint, model, api_key, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort, top_p, top_k, fallback_provider, fallback_endpoint, fallback_api_key],
             outputs=[test_status, endpoint, model, fallback_provider, fallback_endpoint, fallback_model, weights_path, model_version],
         )
+        settings_cache_save.click(
+            _save_processed_cache_inference_settings,
+            inputs=[settings_cache_temperature, settings_cache_timeout, settings_cache_max_tokens, settings_cache_retry_count,
+                    settings_cache_thinking_enabled, settings_cache_thinking_budget, settings_cache_reasoning_effort,
+                    settings_cache_send_temperature, settings_cache_top_p, settings_cache_top_k],
+            outputs=settings_cache_status,
+        )
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
-        diversity_save_button.click(
-            _save_diversity_settings,
-            inputs=[diversity_recipe_enabled, diversity_recipe_dimensions, diversity_retry_limit,
-                    diversity_similarity_threshold, diversity_memory_enabled,
-                    diversity_temperature_floor, diversity_fold_duplicates],
-            outputs=diversity_status,
-        )
-        diversity_reset_button.click(
-            _reset_diversity_settings,
-            outputs=[diversity_recipe_enabled, diversity_recipe_dimensions, diversity_retry_limit,
-                     diversity_similarity_threshold, diversity_memory_enabled,
-                     diversity_temperature_floor, diversity_fold_duplicates, diversity_status],
-        )
-        prompt_preview_button.click(_prompt_preview_text, outputs=prompt_preview_box)
-        diversity_report_button.click(
-            _diversity_report_markdown, inputs=diversity_report_limit,
-            outputs=diversity_report_output,
-        )
         fallback_clear_credentials.click(
             _clear_llm_credentials, inputs=[fallback_provider, fallback_endpoint], outputs=test_status,
         )
@@ -7338,11 +7509,9 @@ def on_ui_tabs():
         cache_next.click(lambda q, score, fmt, model, page: _cache_page_update(q, score, fmt, model, (page or 1) + 1), inputs=[*cache_filter_inputs, cache_page], outputs=page_outputs)
         cache_output_filter.input(_cache_page_update, inputs=cache_filter_inputs, outputs=page_outputs)
         cache_model_filter.input(_cache_page_update, inputs=cache_filter_inputs, outputs=page_outputs)
-        edit_inputs = [edit_scope, record_id, edit_field, edit_operation, edit_find, edit_value, *cache_filter_inputs]
-        edit_preview_button.click(_preview_cache_edit, inputs=edit_inputs, outputs=[edit_preview_text, edit_snapshot])
-        cache_edit_event = edit_apply.click(_apply_cache_edit, inputs=[edit_snapshot, *edit_inputs], outputs=[cache_status, table, selected_records, edit_snapshot]).then(lambda: 1, outputs=cache_page, queue=False)
+        edit_inputs = [edit_operation, edit_find, edit_value, *cache_filter_inputs]
+        edit_apply.click(_apply_cache_edit, inputs=edit_inputs, outputs=[cache_status, table, selected_records]).then(lambda: 1, outputs=cache_page, queue=False)
         record_outputs = [record_id, record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, cache_status]
-        cache_edit_event.then(lambda current_id: _load_record(current_id)[:-1], inputs=record_id, outputs=record_outputs[:-1])
         table.select(
             _select_cache_row_from_view,
             inputs=[cache_page, *cache_filter_inputs],
@@ -7350,8 +7519,7 @@ def on_ui_tabs():
         )
         selected_records.input(_load_selected_record, inputs=selected_records, outputs=record_outputs)
         load_selected.click(_load_selected_record, inputs=selected_records, outputs=record_outputs)
-        preview_selected.click(_preview_selected, inputs=selected_records, outputs=[selection_preview, delete_preview_state])
-        delete_selected.click(_delete_previewed_records, inputs=[selected_records, delete_preview_state, *cache_filter_inputs], outputs=[cache_status, table, selected_records]).then(lambda: 1, outputs=cache_page, queue=False)
+        delete_selected.click(_delete_records, inputs=[selected_records, *cache_filter_inputs], outputs=[cache_status, table, selected_records]).then(lambda: 1, outputs=cache_page, queue=False)
         save.click(_save_record, inputs=[record_id, record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, *cache_filter_inputs], outputs=[cache_status, table, selected_records]).then(lambda: 1, outputs=cache_page, queue=False)
         save_as_new.click(_save_record_as_new, inputs=[record_prompt, record_negative, record_output_mode, record_base_model, record_score, record_tags, *cache_filter_inputs], outputs=[cache_status, table, selected_records]).then(lambda: 1, outputs=cache_page, queue=False)
         batch_preview_button.click(
@@ -7394,21 +7562,9 @@ def on_ui_tabs():
             outputs=[server_queue_status, server_queue_log],
             queue=False,
         )
-        batch_select_all_issues.click(_select_all_batch_issues, inputs=batch_issue_state, outputs=batch_issue_selection)
-        batch_clear_issue_selection.click(_clear_batch_issue_selection, outputs=batch_issue_selection)
-        batch_retry_selected.click(
-            lambda settings: settings, inputs=server_queue_generation_settings, outputs=server_queue_generation_settings,
-            js="(settings) => [window.llmPromptStudioAutoLoop?.readTxt2imgSettings?.() || settings]", queue=False,
-        ).then(
-            _studio_retry,
-            inputs=[generation_destination, server_queue_generation_settings, batch_task_id, batch_issue_selection, batch_issue_state, batch_skip_failed, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, *cache_filter_inputs, batch_task_id],
-            outputs=generation_outputs,
-        )
-        preview_positions.click(_preview_positions, inputs=position_spec, outputs=[cache_status, table, selected_records])
         delete_positions.click(_delete_positions, inputs=[position_spec, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
         undo_delete.click(_undo_last_delete, inputs=cache_filter_inputs, outputs=[cache_status, table, selected_records])
-        import_button.click(_import_cache, inputs=[import_file, import_dedupe, *cache_filter_inputs], outputs=[cache_status, table, selected_records])
-        export_button.click(_export_cache, inputs=export_format, outputs=[cache_status, export_file])
+        export_button.click(lambda: _export_cache("JSON")[1], outputs=export_button)
         processed_result_refresh.click(
             _processed_result_view,
             inputs=processed_result_query,
@@ -7417,16 +7573,15 @@ def on_ui_tabs():
         processed_result_query.submit(_processed_result_view, inputs=processed_result_query,
             outputs=[processed_result_table, processed_result_selection, processed_result_status])
         processed_result_manage_action.change(
-            lambda action: [gr.update(visible=str(action or "edit") == "edit") for _ in range(4)],
+            lambda action: [gr.update(visible=str(action or "edit") == "edit") for _ in range(3)],
             inputs=processed_result_manage_action,
-            outputs=[processed_result_manage_field, processed_result_manage_operation,
-                     processed_result_manage_find, processed_result_manage_value],
+            outputs=[processed_result_manage_operation, processed_result_manage_find, processed_result_manage_value],
             queue=False,
         )
         processed_result_manage_apply.click(
             _processed_result_manage,
-            inputs=[processed_result_manage_action, processed_result_manage_field,
-                    processed_result_manage_operation, processed_result_manage_find,
+            inputs=[processed_result_manage_action, processed_result_manage_operation,
+                    processed_result_manage_find,
                     processed_result_manage_value, processed_result_selection,
                     processed_result_query, processed_result_scope],
             outputs=[processed_result_table, processed_result_selection, processed_result_status],
@@ -7465,23 +7620,5 @@ def on_ui_tabs():
             inputs=[processed_result_selection, processed_result_query, processed_result_queue_ids, processed_result_generation_settings, processed_result_scope],
             outputs=[processed_result_queue_ids, processed_result_status],
             js="(selected, query, queueIds, settings, scope) => [selected, query, queueIds, window.llmPromptStudioAutoLoop.readTxt2imgSettings() || settings, scope]",
-        )
-        processed_result_enqueue_event.then(
-            lambda ids: (_inline_cache_queue_status(ids), gr.update(open=bool(ids))),
-            inputs=processed_result_queue_ids,
-            outputs=[processed_result_queue_status, result_queue_panel],
-            queue=False,
-        )
-        processed_result_refresh_queue.click(
-            _inline_cache_queue_status,
-            inputs=processed_result_queue_ids,
-            outputs=processed_result_queue_status,
-            queue=False,
-        )
-        processed_result_cancel_queue.click(
-            _inline_cache_cancel_queues,
-            inputs=processed_result_queue_ids,
-            outputs=processed_result_queue_status,
-            queue=False,
         )
     return [(ui, "LLM 提示词工作室", "llm_prompt_studio")]
