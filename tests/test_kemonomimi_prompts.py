@@ -30,7 +30,7 @@ class KemonomimiPromptTests(unittest.TestCase):
                 "_KEMONOMIMI_MARKERS", "_KEMONOMIMI_TOPIC_POOL",
                 "_KEMONOMIMI_VARIATION_HINTS", "_KEMONOMIMI_REFERENCE_CATEGORY_HINTS",
                 "_KEMONOMIMI_REFERENCE_EXCLUDED_HINTS", "_INSPIRATION_TOPIC_POOL",
-                "_INSPIRATION_VARIATION_HINTS", "KEMONOMIMI_LOLI_BATCH_TEMPLATE",
+                "_INSPIRATION_VARIATION_HINTS", "KEMONOMIMI_TEMPLATE",
             ),
             DB=self.db, random=random,
             _source_duplication=self.api._source_duplication,
@@ -95,7 +95,7 @@ class KemonomimiPromptTests(unittest.TestCase):
             "", 2, topic_pool="月下花园", base_prompt="fox ears", sample_static=False,
         )
         self.assertTrue(all("随机题材：月下花园；" in source for source in sources))
-        template = api.KEMONOMIMI_LOLI_BATCH_TEMPLATE
+        template = api.KEMONOMIMI_TEMPLATE
         sources, _stats = api._build_inspiration_sources(
             "", 2, base_prompt="cat ears", shared_request=template,
         )
@@ -127,12 +127,17 @@ class KemonomimiPromptTests(unittest.TestCase):
         self.assertEqual(self.api._lexicon_recipe(set(), source="fox ears"), [])
 
     def test_template_is_character_focused_and_allows_explicit_fantasy_species(self):
-        api = ui_functions("_template_request", constants=("KEMONOMIMI_LOLI_BATCH_TEMPLATE",))
-        template = api._template_request("kemonimimi")
+        api = ui_functions(
+            "_template_request", "_builtin_templates", "_builtin_template_defaults", "_template_record",
+            constants=("GENERAL_CREATIVE_REQUEST_TEMPLATE", "KEMONOMIMI_TEMPLATE",
+                       "BUILTIN_TEMPLATES_SETTING", "CUSTOM_TEMPLATES_SETTING", "DEFAULT_TEMPLATE_SETTING"),
+            DB=self.db, _coerce_bool=self.api._coerce_bool,
+        )
+        template = api.KEMONOMIMI_TEMPLATE
         for rule in (
             "圆润幼态的脸颊", "清澈大眼", "完整得体的服装", "避免性化",
             "未指定时每条只选择一种", "不机械添加尾巴", "明确的幻想种族设定",
-            "人物占据主要画面", "最多一个关键道具", "变化一到两项",
+            "人物占据主要画面", "最多一个关键道具", "只写一个完整画面",
         ):
             self.assertIn(rule, template)
 
@@ -211,7 +216,7 @@ class KemonomimiPromptTests(unittest.TestCase):
         results = list(api._batch_generate(
             source_text="", skip_existing=False, skip_failed=False,
             generation_count=1, base_prompt="fox ears, white hair",
-            shared_request=self.inspiration_api().KEMONOMIMI_LOLI_BATCH_TEMPLATE, **options,
+            shared_request=self.inspiration_api().KEMONOMIMI_TEMPLATE, **options,
         ))
         generated.assert_called_once()
         source = generated.call_args.args[0]

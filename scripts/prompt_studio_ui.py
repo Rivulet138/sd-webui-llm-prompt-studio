@@ -104,13 +104,13 @@ GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创
 批量要求：各条在场景/动作/道具/光线上明显不同，不要只改同义词、颜色或标签顺序，也不要套用固定场景清单。
 长度与格式：遵守当前输出预设规定的字数和字段顺序；不新增风格、媒介、画质或艺术家词。
 静态词库只作参考，仅在贴合画面时取用，不要堆砌无关元素。"""
-KEMONOMIMI_LOLI_BATCH_TEMPLATE = """围绕原始 Prompt 生成一组可直接用于扩散模型的兽耳幼态可爱角色单图 Prompt。
+KEMONOMIMI_TEMPLATE = """围绕原始 Prompt 生成一条可直接用于扩散模型的兽耳可爱角色单图 Prompt。
 
 共同方向：只描写一个可见角色和一个完整瞬间。表现二次元可爱萌系的小萝莉气质：圆润幼态的脸颊、清澈大眼、小巧鼻口、娇小而自然的身形，避免写实成人脸、成熟身材和夸张Q版比例。保留人类面部与四肢，以柔软兽耳和符合物种的尾巴体现特征，不变成动物头或全身覆毛；固定 Prompt 的明确设定优先。
 物种一致：原始 Prompt 已指定猫、狐、兔或幻想种族时严格保留；未指定时每条只选择一种。不混搭耳形、尾巴和其他物种特征，不机械添加尾巴；龙角、翅膀、鳞片等仅在明确的幻想种族设定中使用，不随机附加给普通兽耳角色。
 造型与画面：完整得体的服装，避免性化或成人化表达；一套服装只围绕一个主题，如和服与花簪，或衬衫与背带裙，不把多套风格和饰品混穿。人物占据主要画面，脸与兽耳清晰可读，尾巴自然连接身体，不遮住面部；手势与身体重心合理，手、道具与视线的关系明确。
 每条只需写清：主体外观、服装、一个清晰动作、一个表情或视线、一个连贯场景，以及服务主体的构图信息。场景可以是生活空间或符合角色设定的幻想地点；背景围绕同一主题，用一两处环境线索衬托人物，不能抢主体。最多一个关键道具，只有在确实有互动时才加入；时间、天气、光线、材质和空间层次按需补足，不强行填写前景/中景/背景，也不把背景写成物品清单。
-批次规划：在动作、场景、服装小变化、视线或构图中自然变化一到两项即可，保持固定主体和已指定物种一致；避免额外角色、无依据漂浮物、复杂世界观、叙事设定、分镜、拼图、多面板、道具堆砌和互不相关的元素。
+只写一个完整画面：避免额外角色、无依据漂浮物、复杂世界观、叙事设定、分镜、拼图、多面板、道具堆砌和互不相关的元素。
 优先级：固定 Prompt、用户要求与安全限制优先，新增内容不得覆盖或改变它们。
 只写单图：遵守当前输出预设的字数与格式；不新增风格、媒介、画质或艺术家词。"""
 KREA_ANIMA_POLISH_ROLE = """Role: Krea 2 / Anima detail-expansion prompt editor. Turn the input into one complete image prompt by decomposing visible elements instead of summarising them.
@@ -4253,12 +4253,68 @@ def _png_batch_mark_appended(payload, selection, selected_ids, scope, succeeded)
 
 BUILTIN_TEMPLATE_CHOICES = [
     ("通用创作", "general"),
-    ("兽耳角色批量", "kemonimimi"),
+    ("兽耳", "kemonimimi"),
 ]
 CUSTOM_TEMPLATES_SETTING = "prompt_templates_v1"
+BUILTIN_TEMPLATES_SETTING = "prompt_templates_builtin_v1"
 DEFAULT_TEMPLATE_SETTING = "prompt_templates_default_v1"
 _INLINE_TEMPLATE_COMPONENTS: dict[str, Any] = {}
 _INLINE_TEMPLATE_EDITORS: dict[str, Any] = {}
+
+
+def _template_record(value, fallback=None) -> dict[str, Any]:
+    base = dict(fallback or {})
+    record = value if isinstance(value, dict) else {"content": value}
+    dimensions = record.get("variation_dimensions", base.get("variation_dimensions", []))
+    if isinstance(dimensions, str):
+        dimensions = [item.strip() for item in dimensions.split(",") if item.strip()]
+    return {
+        "content": str(record.get("content", base.get("content", "")) or "").strip(),
+        "preserve_fixed_prompt": _coerce_bool(record.get("preserve_fixed_prompt", base.get("preserve_fixed_prompt", True)), True),
+        "obey_user_prompt": _coerce_bool(record.get("obey_user_prompt", base.get("obey_user_prompt", True)), True),
+        "variation_dimensions": [str(item).strip() for item in dimensions if str(item).strip()],
+        "style_rules": str(record.get("style_rules", base.get("style_rules", "")) or "").strip(),
+        "forbidden_content": str(record.get("forbidden_content", base.get("forbidden_content", "")) or "").strip(),
+        "conflict_policy": str(record.get("conflict_policy", base.get("conflict_policy", "reject_and_retry")) or "reject_and_retry"),
+        "duplicate_policy": str(record.get("duplicate_policy", base.get("duplicate_policy", "skip_and_continue")) or "skip_and_continue"),
+    }
+
+
+def _builtin_template_defaults() -> dict[str, dict[str, Any]]:
+    dimensions = ["action", "environment_detail", "camera", "composition", "lighting", "atmosphere"]
+    return {
+        "general": _template_record({"content": GENERAL_CREATIVE_REQUEST_TEMPLATE}, {
+            "variation_dimensions": dimensions,
+        }),
+        "kemonimimi": _template_record({"content": KEMONOMIMI_TEMPLATE}, {
+            "variation_dimensions": dimensions,
+        }),
+    }
+
+
+def _builtin_templates() -> dict[str, dict[str, Any]]:
+    defaults = _builtin_template_defaults()
+    stored = DB.get_setting(BUILTIN_TEMPLATES_SETTING, {}) or {}
+    stored = stored if isinstance(stored, dict) else {}
+    custom = DB.get_setting(CUSTOM_TEMPLATES_SETTING, {}) or {}
+    custom = custom if isinstance(custom, dict) else {}
+    changed = False
+    if "kemonimimi" not in stored and "兽耳" in custom:
+        stored["kemonimimi"] = custom["兽耳"]
+        custom.pop("兽耳", None)
+        changed = True
+        if DB.get_setting(DEFAULT_TEMPLATE_SETTING, "general") == "custom:兽耳":
+            DB.set_setting(DEFAULT_TEMPLATE_SETTING, "kemonimimi")
+    elif "兽耳" in custom:
+        custom.pop("兽耳", None)
+        changed = True
+    if changed:
+        DB.set_setting(BUILTIN_TEMPLATES_SETTING, stored)
+        DB.set_setting(CUSTOM_TEMPLATES_SETTING, custom)
+    return {
+        key: _template_record(stored.get(key), fallback=default)
+        for key, default in defaults.items()
+    }
 
 
 def _custom_templates() -> dict[str, dict[str, Any]]:
@@ -4294,31 +4350,29 @@ def _template_choices():
 
 def _template_request(template_name):
     key = str(template_name or "general")
-    if key == "kemonimimi":
-        return KEMONOMIMI_LOLI_BATCH_TEMPLATE
-    if key.startswith("custom:"):
-        record = _custom_templates().get(key[7:], {})
-        content = str(record.get("content", "")).strip()
-        if not content:
-            return ""
-        rules = [
-            f"Variation dimensions: {', '.join(record.get('variation_dimensions', []))}.",
-            f"Style rules: {record.get('style_rules')}.",
-            f"Forbidden content: {record.get('forbidden_content')}." ,
-            "Preserve the fixed Prompt verbatim." if record.get("preserve_fixed_prompt", True) else "",
-            "Follow the user's prompt as a semantic hard constraint." if record.get("obey_user_prompt", True) else "",
-            f"Conflict policy: {record.get('conflict_policy', 'reject_and_retry')}; duplicate policy: {record.get('duplicate_policy', 'skip_and_continue')}.",
-        ]
-        rendered = [item for item in rules if item and not item.endswith(": .")]
-        defaults = {"action", "environment_detail", "camera", "composition", "lighting", "atmosphere"}
-        if (set(record.get("variation_dimensions", [])) == defaults
-                and not record.get("style_rules") and not record.get("forbidden_content")
-                and record.get("preserve_fixed_prompt", True) and record.get("obey_user_prompt", True)
-                and record.get("conflict_policy") == "reject_and_retry"
-                and record.get("duplicate_policy") == "skip_and_continue"):
-            return content
-        return content + "\n\nTEMPLATE RULES:\n" + "\n".join(rendered)
-    return GENERAL_CREATIVE_REQUEST_TEMPLATE
+    record = (_builtin_templates().get(key) if key in _builtin_templates()
+              else _custom_templates().get(key[7:], {}) if key.startswith("custom:")
+              else _builtin_templates()["general"])
+    content = str(record.get("content", "")).strip()
+    if not content:
+        return ""
+    rules = [
+        f"Variation dimensions: {', '.join(record.get('variation_dimensions', []))}.",
+        f"Style rules: {record.get('style_rules') }.",
+        f"Forbidden content: {record.get('forbidden_content') }.",
+        "Preserve the fixed Prompt verbatim." if record.get("preserve_fixed_prompt", True) else "",
+        "Follow the user's prompt as a semantic hard constraint." if record.get("obey_user_prompt", True) else "",
+        f"Conflict policy: {record.get('conflict_policy', 'reject_and_retry')}; duplicate policy: {record.get('duplicate_policy', 'skip_and_continue') }.",
+    ]
+    rendered = [item for item in rules if item and not item.endswith(": .")]
+    defaults = {"action", "environment_detail", "camera", "composition", "lighting", "atmosphere"}
+    if (set(record.get("variation_dimensions", [])) == defaults
+            and not record.get("style_rules") and not record.get("forbidden_content")
+            and record.get("preserve_fixed_prompt", True) and record.get("obey_user_prompt", True)
+            and record.get("conflict_policy") == "reject_and_retry"
+            and record.get("duplicate_policy") == "skip_and_continue"):
+        return content
+    return content + "\n\nTEMPLATE RULES:\n" + "\n".join(rendered)
 
 
 def _native_cache_database(source: str) -> StudioDB:
