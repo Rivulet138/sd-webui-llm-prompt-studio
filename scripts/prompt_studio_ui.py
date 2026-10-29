@@ -96,6 +96,7 @@ LLM_CONNECTION_SETTINGS_VERSION = 7
 HANDOFF_INFERENCE_SETTINGS_VERSION = 1
 PROCESSED_CACHE_INFERENCE_SETTINGS_VERSION = 1
 MAX_SERVER_QUEUE_REQUESTS = 5000
+SERVER_QUEUE_PENDING_TTL = 6 * 60 * 60
 GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创作一条全新、独立成图的日系插画方向。
 
 必须保留：主体身份、用户明确固定的特征与限制，以及固定 Prompt 里的权重与技术标记。
@@ -1021,6 +1022,14 @@ _SERVER_QUEUE_ACTIVE_BATCHES: set[str] = set()
 _SERVER_QUEUE_THREAD: threading.Thread | None = None
 _SERVER_QUEUE_START_LOCK = threading.Lock()
 
+# Reconcile persisted work as soon as the extension is loaded. This prevents
+# abandoned browser sessions from blocking the next native or server job.
+try:
+    DB.expire_native_cache_jobs(max_age_seconds=_NATIVE_CACHE_CONTEXT_TTL)
+    DB.recover_server_queue(pending_max_age_seconds=SERVER_QUEUE_PENDING_TTL)
+except Exception:
+    LOGGER.exception("failed to reconcile persisted Prompt Studio jobs")
+
 
 def _server_queue_cancel_event(batch_id: str) -> threading.Event:
     key = str(batch_id or "").strip()
@@ -1033,33 +1042,50 @@ def _release_server_queue_cancel_event(batch_id: str) -> None:
     with _SERVER_QUEUE_CANCEL_LOCK:
         if key in _SERVER_QUEUE_ACTIVE_BATCHES:
             return
-    records = DB.list_server_queue(key, MAX_SERVER_QUEUE_REQUESTS)
-    if records and any(record["status"] in {"pending", "running"} for record in records):
+    counts = DB.count_server_queue(key)
+    if counts.get("pending", 0) or counts.get("running", 0):
         return
     with _SERVER_QUEUE_CANCEL_LOCK:
         if key not in _SERVER_QUEUE_ACTIVE_BATCHES:
             _SERVER_QUEUE_CANCEL_EVENTS.pop(key, None)
 
 
-def _server_queue_snapshot(batch_id: str, limit: int = MAX_SERVER_QUEUE_REQUESTS) -> dict[str, Any]:
-    records = DB.list_server_queue(str(batch_id or ""), limit)
-    counts: dict[str, int] = {}
-    for record in records:
-        counts[record["status"]] = counts.get(record["status"], 0) + 1
-    total = len(records)
+def _server_queue_snapshot(batch_id: str, limit: int = 50) -> dict[str, Any]:
+    key = str(batch_id or "")
+    counts = DB.count_server_queue(key)
+    status_limit = 50
+    records = DB.list_server_queue(key, min(int(limit or status_limit), status_limit))
+    total = sum(counts.values())
     done = counts.get("completed", 0)
     failed = counts.get("error", 0)
     cancelled = counts.get("cancelled", 0)
+    expired = counts.get("expired", 0)
     active = counts.get("running", 0)
     if not total:
         status = "未找到服务端队列任务"
     elif active:
         status = f"服务端队列运行中：完成 {done}/{total}，失败 {failed}，取消 {cancelled}"
-    elif done + failed + cancelled >= total:
-        status = f"服务端队列已结束：完成 {done}，失败 {failed}，取消 {cancelled}"
+    elif done + failed + cancelled + expired >= total:
+        status = f"服务端队列已结束：完成 {done}，失败 {failed}，取消 {cancelled}，过期 {expired}"
     else:
         status = f"服务端队列等待中：{done}/{total}"
-    return {"batch_id": str(batch_id or ""), "status": status, "counts": counts, "jobs": records}
+    jobs = [
+        {
+            "id": record.get("id"),
+            "position": record.get("position"),
+            "status": record.get("status"),
+            "error": record.get("error") or "",
+            "attempts": record.get("attempts", 0),
+        }
+        for record in records
+    ]
+    return {
+        "batch_id": key,
+        "status": status,
+        "counts": counts,
+        "jobs": jobs,
+        "jobs_truncated": total > len(jobs),
+    }
 
 
 def _parse_generation_settings(value) -> dict[str, Any]:
@@ -1232,19 +1258,30 @@ def _server_queue_worker() -> None:
     batch_histories: dict[str, list[str]] = {}
     batch_lenses: dict[str, set[str]] = {}
     last_recovery = 0.0
+    idle_since: float | None = None
     while True:
         now = time.monotonic()
         if now - last_recovery >= 60.0:
             active_tokens = []
-            recovered = DB.recover_server_queue(active_claim_tokens=active_tokens)
+            recovered = DB.recover_server_queue(
+                pending_max_age_seconds=SERVER_QUEUE_PENDING_TTL,
+                active_claim_tokens=active_tokens,
+            )
             if recovered:
-                LOGGER.warning("marked %s stale server queue jobs as unknown", recovered)
+                LOGGER.warning("expired or recovered %s stale server queue jobs", recovered)
             last_recovery = now
         job = DB.claim_server_queue_job()
         if not job:
-            _SERVER_QUEUE_WAKE.wait(1.0)
+            if idle_since is None:
+                idle_since = time.monotonic()
+            idle_for = time.monotonic() - idle_since
+            if idle_for >= 30.0:
+                LOGGER.info("server queue worker stopped after idle timeout")
+                return
+            _SERVER_QUEUE_WAKE.wait(min(1.0, 30.0 - idle_for))
             _SERVER_QUEUE_WAKE.clear()
             continue
+        idle_since = None
         batch_id = str(job.get("batch_id") or "")
         with _SERVER_QUEUE_CANCEL_LOCK:
             _SERVER_QUEUE_ACTIVE_BATCHES.add(batch_id)
@@ -1308,7 +1345,7 @@ def _ensure_server_queue_worker() -> None:
     with _SERVER_QUEUE_START_LOCK:
         if _SERVER_QUEUE_THREAD and _SERVER_QUEUE_THREAD.is_alive():
             return
-        DB.recover_server_queue()
+        DB.recover_server_queue(pending_max_age_seconds=SERVER_QUEUE_PENDING_TTL)
         _SERVER_QUEUE_THREAD = threading.Thread(target=_server_queue_worker, name="llm-prompt-studio-server-queue", daemon=True)
         _SERVER_QUEUE_THREAD.start()
 
@@ -1368,21 +1405,10 @@ def _enqueue_server_queue(payload: dict[str, Any], cancel_event=None) -> dict[st
 def _server_queue_html(snapshot: dict[str, Any]) -> str:
     rows = []
     for item in snapshot.get("jobs", []):
-        config = item.get("config") or {}
-        settings = _parse_generation_settings(config.get("generation_settings"))
-        parameter_text = ""
-        if settings:
-            parameter_text = (
-                f"{settings.get('width', '?')}×{settings.get('height', '?')} · "
-                f"{settings.get('steps', '?')} 步 · CFG {settings.get('cfg_scale', '?')} · "
-                f"{settings.get('sampler_name', '?')}"
-            )
         rows.append(
             "<div class='lps-server-queue-row'>"
             f"<span>{int(item.get('position', 0))}</span>"
             f"<b>{html.escape(str(item.get('status', '')))}</b>"
-            f"<code>{html.escape(str(item.get('prompt') or item.get('request') or ''))}</code>"
-            f"<small>{html.escape(parameter_text)}</small>"
             f"<small>{html.escape(str(item.get('error') or ''))}</small>"
             "</div>"
         )
@@ -4408,9 +4434,17 @@ def _native_cache_merge_prompt(base_prompt: str, cached_prompt: str, write_mode:
 
 def _native_cache_cleanup_locked(now: float | None = None) -> None:
     stamp = float(now if now is not None else time.time())
+    active_ttl = 2 * 60 * 60
+    DB.expire_native_cache_jobs(
+        max_age_seconds=_NATIVE_CACHE_CONTEXT_TTL,
+        active_max_age_seconds=active_ttl,
+    )
     expired = [
         token for token, context in _NATIVE_CACHE_CONTEXTS.items()
-        if stamp - float(context.get("created_at", stamp)) > _NATIVE_CACHE_CONTEXT_TTL
+        if stamp - float(context.get("created_at", stamp)) > (
+            active_ttl if context.get("state") == "active" else _NATIVE_CACHE_CONTEXT_TTL
+        )
+        or context.get("state") == "expired"
     ]
     for token in expired:
         _NATIVE_CACHE_CONTEXTS.pop(token, None)
@@ -4547,8 +4581,6 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
         "count": total_images,
         "after_id": after_id,
         "next_cursor": context["next_cursor"],
-        "records": usable,
-        "wrapped": wrapped,
     }
 
 
@@ -4657,6 +4689,7 @@ def track_native_cache_image(processing, image) -> None:
         indices = set()
         processing._llm_prompt_studio_native_cache_indices = indices
     indices.add(int(image.index))
+    DB.touch_native_cache_job(str(getattr(processing, "_llm_prompt_studio_native_cache_token", "")))
 
 
 def complete_native_cache_context(processing, processed) -> None:

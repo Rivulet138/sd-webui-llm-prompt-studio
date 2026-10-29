@@ -557,6 +557,38 @@ class StudioDB:
                 (context["token"], json.dumps(pending, ensure_ascii=False), now, now),
             )
 
+    def expire_native_cache_jobs(
+        self, max_age_seconds: int = 1800, active_max_age_seconds: int = 7200,
+        terminal_retention_seconds: int = 86400,
+    ) -> int:
+        """Expire abandoned cache claims and remove old terminal payloads."""
+        now = int(time.time())
+        active_cutoff = now - max(0, int(max_age_seconds))
+        running_cutoff = now - max(0, int(active_max_age_seconds))
+        terminal_cutoff = now - max(0, int(terminal_retention_seconds))
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE native_cache_jobs SET state='expired', updated_at=? "
+                "WHERE (state IN ('pending','applying') AND updated_at<=?) "
+                "OR (state='active' AND updated_at<=?)",
+                (now, active_cutoff, running_cutoff),
+            )
+            conn.execute(
+                "DELETE FROM native_cache_jobs WHERE state IN "
+                "('completed','partial','failed','cancelled','expired') AND updated_at<=?",
+                (terminal_cutoff,),
+            )
+        return cursor.rowcount
+
+    def touch_native_cache_job(self, token: str) -> bool:
+        """Refresh an active cache claim while Forge is producing images."""
+        with self.lock, self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE native_cache_jobs SET updated_at=? WHERE token=? AND state='active'",
+                (int(time.time()), str(token)),
+            )
+        return cursor.rowcount > 0
+
     def get_native_cache_job(self, token: str) -> dict[str, Any] | None:
         with self.lock, self._connection() as conn:
             row = conn.execute(
@@ -635,8 +667,14 @@ class StudioDB:
     def claim_server_queue_job(self) -> dict[str, Any] | None:
         """Atomically claim the next pending job with an owner token."""
         now = int(time.time())
+        pending_cutoff = now - 21600
         claim_token = secrets.token_urlsafe(24)
         with self.lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE server_queue_jobs SET status='expired', error='任务已过期，未启动生图', updated_at=? "
+                "WHERE status='pending' AND created_at<=?",
+                (now, pending_cutoff),
+            )
             row = conn.execute(
                 "SELECT id FROM server_queue_jobs WHERE status='pending' ORDER BY created_at, position LIMIT 1"
             ).fetchone()
@@ -680,7 +718,7 @@ class StudioDB:
         self, job_id: str, status: str, prompt: str = "", error: str = "",
         expected_claim_token: str | None = None,
     ) -> bool:
-        if status not in {"pending", "running", "completed", "error", "cancelled"}:
+        if status not in {"pending", "running", "completed", "error", "cancelled", "expired"}:
             raise ValueError(f"Unsupported server queue status: {status}")
         with self.lock, self._connection() as conn:
             where = "id=?"
@@ -712,6 +750,15 @@ class StudioDB:
             records.append(item)
         return records
 
+    def count_server_queue(self, batch_id: str) -> dict[str, int]:
+        """Return queue counts without loading request, prompt, or image payloads."""
+        with self.lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT status,COUNT(*) AS count FROM server_queue_jobs WHERE batch_id=? GROUP BY status",
+                (str(batch_id),),
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
     def cancel_server_queue(self, batch_id: str) -> int:
         with self.lock, self._connection() as conn:
             cursor = conn.execute(
@@ -721,13 +768,21 @@ class StudioDB:
         return cursor.rowcount
 
     def recover_server_queue(
-        self, max_age_seconds: int = 1800, active_claim_tokens: Iterable[str] | None = None,
+        self, max_age_seconds: int = 1800, pending_max_age_seconds: int = 21600,
+        active_claim_tokens: Iterable[str] | None = None,
     ) -> int:
-        cutoff = int(time.time()) - max(0, int(max_age_seconds))
+        now = int(time.time())
+        cutoff = now - max(0, int(max_age_seconds))
+        pending_cutoff = now - max(0, int(pending_max_age_seconds))
         tokens = [str(token) for token in (active_claim_tokens or ()) if str(token)]
         with self.lock, self._connection() as conn:
+            expired = conn.execute(
+                "UPDATE server_queue_jobs SET status='expired', error='任务已过期，未启动生图', updated_at=? "
+                "WHERE status='pending' AND created_at<=?",
+                (now, pending_cutoff),
+            ).rowcount
             where = "status='running' AND updated_at<=?"
-            params: list[Any] = [int(time.time()), cutoff]
+            params: list[Any] = [now, cutoff]
             if tokens:
                 placeholders = ",".join("?" for _ in tokens)
                 where += f" AND claim_token NOT IN ({placeholders})"
@@ -736,7 +791,7 @@ class StudioDB:
                 f"UPDATE server_queue_jobs SET status='error', error='服务重启后任务执行状态未知，请人工确认后重试', updated_at=? WHERE {where}",
                 params,
             )
-        return cursor.rowcount
+        return expired + cursor.rowcount
 
     def save_prompt(
         self, prompt: str, negative: str = "", output_mode: str = "", base_model: str = "", score: float = 0,
