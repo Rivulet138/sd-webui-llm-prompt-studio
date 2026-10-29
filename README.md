@@ -18,7 +18,6 @@ Stable Diffusion Forge Neo 的 LLM 提示词工作室。
   - [静态词库](#静态词库)
   - [图片反推](#图片反推)
   - [外部插件交接](#外部插件交接)
-- [常见问题](#常见问题)
 
 ## 功能
 
@@ -265,32 +264,6 @@ Content-Type: application/json
   "metadata": {}
 }
 ```
-
-## 常见问题
-
-### 页面没有出现
-
-重启 Forge，然后执行 `Ctrl + F5`。确认扩展目录为：
-
-```text
-<Forge 根目录>/extensions/sd-webui-llm-prompt-studio
-```
-
-### LLM 连接失败
-
-检查服务商、地址、模型 ID 和 API Key。自定义 OpenAI 兼容服务通常需要填写正确的 `/v1` 路径。
-
-### 生成成功但没有生图
-
-确认生成去向选择的是「生成并入队生图」，而不是「生成到缓存」。
-
-### Native Cache 注入失败
-
-确认 Forge Script 为 `None`，批次数量与缓存数量一致，然后重新发起 Native Cache 任务。
-
-### 找不到反推模型
-
-确认 ONNX 模型与标签文件在同一模型目录中，点击「重新检测模型」。
 
 ### 更新插件
 
