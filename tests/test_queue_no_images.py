@@ -38,7 +38,7 @@ class QueueImageRemovalTests(unittest.TestCase):
         with patch.object(self.db, "_connection", status_connection):
             snapshot = api._server_queue_snapshot("batch")
         self.assertEqual(snapshot["counts"], {"pending": 1})
-        self.assertEqual(snapshot["jobs"][0]["request"], "one cat")
+        self.assertNotIn("request", snapshot["jobs"][0])
         self.assertNotIn("images", snapshot["jobs"][0])
         self.assertNotIn("images_json", snapshot["jobs"][0])
         self.assertLess(len(json.dumps(snapshot)), 4096)
@@ -79,7 +79,7 @@ class QueueImageRemovalTests(unittest.TestCase):
         markup = api._server_queue_html({"jobs": [{"position": 1, "status": "completed", "prompt": "cat <tree>",
             "images": ["data:image/png;base64,legacy"], "error": ""}]})
         self.assertIn("completed", markup)
-        self.assertIn("cat &lt;tree&gt;", markup)
+        self.assertNotIn("cat &lt;tree&gt;", markup)
         self.assertNotIn("<img", markup)
         self.assertNotIn("base64", markup)
 

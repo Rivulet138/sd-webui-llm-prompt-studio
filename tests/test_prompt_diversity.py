@@ -30,6 +30,8 @@ from prompt_studio_diversity import (
     STOP_TOKENS,
     duplicate_clusters as _duplicate_clusters,
 )
+from prompt_studio_lexicon_sampling import sample_references, sample_terms
+from prompt_studio_generation import run_llm_generation
 
 DIVERSITY_CONSTANTS = (
     "_DIVERSITY_SKELETON_TOKENS",
@@ -80,6 +82,7 @@ DIVERSITY_FUNCTIONS = (
     "_persist_diversity_memory",
     "_remember_diverse_output",
     "_recent_diverse_outputs",
+    "_sample_lexicon_terms",
     "_lexicon_recipe",
     "_weighted_category",
     "_recipe_schedule",
@@ -130,6 +133,9 @@ class DiversityLayerTests(unittest.TestCase):
             uuid=uuid,
             threading=threading,
             _duplicate_clusters=_duplicate_clusters,
+            _sample_lexicon_references=sample_references,
+            _sample_lexicon_terms_impl=sample_terms,
+            _run_llm_generation_impl=run_llm_generation,
         )
 
     def make_lexicon(self):
@@ -277,7 +283,7 @@ class DiversityLayerTests(unittest.TestCase):
         self.assertEqual(self.db.get_setting(self.api._DIVERSITY_MEMORY_SETTING, {}), {})
 
 
-GENERATE_FUNCTIONS = DIVERSITY_FUNCTIONS + ("_generate",)
+GENERATE_FUNCTIONS = DIVERSITY_FUNCTIONS + ("_run_llm_generation", "_generate",)
 CONNECTION = {
     "retry_count": 0, "thinking_enabled": False, "thinking_budget": 0,
     "reasoning_effort": "", "top_p": None, "top_k": None,
@@ -318,6 +324,9 @@ class GenerateGateTests(unittest.TestCase):
             uuid=uuid,
             threading=threading,
             _duplicate_clusters=_duplicate_clusters,
+            _sample_lexicon_references=sample_references,
+            _sample_lexicon_terms_impl=sample_terms,
+            _run_llm_generation_impl=run_llm_generation,
             _BATCH_CONTEXT=threading.local(),
             call_llm=fake_call,
             CREDENTIALS=SimpleNamespace(resolve=lambda *args: "fake-key"),
@@ -399,7 +408,7 @@ class GenerateGateTests(unittest.TestCase):
         _prompt, _system, _status = self.generate(api, history=[KITCHEN_A, KITCHEN_B])
         system = self.calls[0].system
         self.assertIn("COVERAGE SO FAR", system)
-        self.assertIn("UNUSED DIRECTIONS", system)
+        self.assertIn("RANDOM LOCAL DIRECTIONS", system)
         self.assertNotIn("DIVERSITY LEDGER", system)
         self.assertNotIn("Do not reuse their scene structure", system)
 

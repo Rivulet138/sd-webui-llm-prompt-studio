@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import test_prompt_diversity as diversity
+from prompt_studio_lexicon_sampling import sample_terms
 from test_queue_regressions import StudioDB, ui_functions
 
 
@@ -26,6 +27,7 @@ class KemonomimiPromptTests(unittest.TestCase):
             "_build_inspiration_sources", "_parse_batch_sources",
             "_normalize_generation_count", "_is_kemonimimi_request",
             "_kemonimimi_reference_categories",
+            "_sample_lexicon_terms",
             constants=(
                 "_KEMONOMIMI_MARKERS", "_KEMONOMIMI_TOPIC_POOL",
                 "_KEMONOMIMI_VARIATION_HINTS", "_KEMONOMIMI_REFERENCE_CATEGORY_HINTS",
@@ -33,6 +35,8 @@ class KemonomimiPromptTests(unittest.TestCase):
                 "_INSPIRATION_VARIATION_HINTS", "KEMONOMIMI_TEMPLATE",
             ),
             DB=self.db, random=random,
+            LOGGER=__import__("logging").getLogger("kemonomimi-test"),
+            _sample_lexicon_terms_impl=sample_terms,
             _source_duplication=self.api._source_duplication,
         )
 

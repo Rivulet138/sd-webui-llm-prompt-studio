@@ -108,19 +108,18 @@ class UiPromptTests(unittest.TestCase):
     def setUpClass(cls):
         cls.source = (ROOT / "scripts/prompt_studio_ui.py").read_text(encoding="utf-8")
 
-    def test_prompt_page_exposes_every_diversity_control(self):
+    def test_prompt_page_keeps_diversity_runtime_internal(self):
         self.assertIn('with gr.Tab("提示词"', self.source)
         for key in ("recipe_enabled", "recipe_dimensions", "retry_limit",
                     "similarity_threshold", "memory_enabled", "batch_temperature_floor",
                     "source_fold_duplicates"):
-            self.assertIn(f'elem_id="llm_prompt_studio_diversity_{key}"', self.source, key)
-        for handler in ("_save_diversity_settings", "_reset_diversity_settings",
-                        "_prompt_preview_text", "_diversity_report_markdown"):
-            self.assertIn(f"{handler},", self.source, handler)
+            self.assertIn(f'"{key}"', self.source, key)
+        self.assertIn("_run_llm_generation", self.source)
+        self.assertIn("_sample_lexicon_terms", self.source)
 
-    def test_prompt_page_shows_the_assembled_prompt(self):
-        self.assertIn('elem_id="llm_prompt_studio_prompt_preview"', self.source)
-        self.assertIn("show_copy_button=True", self.source)
+    def test_prompt_page_does_not_reintroduce_technical_preview_controls(self):
+        self.assertNotIn('elem_id="llm_prompt_studio_prompt_preview"', self.source)
+        self.assertNotIn("show_copy_button=True", self.source)
 
     def test_dead_technical_token_helper_is_removed(self):
         self.assertNotIn("_preserves_immutable_technical_tokens", self.source)

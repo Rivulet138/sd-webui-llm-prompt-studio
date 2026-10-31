@@ -49,7 +49,7 @@ function harness(options = {}) {
     const context = vm.createContext({ window, document, console, setTimeout: nativeTimer, clearTimeout, setInterval, clearInterval, Blob, Event: DomEvent, AbortController, HTMLInputElement: Control, HTMLTextAreaElement: Control });
     const instrumented = source.replace(
         /\}\)\(\);\s*$/,
-        "window.__probe = { wait, enablePluginKeepAlive, serverQueueRowsHtml, requestNativeCacheContext, releaseNativeCacheContext, commitInlineCacheCursor, handleNativeGenerate, nativeCacheConfig, startLinkedRun, syncCacheCursor, restoreNativeCacheState: (...args) => restoreNativeCacheState(...args), installNativeCacheState: () => installNativeCacheState(), setForgeRunner: fn => { runForgeGeneration = fn; } };\n})();",
+        "window.__probe = { wait, enablePluginKeepAlive, serverQueueRowsHtml, watchServerQueue, requestNativeCacheContext, releaseNativeCacheContext, commitInlineCacheCursor, handleNativeGenerate, nativeCacheConfig, startLinkedRun, syncCacheCursor, restoreNativeCacheState: (...args) => restoreNativeCacheState(...args), installNativeCacheState: () => installNativeCacheState(), setForgeRunner: fn => { runForgeGeneration = fn; } };\n})();",
     );
     assert.notEqual(instrumented, source);
     vm.runInContext(instrumented, context, { filename: "llm_prompt_studio_auto_loop.js" });
@@ -239,6 +239,46 @@ test("release acknowledges actual partial cursor before legacy local commit", as
     assert.equal(JSON.parse(h.storage.get("llm_prompt_studio_cache_cursors_v1"))["txt2img:cache"], 12);
 });
 
+test("release waits for Forge postprocess to commit an active native cache job", async () => {
+    let releaseCalls = 0;
+    const h = harness({ fetch: async url => {
+        if (!url.includes("/release")) return response(snapshot());
+        releaseCalls += 1;
+        return releaseCalls === 1
+            ? response({ released: false, committed: false, state: "active", completed_count: 0, next_cursor: 41 })
+            : response({ released: true, committed: true, state: "partial", completed_count: 1, next_cursor: 42 });
+    } });
+    cacheForm(h);
+    const run = {
+        slot: "txt2img", nativeContextToken: "token", pendingCacheCursor: 41,
+        activeCacheCursor: 41, pendingCacheSource: "txt2img:cache", activeCacheSource: "txt2img:cache",
+    };
+    const released = await h.test.releaseNativeCacheContext(run, true);
+    assert.equal(releaseCalls, 2);
+    assert.equal(released.committed, true);
+    assert.equal(run.pendingCacheCursor, 42);
+});
+
+test("cancel release also waits for a delayed partial native-cache commit", async () => {
+    let releaseCalls = 0;
+    const h = harness({ fetch: async url => {
+        if (!url.includes("/release")) return response(snapshot());
+        releaseCalls += 1;
+        return releaseCalls === 1
+            ? response({ released: false, committed: false, state: "active", completed_count: 0, next_cursor: 41 })
+            : response({ released: true, committed: true, state: "partial", completed_count: 2, next_cursor: 43 });
+    } });
+    cacheForm(h);
+    const run = {
+        slot: "txt2img", nativeContextToken: "token", pendingCacheCursor: 41,
+        activeCacheCursor: 41, pendingCacheSource: "txt2img:cache", activeCacheSource: "txt2img:cache",
+    };
+    const released = await h.test.releaseNativeCacheContext(run, false);
+    assert.equal(releaseCalls, 2);
+    assert.equal(released.committed, true);
+    assert.equal(run.pendingCacheCursor, 43);
+});
+
 test("prepare actual cursor stays visible when progress advanced after the state read", async () => {
     const h = harness({ fetch: async url => response(url.includes("/prepare")
         ? { token: "a".repeat(32), count: 1, after_id: 57, next_cursor: 58 } : snapshot()) });
@@ -265,7 +305,7 @@ test("native status uses completed_count, not requested batch count", async () =
     await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
     const status = h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML;
     assert.match(status, /2\s*\/\s*4/);
-    assert.match(status, /12/);
+    assert.doesNotMatch(status, /读取进度 ID|next_cursor/);
     assert.doesNotMatch(status, /已完成 4|完成 4 张/);
 });
 
@@ -281,7 +321,7 @@ test("native browser failure never claims backend work was uncommitted", async (
     const status = h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML;
     assert.match(status, /browser timeout/);
     assert.doesNotMatch(status, /未提交|可重试/);
-    assert.match(status, /后端|刷新/);
+    assert.match(status, /Forge|未完成/);
 });
 
 test("selected Forge script rejects before prepare or native click", async () => {
@@ -352,12 +392,12 @@ test("nullable processed progress remains blank and manual cursors stay source s
     form.sourceHost.children[1].click(true);
     let config = h.test.nativeCacheConfig("txt2img");
     await h.test.requestNativeCacheContext(config, h.test.startLinkedRun(config));
-    assert.equal(calls.at(-1).body.after_id, null);
+    assert.equal(calls.findLast(item => item.url.includes("/prepare")).body.after_id, null);
     form.sourceHost.children[2].click(true);
     assert.equal(form.cache_cursor.value, "7");
     config = h.test.nativeCacheConfig("txt2img");
     await h.test.requestNativeCacheContext(config, h.test.startLinkedRun(config));
-    assert.equal(calls.at(-1).body.after_id, 7);
+    assert.equal(calls.findLast(item => item.url.includes("/prepare")).body.after_id, 7);
 });
 
 test("zero-output and unconfirmed completion stop queued clicks without speculative cursor", async () => {
@@ -389,7 +429,7 @@ test("cancelled batches retain the backend-produced prefix and truthful stop sta
     await h.test.restoreNativeCacheState("txt2img");
     h.test.setForgeRunner(async () => {
         const message = h.window.llmPromptStudioAutoLoop.cancelInline("txt2img");
-        assert.match(message, /后端保留已完成图片的读取进度/);
+        assert.match(message, /正在保存已经完成的图片/);
         assert.doesNotMatch(message, /未提交/);
     });
     await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
@@ -487,8 +527,54 @@ test("server queue renders status without accessing legacy image payloads", () =
     Object.defineProperty(job, "images", { get() { throw new Error("Do not load queue images"); } });
     const markup = h.test.serverQueueRowsHtml([job]);
     assert.match(markup, /completed/);
-    assert.match(markup, /one cat &lt;tree&gt;/);
+    assert.doesNotMatch(markup, /one cat|&lt;tree&gt;/);
     assert.doesNotMatch(markup, /<img|base64/);
+});
+
+test("server queue watcher stops immediately on permanent HTTP errors", async () => {
+    let requests = 0;
+    const h = harness({ fetch: async () => {
+        requests++;
+        return { ok: false, status: 404 };
+    } });
+    const status = { innerHTML: "", get textContent() { return this.innerHTML; } };
+    h.nodes.set("llm_prompt_studio_server_queue_status", status);
+
+    await h.test.watchServerQueue("missing-batch");
+
+    assert.equal(requests, 1);
+    assert.match(status.innerHTML, /轮询已停止：服务端队列 HTTP 404/);
+});
+
+test("server queue watcher bounds transient failures", async () => {
+    let requests = 0;
+    const h = harness({ fetch: async () => {
+        requests++;
+        throw new Error("backend offline");
+    } });
+    const status = { innerHTML: "", get textContent() { return this.innerHTML; } };
+    h.nodes.set("llm_prompt_studio_server_queue_status", status);
+
+    await h.test.watchServerQueue("offline-batch");
+
+    assert.equal(requests, 5);
+    assert.deepEqual(h.timers.filter(ms => ms <= 8000), [1000, 2000, 4000, 8000]);
+    assert.match(status.innerHTML, /轮询已停止：backend offline/);
+});
+
+test("server queue watcher does not retry authentication failures", async () => {
+    let requests = 0;
+    const h = harness({ fetch: async () => {
+        requests++;
+        return { status: 401 };
+    } });
+    const status = { innerHTML: "", get textContent() { return this.innerHTML; } };
+    h.nodes.set("llm_prompt_studio_server_queue_status", status);
+
+    await h.test.watchServerQueue("protected-batch");
+
+    assert.equal(requests, 1);
+    assert.match(status.innerHTML, /轮询已停止：Studio API 认证失败/);
 });
 
 test("native cache claims remain token-bound and recoverable", () => {
@@ -503,7 +589,8 @@ test("native cache claims remain token-bound and recoverable", () => {
 test("linked runs always remove their own prompt listeners", () => {
     assert.match(source, /function finishLinkedRun\(run\)\s*\{[\s\S]*?run\.promptElement\.removeEventListener/);
     assert.doesNotMatch(source, /if \(linkedRuns\[run\.slot\] !== run\) return/);
-    assert.match(source, /if \(linkedRuns\[run\.slot\] === run\) linkedRuns\[run\.slot\] = null/);
+    assert.match(source, /function clearRunRegistry\(run\)/);
+    assert.match(source, /finishLinkedRun\(run\)\s*\{[\s\S]*?clearRunRegistry\(run\)/);
 });
 
 test("native generation restores claims and finishes linked runs", () => {

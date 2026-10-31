@@ -23,6 +23,12 @@ from prompt_studio_wd14 import (
 )
 from prompt_studio_tagger_models import MODEL_CATALOG, download_links, download_model, model_directory
 from prompt_studio_image_batch import ImageBatchJob
+from prompt_studio_lexicon_sampling import sample_references as _sample_lexicon_references
+from prompt_studio_lexicon_sampling import sample_terms as _sample_lexicon_terms_impl
+from prompt_studio_generation import run_llm_generation as _run_llm_generation_impl
+from prompt_studio_native_cache import extract_claim as _native_cache_extract_claim_impl
+from prompt_studio_native_cache import merge_prompt as _native_cache_merge_prompt_impl
+from prompt_studio_native_cache import validate_slot as _native_cache_slot_impl
 from prompt_studio_diversity import (
     CONCEPT_ALIASES as _DIVERSITY_CONCEPT_ALIASES,
     SKELETON_WORDS as _DIVERSITY_SKELETON_WORDS,
@@ -95,6 +101,8 @@ DEFAULT_LLM_SETTINGS = {
 LLM_CONNECTION_SETTINGS_VERSION = 7
 HANDOFF_INFERENCE_SETTINGS_VERSION = 1
 PROCESSED_CACHE_INFERENCE_SETTINGS_VERSION = 1
+TRANSFORM_LLM_SETTINGS_VERSION = 1
+TRANSFORM_LLM_SETTINGS_KEY = "transform_llm_settings_v1"
 MAX_SERVER_QUEUE_REQUESTS = 5000
 SERVER_QUEUE_PENDING_TTL = 6 * 60 * 60
 GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创作一条全新、独立成图的日系插画方向。
@@ -904,6 +912,16 @@ def _weighted_category(sampler, names: list[str], groups: dict[str, list[str]]) 
     return sampler.choices(names, weights=weights, k=1)[0]
 
 
+def _sample_lexicon_terms(
+    limit=8, exclude_terms=None, categories=None, per_category=2,
+    max_categories=12,
+):
+    """Return one independent vocabulary slice while keeping the UI API stable."""
+    return _sample_lexicon_terms_impl(
+        DB, limit, exclude_terms, categories, per_category, max_categories, LOGGER,
+    )
+
+
 def _lexicon_recipe(
     used_terms: set[str] | None = None, count: int | None = None,
     dimensions: Iterable[str] | None = None, source: str = "",
@@ -966,12 +984,16 @@ def _lexicon_recipe(
             break
         candidates = [name for name in names if name not in claimed]
         while candidates:
-            name = _weighted_category(sampler, candidates, groups)
-            candidates.remove(name)
-            values = [term for term in groups[name] if term.casefold() not in used]
-            if not values:
+            sampled = _sample_lexicon_terms(
+                1, exclude_terms=used, categories=candidates,
+                per_category=1, max_categories=1,
+            )
+            if not sampled:
+                break
+            term, name = sampled[0]
+            if name not in candidates:
+                candidates.remove(name)
                 continue
-            term = sampler.choice(values)
             used.add(term.casefold())
             claimed.add(name)
             picks.append((dimension, name, term))
@@ -1865,11 +1887,43 @@ def _save_handoff_inference_settings(temperature, timeout, max_tokens, retry_cou
 
 
 def _processed_cache_inference_settings() -> dict[str, Any]:
-    """Return the isolated, conservative profile used by cache transformations."""
+    """Compatibility alias for the isolated transform/expand/polish profile."""
+    return _transform_llm_settings()
+
+
+def _transform_llm_settings() -> dict[str, Any]:
+    """Return the complete connection used by every prompt transformation path.
+
+    The first read snapshots the old main connection so existing installations
+    keep working. Once saved, this profile is independent from generation.
+    """
     base = _connection_settings()
-    saved = DB.get_setting("processed_cache_inference_v1", {}) or {}
+    saved = DB.get_setting(TRANSFORM_LLM_SETTINGS_KEY, {}) or {}
+    legacy = DB.get_setting("processed_cache_inference_v1", {}) or {}
     if not isinstance(saved, dict):
         saved = {}
+    if not saved:
+        saved = {
+            "version": TRANSFORM_LLM_SETTINGS_VERSION,
+            "provider": base["provider"], "endpoint": base["endpoint"], "model": base["model"],
+            "temperature": 0.25, "top_p": 0.9, "top_k": None,
+            "timeout": 90, "max_tokens": 8096, "send_temperature": True,
+            "retry_count": 2, "thinking_enabled": False, "thinking_budget": 0,
+            "reasoning_effort": "",
+        }
+        if isinstance(legacy, dict) and legacy:
+            for key in (
+                "temperature", "top_p", "top_k", "timeout", "max_tokens", "send_temperature",
+                "retry_count", "thinking_enabled", "thinking_budget", "reasoning_effort",
+            ):
+                if key in legacy:
+                    saved[key] = legacy[key]
+        DB.set_setting(TRANSFORM_LLM_SETTINGS_KEY, saved)
+
+    provider = _canonical_provider(saved.get("provider") or base["provider"])
+    if provider not in PROVIDER_PROFILES:
+        provider = base["provider"]
+    profile = get_provider_profile(provider)
 
     def bounded(name, default, low, high, cast):
         try:
@@ -1882,7 +1936,9 @@ def _processed_cache_inference_settings() -> dict[str, Any]:
     except (TypeError, ValueError):
         sampling = {"top_p": 0.9, "top_k": None}
     return {
-        "provider": base["provider"], "endpoint": base["endpoint"], "model": base["model"],
+        "provider": provider,
+        "endpoint": str(saved.get("endpoint") or profile["default_endpoint"]),
+        "model": str(saved.get("model") or ""),
         "temperature": bounded("temperature", 0.25, 0.0, 2.0, float),
         "top_p": sampling.get("top_p"), "top_k": sampling.get("top_k"),
         "timeout": bounded("timeout", 90, 5, 600, int),
@@ -1896,28 +1952,122 @@ def _processed_cache_inference_settings() -> dict[str, Any]:
     }
 
 
-def _save_processed_cache_inference_settings(
-    temperature, timeout, max_tokens, retry_count, thinking_enabled, thinking_budget,
-    reasoning_effort, send_temperature, top_p=None, top_k=None,
+def _save_transform_llm_settings(
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens,
+    send_temperature, retry_count, thinking_enabled=False, thinking_budget=0,
+    reasoning_effort="", top_p=None, top_k=None,
 ):
+    provider = _canonical_provider(provider or DEFAULT_LLM_SETTINGS["provider"])
     try:
+        if provider not in PROVIDER_PROFILES:
+            raise ValueError("不支持的 Provider")
+        endpoint = validate_endpoint(endpoint)
+        model = str(model or "").strip()
+        if not model:
+            raise ValueError("转换 LLM model ID 不能为空")
         sampling = normalize_sampling(top_p, top_k)
         values = {
-            "version": PROCESSED_CACHE_INFERENCE_SETTINGS_VERSION,
+            "version": TRANSFORM_LLM_SETTINGS_VERSION,
+            "provider": provider, "endpoint": endpoint, "model": model,
             "temperature": max(0.0, min(float(temperature), 2.0)),
             "timeout": max(5, min(int(timeout), 600)),
             "max_tokens": max(0, min(int(max_tokens), 262144)),
+            "send_temperature": _coerce_bool(send_temperature, True),
             "retry_count": max(0, min(int(retry_count), 5)),
             "thinking_enabled": _coerce_bool(thinking_enabled),
             "thinking_budget": max(0, min(int(thinking_budget or 0), 262144)),
             "reasoning_effort": str(reasoning_effort or "").strip(),
-            "send_temperature": _coerce_bool(send_temperature, True),
             "top_p": sampling.get("top_p"), "top_k": sampling.get("top_k"),
         }
     except (TypeError, ValueError) as error:
-        return f"处理结果库参数保存失败：{_safe_error(error)}"
-    DB.set_setting("processed_cache_inference_v1", values)
-    return "处理结果库的独立 LLM 参数已保存；仅影响缓存 Prompt 写入处理结果库。"
+        return f"转换 LLM 配置保存失败：{_safe_error(error)}"
+    DB.set_setting(TRANSFORM_LLM_SETTINGS_KEY, values)
+    key_saved = CREDENTIALS.save(provider, endpoint, api_key)
+    message = f"转换 LLM 配置已保存：{provider} / {model}。"
+    if key_saved or CREDENTIALS.has_matching(provider, endpoint):
+        message += " API Key 已按转换服务地址独立保存。"
+    elif get_provider_profile(provider).get("requires_api_key"):
+        message += " 尚未保存 API Key，调用转换功能时必须填写。"
+    return message
+
+
+def _load_transform_provider_settings(provider):
+    settings = _transform_llm_settings()
+    provider = _canonical_provider(provider)
+    if provider in PROVIDER_PROFILES:
+        saved = DB.get_setting(TRANSFORM_LLM_SETTINGS_KEY, {}) or {}
+        settings = dict(settings)
+        same_provider = isinstance(saved, dict) and _canonical_provider(saved.get("provider")) == provider
+        settings["provider"] = provider
+        settings["endpoint"] = str(saved.get("endpoint") if same_provider else get_provider_profile(provider)["default_endpoint"])
+        settings["model"] = str(saved.get("model") if same_provider else "")
+    choices = [settings["model"]] if settings["model"] else []
+    return (
+        settings["endpoint"], gr.update(choices=choices, value=settings["model"]),
+        settings["temperature"], settings["top_p"],
+        gr.update(value=settings["top_k"], visible=_supports_top_k(provider)),
+        settings["max_tokens"], settings["timeout"], settings["retry_count"],
+        settings["thinking_enabled"], settings["thinking_budget"], settings["reasoning_effort"],
+        settings["send_temperature"],
+        _credential_status(provider, settings["endpoint"]),
+    )
+
+
+def _load_transform_settings():
+    settings = _transform_llm_settings()
+    choices = [settings["model"]] if settings["model"] else []
+    return (
+        settings["provider"], settings["endpoint"], gr.update(choices=choices, value=settings["model"]),
+        settings["temperature"], settings["top_p"],
+        gr.update(value=settings["top_k"], visible=_supports_top_k(settings["provider"])),
+        settings["max_tokens"], settings["timeout"], settings["retry_count"],
+        settings["thinking_enabled"], settings["thinking_budget"], settings["reasoning_effort"],
+        settings["send_temperature"],
+        _credential_status(settings["provider"], settings["endpoint"]),
+    )
+
+
+def _test_transform_connection(
+    provider, endpoint, model, api_key, temperature, timeout, max_tokens,
+    send_temperature, retry_count, thinking_enabled=False, thinking_budget=0,
+    reasoning_effort="", top_p=None, top_k=None,
+):
+    result = _test_connection(
+        provider, endpoint, model, api_key, "", temperature, timeout, max_tokens,
+        send_temperature, retry_count, thinking_enabled, thinking_budget,
+        reasoning_effort, top_p, top_k,
+    )
+    return result.replace("连接成功", "转换连接成功", 1)
+
+
+def _discover_transform_models(provider, endpoint, api_key, timeout):
+    try:
+        settings = _transform_llm_settings()
+        resolved_key = CREDENTIALS.resolve(api_key, _canonical_provider(provider), endpoint)
+        models = discover_provider_models(
+            _canonical_provider(provider), endpoint, resolved_key,
+            max(5, min(int(timeout or 30), 120)),
+        )
+        selected = settings["model"] if settings["model"] in models else (models[0] if models else "")
+        return gr.update(choices=models, value=selected), f"已发现 {len(models)} 个转换模型。"
+    except Exception as error:
+        current = str(_transform_llm_settings().get("model") or "").strip()
+        return gr.update(choices=[current] if current else [], value=current), f"转换模型发现失败：{_safe_error(error)}"
+
+
+def _save_processed_cache_inference_settings(
+    temperature, timeout, max_tokens, retry_count, thinking_enabled, thinking_budget,
+    reasoning_effort, send_temperature, top_p=None, top_k=None,
+):
+    current = _transform_llm_settings()
+    result = _save_transform_llm_settings(
+        current["provider"], current["endpoint"], current["model"], "",
+        temperature, timeout, max_tokens, send_temperature, retry_count,
+        thinking_enabled, thinking_budget, reasoning_effort, top_p, top_k,
+    )
+    if result.startswith("转换 LLM 配置已保存"):
+        return "转换 / 扩写 / 润色 LLM 参数已保存；缓存 Prompt 处理继续复用该配置。"
+    return result
 
 
 def _credential_status(provider: str, endpoint: str) -> str:
@@ -2429,19 +2579,15 @@ def _build_inspiration_sources(
         variation_hint = variation_hints[index % len(variation_hints)]
         sampled: list[str] = []
         if sample_static and (not character_focused or reference_categories):
-            categorized = DB.wildcard_samples_by_category(
-                1, exclude=used_terms, categories=reference_categories,
-                limit=reference_limit, max_categories=reference_limit,
+            entries = _sample_lexicon_terms(
+                reference_limit, exclude_terms=used_terms,
+                categories=reference_categories, per_category=1,
+                max_categories=reference_limit,
             )
-            categories = list(categorized)
-            rng.shuffle(categories)
-            for category in categories:
-                values = categorized.get(category) or []
-                if values:
-                    term = str(values[0]).strip()
-                    if term and term.casefold() not in used_terms:
-                        sampled.append(f"[{category}] {term}")
-                        used_terms.add(term.casefold())
+            for term, category in entries:
+                if term.casefold() not in used_terms:
+                    sampled.append(f"[{category}] {term}")
+                    used_terms.add(term.casefold())
         reference = "；".join(sampled[:reference_limit])
         source = f"随机题材：{topic}；本条变化重点：{variation_hint}。请创作一条完整、可直接生图的单图 Prompt，围绕主体、一个清晰动作和一个连贯场景展开，其他细节只在自然支持画面时添加，不为填满维度而添加物品。"
         if character_focused:
@@ -2557,7 +2703,6 @@ def _batch_generate(
     pending, inserted, duplicates, score_updates, skipped, failed, request_count = [], 0, 0, 0, 0, 0, 0
     batch_history = []
     used_lenses: set[str] = set()
-    used_recipe_terms: set[str] = set()
     # One seed per batch run: the coverage plan is deterministic inside the run
     # and different between runs, so reruns explore new mixes.
     recipe_seed = random.SystemRandom().getrandbits(32)
@@ -2634,6 +2779,11 @@ def _batch_generate(
             generated, last_status = "", ""
             request_count += 1
             try:
+                recipe = _lexicon_recipe(
+                    set(),  # Keep recipe sampling independent; do not deplete the lexicon across calls.
+                    dimensions=_recipe_schedule(index, recipe_seed, source=source),
+                    source=source,
+                )
                 generated, _system, last_status = _generate(
                     source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
@@ -2641,10 +2791,7 @@ def _batch_generate(
                     0, False, "", "", False, _BATCH_CANCEL,
                     _independent_batch_directive(
                         index, used_lenses,
-                        _lexicon_recipe(
-                            used_recipe_terms, dimensions=_recipe_schedule(index, recipe_seed, source=source),
-                            source=source,
-                        ),
+                        recipe,
                     ) + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{total_label} 条。"
                         "批次上下文中的结果只用于排除重复，不要复制其措辞、构图、动作或物品组合；"
@@ -3333,29 +3480,15 @@ def _static_prompt_reference(
     if character_focused and not categories:
         return []
     related_count = max(0, min(1 if character_focused else 30, int(related_limit or 0)))
+    requested = max(0, min(1 if character_focused else 30, int(sample_limit or 0)))
     excluded = {str(item).strip().casefold() for item in (exclude_terms or []) if str(item).strip()}
-    related = []
-    for category in (categories if character_focused else [None]):
-        if len(related) >= related_count:
-            break
-        for term in DB.wildcard_matches(str(source or ""), related_count, category=category):
-            if (str(term or "").strip().casefold() not in _STATIC_REFERENCE_BLOCKLIST
-                    and str(term or "").strip().casefold() not in excluded
-                    and term not in related):
-                related.append(term)
-                if len(related) >= related_count:
-                    break
-    sample_excluded = excluded | {str(item).strip().casefold() for item in related if str(item).strip()}
-    requested = max(0, min(1 if character_focused else 30 - len(related), int(sample_limit or 0)))
-    categorized = DB.wildcard_samples_by_category(
-        12, exclude=sample_excluded, categories=categories, limit=requested,
+    references = _sample_lexicon_references(
+        DB, source, related_count, requested, categories,
+        exclude_terms, _STATIC_REFERENCE_BLOCKLIST, LOGGER,
     )
-    category_order = list(categorized)
-    random.SystemRandom().shuffle(category_order)
-    samples = [(term, category) for category in category_order for term in categorized[category]][:requested]
     result = []
     seen = set()
-    for term, category in [*((term, "") for term in related), *samples]:
+    for term, category in references:
         normalized = str(term or "").strip()
         if (normalized and normalized.casefold() not in seen
                 and normalized.casefold() not in excluded
@@ -3363,6 +3496,26 @@ def _static_prompt_reference(
             seen.add(normalized.casefold())
             result.append(f"[{category}] {normalized}" if category else normalized)
     return result
+
+
+def _run_llm_generation(
+    source, provider, endpoint, model, api_key, initial_system, build_retry_system,
+    finalize_result, runtime_connection, request_temperature, timeout, max_tokens,
+    send_temperature, cancel_event=None, preserve_inference_settings=False,
+    gate_context=None, retry_limit=0, similarity_limit=_MAX_CONTENT_SIMILARITY,
+    retry_empty_result=False,
+):
+    """Compatibility wrapper around the standalone generation kernel."""
+    return _run_llm_generation_impl(
+        source, provider, endpoint, model, api_key, initial_system, build_retry_system,
+        finalize_result, runtime_connection, request_temperature, timeout, max_tokens,
+        send_temperature, cancel_event, preserve_inference_settings, gate_context,
+        retry_limit, similarity_limit, retry_empty_result,
+        credentials=CREDENTIALS, call_llm=call_llm, build_user_message=build_user_message,
+        coerce_bool=_coerce_bool, fallback_request_kwargs=_fallback_request_kwargs,
+        worst_content_similarity=_worst_content_similarity,
+        max_response_retries=_MAX_RESPONSE_RETRIES,
+    )
 
 
 def _generate(
@@ -3396,7 +3549,9 @@ def _generate(
         recent_outputs = _recent_diverse_outputs(source)
         context_outputs = [*recent_outputs, *batch_history]
         exclusion_terms = _diversity_exclusion_terms_from_outputs(context_outputs, source)
-        static_tags = _static_prompt_reference(source, exclude_terms=exclusion_terms)
+        # Batch items need a fresh random vocabulary slice, not deterministic
+        # source-related matches that can keep surfacing the same prop.
+        static_tags = _static_prompt_reference(source, related_limit=0)
         if exclusion_terms:
             effective_batch_directive += (
                 "\nCOVERAGE SO FAR: this batch has already spent these content concepts: "
@@ -3404,15 +3559,14 @@ def _generate(
                 + ". Treat the list as a coverage map: the next item should land on a different "
                   "combination of action, place, prop and light rather than renaming one of them."
             )
-        fresh = [
-            str(term).strip() for term in static_tags
-            if str(term).strip().casefold() not in {item.casefold() for item in exclusion_terms}
+        static_hints = [
+            str(term).strip() for term in static_tags if str(term).strip()
         ]
-        if fresh:
+        if static_hints:
             effective_batch_directive += (
-                "\nUNUSED DIRECTIONS for this item (local-lexicon terms this batch has not used yet; "
+                "\nRANDOM LOCAL DIRECTIONS for this item (sampled independently from the local lexicon; "
                 "pick from them when they fit the fixed subject and ignore the rest): "
-                + ", ".join(fresh[:6])
+                + ", ".join(static_hints[:6])
             )
         if context_outputs:
             latest = context_outputs[-3:]
@@ -3433,84 +3587,37 @@ def _generate(
     gate_context = list(context_outputs) if effective_batch_directive else []
     retry_limit = int(diversity["retry_limit"]) if gate_context else 0
     similarity_limit = float(diversity["similarity_threshold"])
-    diversity_retries_used = 0
     try:
-        resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
         request_temperature = float(1.0 if temperature is None else temperature)
         if effective_batch_directive and (
             not preserve_inference_settings or diversity["batch_temperature_floor"]
         ):
             request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
-        result = ""
-        accepted = ""
-        best_candidate = ""
-        best_score = -1.0
-        retry_reason = ""
-        attempt = 0
-        while attempt < 1 + max(_MAX_RESPONSE_RETRIES, retry_limit):
-            attempt_system = system
-            if retry_reason == "diversity":
-                attempt_system = build_system_prompt(
-                    preset, base_model, safety, nsfw_injection, user_instruction, examples,
-                    static_tags, system_override,
+        def build_retry_system(reason, attempt):
+            if reason == "diversity":
+                retry_directive = (
                     effective_batch_directive
                     + "\nDIVERSITY RETRY: the previous candidate repeated content that an earlier item of "
                       "this batch already used. Keep the subject, identity and every explicit constraint, "
                       "and make a meaningful, source-compatible change in action, setting or composition. "
-                      "Recipe hints and variation lenses remain optional; do not add clutter to satisfy them.",
-                    operation_instruction,
+                      "Recipe hints and variation lenses remain optional; do not add clutter to satisfy them."
                 )
-            elif retry_reason == "response":
-                attempt_system = build_system_prompt(
-                    preset, base_model, safety, nsfw_injection, user_instruction, examples,
-                    static_tags, system_override,
-                    effective_batch_directive + "\nRESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise result directly and do not spend output on analysis or reasoning.",
-                    operation_instruction,
-                )
-            attempt_temperature = request_temperature
-            if attempt and (retry_reason == "diversity" or not preserve_inference_settings):
-                attempt_temperature = min(2.0, request_temperature + 0.15 * attempt)
-            try:
-                raw_result = call_llm(
-                    provider, endpoint, model, resolved_key, attempt_system, build_user_message(source),
-                    attempt_temperature,
-                    int(timeout or 90), int(max_tokens or 0), _coerce_bool(send_temperature),
-                    max_retries=runtime_connection["retry_count"], cancel_event=cancel_event,
-                    thinking_enabled=runtime_connection.get("thinking_enabled"),
-                    thinking_budget=runtime_connection.get("thinking_budget", 0),
-                    reasoning_effort=runtime_connection.get("reasoning_effort", ""),
-                    top_p=runtime_connection.get("top_p"), top_k=runtime_connection.get("top_k"),
-                    **_fallback_request_kwargs(runtime_connection),
-                )
-            except RuntimeError as error:
-                if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
-                    raise
-                retry_reason = "response"
-                attempt += 1
-                continue
-            candidate = _finalize_generated_prompt(
-                raw_result, preset, safety, remove_bad, remove_terms, shuffle, spaces,
-                max_tags, structured_mode, region_count,
+            else:
+                retry_directive = effective_batch_directive + "\nRESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise result directly and do not spend output on analysis or reasoning."
+            return build_system_prompt(
+                preset, base_model, safety, nsfw_injection, user_instruction, examples,
+                static_tags, system_override, retry_directive, operation_instruction,
             )
-            result = candidate
-            system = attempt_system
-            if not gate_context:
-                break
-            score = _worst_content_similarity(candidate, gate_context, source)
-            if best_candidate == "" or score < best_score:
-                best_candidate, best_score = candidate, score
-            if score < similarity_limit:
-                accepted = candidate
-                break
-            if attempt >= retry_limit:
-                break
-            retry_reason = "diversity"
-            attempt += 1
-            diversity_retries_used += 1
-        if accepted:
-            result = accepted
-        elif best_candidate:
-            result = best_candidate
+
+        result, system, diversity_retries_used = _run_llm_generation(
+            source, provider, endpoint, model, api_key, system, build_retry_system,
+            lambda raw: _finalize_generated_prompt(
+                raw, preset, safety, remove_bad, remove_terms, shuffle, spaces,
+                max_tags, structured_mode, region_count,
+            ), runtime_connection, request_temperature, timeout, max_tokens,
+            send_temperature, cancel_event, preserve_inference_settings,
+            gate_context, retry_limit, similarity_limit,
+        )
     except LLMRequestError as error:
         if str(error) == "LLM request cancelled":
             return "", system, "已取消"
@@ -3666,78 +3773,31 @@ def _expand_or_polish(
     retry_limit = int(diversity_settings.get("retry_limit") or 0) if directive else 0
     similarity_limit = float(diversity_settings.get("similarity_threshold") or _MAX_CONTENT_SIMILARITY)
     gate_context = list(previous) if directive and previous else []
-    diversity_retries_used = 0
     runtime_connection = dict(connection_settings or _connection_settings(provider))
     try:
-        resolved_key = CREDENTIALS.resolve(api_key, provider, endpoint)
-        result = ""
-        accepted = ""
-        best_candidate = ""
-        best_score = -1.0
-        retry_reason = ""
-        attempt = 0
-        while attempt < 1 + max(_MAX_RESPONSE_RETRIES, retry_limit):
-            attempt_system = system
-            if retry_reason:
-                retry_directive = ""
-                if directive and retry_reason == "diversity":
-                    retry_directive = (
-                        f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate repeated content that "
-                        "an item of this batch already used. Favor a different compatible combination of "
-                        "setting, action, prop relationship, spatial layout, camera angle, time/weather and "
-                        "visible daily-life context, follow the required output contract and return exactly one result."
-                    )
-                retry_directive += "\nRESPONSE RETRY: return one concise result directly and do not spend output on analysis or reasoning."
-                attempt_system = build_transform_system(retry_directive)
-            attempt_temperature = request_temperature
-            if attempt and (retry_reason == "diversity" or not preserve_inference_settings):
-                attempt_temperature = min(2.0, request_temperature + 0.15 * attempt)
-            try:
-                raw_result = call_llm(
-                    provider, endpoint, model, resolved_key, attempt_system,
-                    build_user_message(source), attempt_temperature,
-                    int(timeout or 90), int(max_tokens or 0), _coerce_bool(send_temperature),
-                    max_retries=runtime_connection["retry_count"], cancel_event=cancel_event,
-                    thinking_enabled=runtime_connection.get("thinking_enabled"),
-                    thinking_budget=runtime_connection.get("thinking_budget", 0),
-                    reasoning_effort=runtime_connection.get("reasoning_effort", ""),
-                    top_p=runtime_connection.get("top_p"), top_k=runtime_connection.get("top_k"),
-                    **_fallback_request_kwargs(runtime_connection),
+        def build_retry_system(reason, attempt):
+            if reason == "diversity":
+                retry_directive = (
+                    f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate repeated content that "
+                    "an item of this batch already used. Favor a different compatible combination of "
+                    "setting, action, prop relationship, spatial layout, camera angle, time/weather and "
+                    "visible daily-life context, follow the required output contract and return exactly one result."
                 )
-            except RuntimeError as error:
-                if "response did not contain assistant text" not in str(error).lower() or attempt >= _MAX_RESPONSE_RETRIES:
-                    raise
-                retry_reason = "response"
-                attempt += 1
-                continue
-            finalize_preset = "Krea 2 Natural" if use_fixed_krea_polish else preset
-            result = _finalize_generated_prompt(
-                raw_result, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
+            else:
+                retry_directive = ""
+            retry_directive += "\nRESPONSE RETRY: return one concise result directly and do not spend output on analysis or reasoning."
+            return build_transform_system(retry_directive)
+
+        finalize_preset = "Krea 2 Natural" if use_fixed_krea_polish else preset
+        result, _final_system, diversity_retries_used = _run_llm_generation(
+            source, provider, endpoint, model, api_key, system, build_retry_system,
+            lambda raw: _finalize_generated_prompt(
+                raw, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count,
-            )
-            if not result:
-                if attempt >= _MAX_RESPONSE_RETRIES:
-                    break
-                retry_reason = "response"
-                attempt += 1
-                continue
-            if not gate_context:
-                break
-            score = _worst_content_similarity(result, gate_context, source)
-            if best_candidate == "" or score < best_score:
-                best_candidate, best_score = result, score
-            if score < similarity_limit:
-                accepted = result
-                break
-            if attempt >= retry_limit:
-                break
-            retry_reason = "diversity"
-            attempt += 1
-            diversity_retries_used += 1
-        if accepted:
-            result = accepted
-        elif best_candidate:
-            result = best_candidate
+            ), runtime_connection, request_temperature, timeout, max_tokens,
+            send_temperature, cancel_event, preserve_inference_settings,
+            gate_context, retry_limit, similarity_limit, retry_empty_result=True,
+        )
         if result and directive:
             try:
                 _remember_diverse_output(source, result)
@@ -4069,7 +4129,7 @@ def _cancel_png_batch(cancel_id=""):
 def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="independent", cancel_id=""):
     """Run JSON Prompt processing from the Forge txt2img inline panel."""
     workflow = _workflow_settings()
-    connection = _connection_settings()
+    connection = _transform_llm_settings()
     action = _canonical_action(action)
     variation_mode = _canonical_variation_mode(variation_mode)
     preset = _canonical_preset(preset)
@@ -4411,25 +4471,7 @@ def _native_cache_database(source: str) -> StudioDB:
 
 
 def _native_cache_merge_prompt(base_prompt: str, cached_prompt: str, write_mode: str, marker: str) -> str:
-    base = str(base_prompt or "").strip()
-    cached = str(cached_prompt or "").strip()
-    mode = str(write_mode or "append_end").strip()
-    if mode not in {"replace", "marker", "append_start", "append_end"}:
-        raise ValueError("不支持的缓存 Prompt 写入方式")
-    if mode == "replace":
-        return cached
-    if mode == "marker":
-        token = str(marker or "{{LLM}}").strip() or "{{LLM}}"
-        if token not in base:
-            raise ValueError("当前 Prompt 中没有插入标记，请添加标记或更换写入方式")
-        return base.replace(token, cached)
-    if not base:
-        return cached
-    if not cached:
-        return base
-    if mode == "append_start":
-        return f"{cached}, {base}"
-    return f"{base}, {cached}"
+    return _native_cache_merge_prompt_impl(base_prompt, cached_prompt, write_mode, marker)
 
 
 def _native_cache_cleanup_locked(now: float | None = None) -> None:
@@ -4451,9 +4493,7 @@ def _native_cache_cleanup_locked(now: float | None = None) -> None:
 
 
 def _native_cache_slot(slot: str) -> str:
-    if slot not in {"txt2img", "img2img"}:
-        raise ValueError("无效的 Forge 生图面板")
-    return slot
+    return _native_cache_slot_impl(slot)
 
 
 def _native_cache_state(slot: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4487,28 +4527,10 @@ def _native_cache_get_context(token: str) -> dict[str, Any] | None:
 
 
 def _native_cache_extract_claim(processing) -> tuple[str, str] | None:
-    prompt = getattr(processing, "prompt", None)
-    if not isinstance(prompt, str):
-        return None
-    end = prompt.rfind(_NATIVE_CACHE_MARKER_END)
-    if end < 0 or prompt[end + len(_NATIVE_CACHE_MARKER_END):].strip(" \t\r\n,，"):
-        return None
-    encoded_end = end
-    encoded_start = encoded_end - 128
-    start = encoded_start - len(_NATIVE_CACHE_MARKER_START)
-    if start < 0 or prompt[start:encoded_start] != _NATIVE_CACHE_MARKER_START:
-        return None
-    original = prompt[:start]
-    encoded = prompt[encoded_start:encoded_end]
-    if len(encoded) != 128 or any(
-        char not in {_NATIVE_CACHE_MARKER_ZERO, _NATIVE_CACHE_MARKER_ONE} for char in encoded
-    ):
-        return None
-    bits = "".join("1" if char == _NATIVE_CACHE_MARKER_ONE else "0" for char in encoded)
-    token = "".join(f"{int(bits[index:index + 4], 2):x}" for index in range(0, 128, 4))
-    if not re.fullmatch(r"[0-9a-f]{32}", token):
-        return None
-    return token, original
+    return _native_cache_extract_claim_impl(
+        processing, _NATIVE_CACHE_MARKER_START, _NATIVE_CACHE_MARKER_END,
+        _NATIVE_CACHE_MARKER_ZERO, _NATIVE_CACHE_MARKER_ONE,
+    )
 
 
 def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5067,7 +5089,7 @@ def inject_inline_before_negative(component, **kwargs):
 
 
 def _inline_cache_transform(source, action, preset, base_model, instruction, cancel_event):
-    workflow, connection = _workflow_settings(), _processed_cache_inference_settings()
+    workflow, connection = _workflow_settings(), _transform_llm_settings()
     return _expand_or_polish(
         source, _canonical_action(action), _canonical_preset(preset), workflow["system_override"],
         _canonical_base_model(base_model), workflow["safety"], workflow["nsfw_injection"], instruction,
@@ -7160,24 +7182,50 @@ def on_ui_tabs():
                     with gr.Row():
                         fallback_test = gr.Button("测试备用连接", elem_id="llm_prompt_studio_fallback_test")
                         fallback_clear_credentials = gr.Button("清除备用 API Key", elem_id="llm_prompt_studio_fallback_clear")
-                processed_cache_settings = _processed_cache_inference_settings()
-                with gr.Accordion("处理结果库独立 LLM 参数", open=False, elem_classes=["lps-settings-section"]):
-                    gr.Markdown("仅影响缓存 Prompt 处理并写入处理结果库；服务商、地址、模型和凭据继承主连接，推理参数独立保存。")
+                transform_settings = _transform_llm_settings()
+                with gr.Accordion("转换 / 扩写 / 润色 LLM 配置", open=False, elem_classes=["lps-settings-section"]):
+                    gr.Markdown("仅用于格式转换、扩写、润色、WD14 反推处理和缓存 Prompt 处理；与上方创作生成配置完全独立。")
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
-                        settings_cache_temperature = gr.Number(label="温度", value=processed_cache_settings["temperature"], minimum=0, maximum=2, step=0.05)
-                        settings_cache_top_p = gr.Number(label="Top P", value=processed_cache_settings["top_p"], minimum=0, maximum=1, step=0.01)
-                        settings_cache_top_k = gr.Number(label="Top K", value=processed_cache_settings["top_k"], minimum=0, maximum=100000, precision=0)
-                        settings_cache_max_tokens = gr.Number(label="最大 Token", value=processed_cache_settings["max_tokens"], minimum=0, maximum=262144, precision=0)
+                        transform_provider = gr.Dropdown(label="转换服务提供方", choices=PROVIDER_UI_CHOICES, value=transform_settings["provider"], scale=1)
+                        transform_endpoint = gr.Textbox(label="转换模型服务地址", value=transform_settings["endpoint"], scale=2)
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
-                        settings_cache_timeout = gr.Number(label="超时（秒）", value=processed_cache_settings["timeout"], minimum=5, maximum=600, precision=0)
-                        settings_cache_retry_count = gr.Number(label="重试次数", value=processed_cache_settings["retry_count"], minimum=0, maximum=5, precision=0)
-                        settings_cache_thinking_enabled = gr.Checkbox(label="启用思考", value=processed_cache_settings["thinking_enabled"])
-                        settings_cache_send_temperature = gr.Checkbox(label="发送温度", value=processed_cache_settings["send_temperature"])
+                        transform_model = gr.Dropdown(
+                            label="转换模型 / 模型 ID", choices=[transform_settings["model"]] if transform_settings["model"] else [],
+                            value=transform_settings["model"], allow_custom_value=True, scale=3,
+                        )
+                        transform_discover_models = gr.Button("发现转换模型", scale=1)
+                    transform_api_key = gr.Textbox(label="转换 API Key（留空则使用已保存凭据）", type="password")
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
-                        settings_cache_thinking_budget = gr.Number(label="思考预算", value=processed_cache_settings["thinking_budget"], minimum=0, maximum=262144, precision=0)
-                        settings_cache_reasoning_effort = gr.Dropdown(label="推理强度", choices=[("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high")], value=processed_cache_settings["reasoning_effort"])
-                        settings_cache_save = gr.Button("保存处理结果库参数", variant="primary")
-                    settings_cache_status = gr.Markdown(elem_classes=["lps-status"])
+                        transform_temperature = gr.Number(label="转换温度", value=transform_settings["temperature"], minimum=0, maximum=2, step=0.05)
+                        transform_top_p = gr.Number(label="转换 Top P", value=transform_settings["top_p"], minimum=0, maximum=1, step=0.01)
+                        transform_top_k = gr.Number(label="转换 Top K", value=transform_settings["top_k"], minimum=0, maximum=100000, precision=0, visible=_supports_top_k(transform_settings["provider"]))
+                        transform_max_tokens = gr.Number(label="转换最大 Token", value=transform_settings["max_tokens"], minimum=0, maximum=262144, precision=0)
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        transform_timeout = gr.Number(label="转换超时（秒）", value=transform_settings["timeout"], minimum=5, maximum=600, precision=0)
+                        transform_retry_count = gr.Number(label="转换重试次数", value=transform_settings["retry_count"], minimum=0, maximum=5, precision=0)
+                        transform_thinking_enabled = gr.Checkbox(label="转换启用思考", value=transform_settings["thinking_enabled"])
+                        transform_send_temperature = gr.Checkbox(label="转换发送温度", value=transform_settings["send_temperature"])
+                    with gr.Row(elem_classes=["lps-model-settings-row"]):
+                        transform_thinking_budget = gr.Number(label="转换思考预算", value=transform_settings["thinking_budget"], minimum=0, maximum=262144, precision=0)
+                        transform_reasoning_effort = gr.Dropdown(label="转换推理强度", choices=[("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high")], value=transform_settings["reasoning_effort"])
+                    with gr.Row(elem_classes=["lps-primary-actions"]):
+                        transform_test = gr.Button("测试转换连接")
+                        transform_save = gr.Button("保存转换配置", variant="primary")
+                        transform_clear_credentials = gr.Button("清除转换 API Key")
+                    transform_status = gr.Markdown(_credential_status(transform_settings["provider"], transform_settings["endpoint"]), elem_classes=["lps-status"])
+                # Keep the old callback names for the compact cache panel contract.
+                settings_cache_temperature = transform_temperature
+                settings_cache_top_p = transform_top_p
+                settings_cache_top_k = transform_top_k
+                settings_cache_max_tokens = transform_max_tokens
+                settings_cache_timeout = transform_timeout
+                settings_cache_retry_count = transform_retry_count
+                settings_cache_thinking_enabled = transform_thinking_enabled
+                settings_cache_send_temperature = transform_send_temperature
+                settings_cache_thinking_budget = transform_thinking_budget
+                settings_cache_reasoning_effort = transform_reasoning_effort
+                settings_cache_save = transform_save
+                settings_cache_status = transform_status
                 with gr.Row(elem_classes=["lps-primary-actions", "lps-action-bar"]):
                     test = gr.Button("测试连接", elem_id="llm_prompt_studio_test_connection")
                     save_connection = gr.Button("保存并应用", variant="primary")
@@ -7436,11 +7484,37 @@ def on_ui_tabs():
             inputs=[provider, endpoint, model, api_key, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort, top_p, top_k, fallback_provider, fallback_endpoint, fallback_api_key],
             outputs=[test_status, endpoint, model, fallback_provider, fallback_endpoint, fallback_model, weights_path, model_version],
         )
+        transform_provider.change(
+            _load_transform_provider_settings,
+            inputs=transform_provider,
+            outputs=[transform_endpoint, transform_model, transform_temperature, transform_top_p, transform_top_k,
+                     transform_max_tokens, transform_timeout, transform_retry_count, transform_thinking_enabled,
+                     transform_thinking_budget, transform_reasoning_effort, transform_send_temperature, transform_status],
+        )
+        transform_discover_models.click(
+            _discover_transform_models,
+            inputs=[transform_provider, transform_endpoint, transform_api_key, transform_timeout],
+            outputs=[transform_model, transform_status],
+        )
+        transform_test.click(
+            _test_transform_connection,
+            inputs=[transform_provider, transform_endpoint, transform_model, transform_api_key,
+                    transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature,
+                    transform_retry_count, transform_thinking_enabled, transform_thinking_budget,
+                    transform_reasoning_effort, transform_top_p, transform_top_k],
+            outputs=transform_status,
+        )
+        transform_clear_credentials.click(
+            _clear_llm_credentials,
+            inputs=[transform_provider, transform_endpoint],
+            outputs=transform_status,
+        )
         settings_cache_save.click(
-            _save_processed_cache_inference_settings,
-            inputs=[settings_cache_temperature, settings_cache_timeout, settings_cache_max_tokens, settings_cache_retry_count,
-                    settings_cache_thinking_enabled, settings_cache_thinking_budget, settings_cache_reasoning_effort,
-                    settings_cache_send_temperature, settings_cache_top_p, settings_cache_top_k],
+            _save_transform_llm_settings,
+            inputs=[transform_provider, transform_endpoint, transform_model, transform_api_key,
+                    transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature,
+                    transform_retry_count, transform_thinking_enabled, transform_thinking_budget,
+                    transform_reasoning_effort, transform_top_p, transform_top_k],
             outputs=settings_cache_status,
         )
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
@@ -7450,6 +7524,13 @@ def on_ui_tabs():
         ui.load(
             _load_active_connection_settings,
             outputs=[provider, endpoint, model, fallback_provider, fallback_endpoint, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort, test_status, top_p, top_k],
+        )
+        ui.load(
+            _load_transform_settings,
+            outputs=[transform_provider, transform_endpoint, transform_model, transform_temperature, transform_top_p,
+                     transform_top_k, transform_max_tokens, transform_timeout, transform_retry_count,
+                     transform_thinking_enabled, transform_thinking_budget, transform_reasoning_effort,
+                     transform_send_temperature, transform_status],
         )
         png_collector_pull.click(
             fn=None,
@@ -7468,7 +7549,7 @@ def on_ui_tabs():
         png_batch_selection.change(_png_batch_current, inputs=[png_batch_payload, png_batch_selection], outputs=[png_batch_selection, png_batch_current])
         png_batch_run.click(
             _png_batch_run,
-            inputs=[png_batch_payload, png_batch_action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, gr.State("faithful"), png_batch_cancel_id],
+            inputs=[png_batch_payload, png_batch_action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, transform_provider, transform_endpoint, transform_model, transform_api_key, transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count, gr.State("faithful"), png_batch_cancel_id],
             outputs=[png_batch_payload, png_batch_table, png_batch_selection, png_batch_current, png_batch_status, png_batch_selected],
         )
         png_batch_cancel.click(_cancel_png_batch, inputs=png_batch_cancel_id, outputs=png_batch_status, queue=False)
@@ -7513,10 +7594,10 @@ def on_ui_tabs():
         )
         wd_full_process.click(
             _wd14_process,
-            inputs=[image, wd_model, wd_threshold, wd_character_threshold, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature],
+            inputs=[image, wd_model, wd_threshold, wd_character_threshold, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, transform_provider, transform_endpoint, transform_model, transform_api_key, transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature],
             outputs=[wd_raw_tags, wd_tags, wd_llm_status],
         ).then(lambda value: value, inputs=preset, outputs=wd_output_mode, queue=False)
-        transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature], outputs=[wd_tags, wd_llm_status]).then(
+        transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, transform_provider, transform_endpoint, transform_model, transform_api_key, transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature], outputs=[wd_tags, wd_llm_status]).then(
             lambda value: value, inputs=preset, outputs=wd_output_mode, queue=False,
         )
         wd_save.click(_wd14_save_single, inputs=[wd_tags, base_model, wd_output_mode, *cache_filter_inputs], outputs=[wd_status, table, selected_records])

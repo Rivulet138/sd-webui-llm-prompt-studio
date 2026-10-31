@@ -432,27 +432,48 @@
 
 
     function assertActive(run) {
-        const isCurrent = run.scope === "inline"
-            ? inlineRuns[run.slot] === run
-            : run.scope === "linked"
-                ? linkedRuns[run.slot] === run
-                : state.active === run;
+        const registry = run.scope === "inline" ? inlineRuns : run.scope === "linked" ? linkedRuns : null;
+        const isCurrent = registry ? registry[run.slot] === run : state.active === run;
         if (run.cancelled || !isCurrent) throw new Error("已取消");
+    }
+
+    function baseRunState(scope, slot, target = slot) {
+        return {
+            id: createId(scope), scope, slot, target, cancelled: false,
+            abortController: null, requestId: "", forgeStarted: false, forgeTaskId: "",
+        };
+    }
+
+    function clearRunRegistry(run) {
+        const registry = run?.scope === "linked" ? linkedRuns : inlineRuns;
+        if (run && registry[run.slot] === run) registry[run.slot] = null;
+    }
+
+    function cancelRun(run, { interruptForge = false } = {}) {
+        if (!run) return;
+        cancelInlineRequest(run);
+        run.cancelled = true;
+        run.abortController?.abort();
+        if (run.scope === "linked") {
+            run.pendingNativeClick = false;
+            if (run.nativeRetryTimer != null) {
+                run.nativeRetryTimer.cancelled = true;
+                run.nativeRetryTimer = null;
+            }
+        }
+        if (interruptForge && ownsActiveForgeTask(run)) findButton(`${run.slot}_interrupt`)?.click();
     }
 
 
     function beginInlineRun(slot, target) {
         if (inlineRuns[slot] || linkedRuns[slot]) return null;
-        const run = {
-            id: createId("inline"), scope: "inline", slot, phase: "inline", target, cancelled: false,
-            forgeStarted: false, forgeTaskId: "", abortController: null,
-        };
+        const run = { ...baseRunState("inline", slot, target), phase: "inline" };
         inlineRuns[slot] = run;
         return run;
     }
 
     function finishInlineRun(run) {
-        if (inlineRuns[run.slot] === run) inlineRuns[run.slot] = null;
+        clearRunRegistry(run);
     }
 
     function freezeBasePrompt(run, target, targetInput) {
@@ -845,6 +866,10 @@
         const [slot, source] = sourceKey.split(":");
         const processed = source === "processed_cache";
         const cursors = processed ? processedCacheCursors : inlineCacheCursors;
+        // Native Cache has already committed this cursor in the backend. The
+        // browser copy is display/legacy compatibility only; the next native
+        // prepare request deliberately sends null unless the user edits the
+        // cursor field, so stale localStorage can never advance the job.
         const cursor = saveCacheCursor(slot, processed, cursorValue);
         cursors[slot] = cursor;
         run.cacheCursor = cursor;
@@ -904,7 +929,7 @@
             run.promptElement.removeEventListener?.("input", run.promptListener);
             run.promptElement.removeEventListener?.("change", run.promptListener);
         }
-        if (linkedRuns[run.slot] === run) linkedRuns[run.slot] = null;
+        clearRunRegistry(run);
     }
 
     function nativeCacheEnabled(slot) {
@@ -1197,34 +1222,48 @@
         const token = String(run?.nativeContextToken || "").trim();
         if (!token) return;
         try {
-            const response = await studioFetch("/llm-prompt-studio/v1/native-cache/release", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                cache: "no-store",
-                body: JSON.stringify({ token, commit: Boolean(commit) }),
-            });
-            if (!response.ok) throw new Error(`释放缓存生图上下文失败：HTTP ${response.status}`);
-            let data = null;
-            try { data = await response.json(); } catch { data = null; }
-            if (commit && data?.committed !== true) {
-                throw new Error("后端尚未确认缓存批次完成，请等待 Forge 完成后刷新读取进度");
-            }
-            if (data?.committed === true) {
-                const cursor = normalizeCacheCursor(data.next_cursor, null);
-                const count = normalizeCacheCursor(data.completed_count, null);
-                if (cursor == null || count == null) throw new Error("后端完成进度无效，请刷新读取进度");
-                run.pendingCacheCursor = cursor;
-                run.activeCacheCursor = cursor;
-                run.nativeCompletedCount = count;
-                const sourceKey = run.activeCacheSource || run.pendingCacheSource;
-                if (sourceKey) {
-                    const [slot, source] = sourceKey.split(":");
-                    const ui = nativeCacheUiState(slot);
-                    if (ui.snapshot) ui.snapshot.cursors[source] = cursor;
+            // Forge can hide its busy controls before the native postprocess
+            // callback commits the cache job. Retry only that transient active
+            // state so a successful render is not reported as a backend error.
+            const maxReleasePolls = 20;
+            for (let attempt = 0; attempt < maxReleasePolls; attempt += 1) {
+                const response = await studioFetch("/llm-prompt-studio/v1/native-cache/release", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    cache: "no-store",
+                    body: JSON.stringify({ token, commit: Boolean(commit) }),
+                });
+                if (!response.ok) throw new Error(`释放缓存生图上下文失败：HTTP ${response.status}`);
+                let data = null;
+                try { data = await response.json(); } catch { data = null; }
+                if (commit && data?.committed !== true) {
+                    if (data?.state === "active" && attempt + 1 < maxReleasePolls) {
+                        await wait(250);
+                        continue;
+                    }
+                    throw new Error("Forge 尚未完成最后的图片保存");
                 }
+                if (!commit && data?.state === "active" && attempt + 1 < maxReleasePolls) {
+                    await wait(250);
+                    continue;
+                }
+                if (data?.committed === true) {
+                    const cursor = normalizeCacheCursor(data.next_cursor, null);
+                    const count = normalizeCacheCursor(data.completed_count, null);
+                    if (cursor == null || count == null) throw new Error("后端完成进度无效，请刷新读取进度");
+                    run.pendingCacheCursor = cursor;
+                    run.activeCacheCursor = cursor;
+                    run.nativeCompletedCount = count;
+                    const sourceKey = run.activeCacheSource || run.pendingCacheSource;
+                    if (sourceKey) {
+                        const [slot, source] = sourceKey.split(":");
+                        const ui = nativeCacheUiState(slot);
+                        if (ui.snapshot) ui.snapshot.cursors[source] = cursor;
+                    }
+                }
+                run.nativeContextToken = "";
+                return data;
             }
-            run.nativeContextToken = "";
-            return data;
         } catch (error) {
             if (!commit) run.nativeContextToken = "";
             if (commit) throw error;
@@ -1245,14 +1284,14 @@
             return existing;
         }
         const run = {
-            scope: "linked", slot, target: slot, cancelled: false, busy: false, count: 0, completed: 0,
+            ...baseRunState("linked", slot), busy: false, count: 0, completed: 0,
             native: true, config: normalizedConfig, basePrompt: currentPrompt,
             lastWrittenPrompt: currentPrompt,
             promptEdited: false, promptElement: null, promptListener: null,
             cacheCursorOverride: normalizedConfig.cacheCursor, cacheCursorSource: "", cacheCursor: 0,
             pendingCacheCursor: null, pendingCacheSource: "", activeCacheCursor: null, activeCacheSource: "",
-            abortController: null, requestId: "", pendingNativeClick: false, nativeRetryTimer: null, forgeLaunching: false,
-            forgeStarted: false, forgeTaskId: "", lastCompletedForgeTaskId: lastCompletedForgeTaskIds[slot], nativeContextToken: "", nativeImageCount: 0,
+            pendingNativeClick: false, nativeRetryTimer: null, forgeLaunching: false,
+            lastCompletedForgeTaskId: lastCompletedForgeTaskIds[slot], nativeContextToken: "", nativeImageCount: 0,
             nativeClaimSuffix: "", nativeClaimPrompt: "",
         };
         run.promptElement = input(`${slot}_prompt`);
@@ -1274,16 +1313,8 @@
         const normalizedSlot = slot === "img2img" ? "img2img" : "txt2img";
         const run = linkedRuns[normalizedSlot];
         if (!run) return;
-        cancelInlineRequest(run);
-        run.cancelled = true;
-        run.abortController?.abort();
-        run.pendingNativeClick = false;
-        if (run.nativeRetryTimer != null) {
-            run.nativeRetryTimer.cancelled = true;
-            run.nativeRetryTimer = null;
-        }
-        if (interruptForge && ownsActiveForgeTask(run)) findButton(`${normalizedSlot}_interrupt`)?.click();
-        renderInline(normalizedSlot, "warning", "缓存 Prompt 生图已停止", "后端保留已完成图片的读取进度，请等待 Forge 结束后刷新确认");
+        cancelRun(run, { interruptForge });
+        renderInline(normalizedSlot, "warning", "缓存生图已停止", "正在保存已经完成的图片");
         if (!run.busy) finishLinkedRun(run);
     }
 
@@ -1353,7 +1384,7 @@
         }
         let completed = false;
         try {
-            renderInline(slot, "warning", `正在准备${inlineSourceName(config)}缓存批次`, "每张图使用一条缓存，等待 Forge 原生 Generate");
+            renderInline(slot, "warning", "正在准备缓存生图", "即将交给 Forge 处理");
             await requestNativeCacheContext(config, run);
             assertActive(run);
             run.activeCacheCursor = run.pendingCacheCursor;
@@ -1368,8 +1399,8 @@
             completed = count > 0;
             const partial = count < run.nativeImageCount;
             if (!completed) run.pendingNativeClick = false;
-            renderInline(slot, partial ? "warning" : "success", partial ? "本批仅完成部分图片" : "本批生图完成",
-                count + ' / ' + run.nativeImageCount + ' 张图 · 后端已保存读取进度 ID ' + run.cacheCursor);
+            renderInline(slot, partial ? "warning" : "success", partial ? "已停止，部分图片已保存" : "本批生图完成",
+                count + ' / ' + run.nativeImageCount + ' 张图片 · 可以继续生成');
         } catch (error) {
             const message = String(error?.message || error);
             run.pendingNativeClick = false;
@@ -1379,10 +1410,16 @@
                 run.completed += released.completed_count;
             }
             const progress = released?.committed === true
-                ? released.completed_count + ' / ' + run.nativeImageCount + ' 张图 · 后端已保存读取进度 ID ' + run.cacheCursor
-                : "后端可能仍在完成生图并自动保存已完成图片的读取进度，请等待 Forge 结束后刷新确认";
-            renderInline(slot, message === "已取消" ? "warning" : "error", "缓存 Prompt 生图已停止",
-                message + ' · ' + progress + (run.nativeReleaseError ? ' · ' + run.nativeReleaseError : ''));
+                ? released.completed_count + ' / ' + run.nativeImageCount + ' 张图片已保存 · 可以继续生成'
+                : run.cancelled
+                    ? "Forge 正在保存已经完成的图片，完成后缓存位置会自动更新"
+                    : message + " · 请检查 Forge 状态后重试";
+            renderInline(
+                slot,
+                released?.committed === true || run.cancelled ? "warning" : "error",
+                released?.committed === true ? "已停止，部分图片已保存" : run.cancelled ? "正在完成停止" : "本批生图未完成",
+                progress,
+            );
             discardPendingInlineCache(run);
         } finally {
             if (!completed) discardPendingInlineCache(run);
@@ -1525,17 +1562,11 @@
         const linked = linkedRuns[normalizedSlot];
         if (!run && !linked) return "当前没有该面板的 Prompt 任务";
         if (run) {
-            cancelInlineRequest(run);
-            run.cancelled = true;
-            run.abortController?.abort();
-            if (run.target) {
-                const interrupt = find(`${run.target}_interrupt`);
-                if (interrupt && ownsActiveForgeTask(run)) interrupt.click();
-            }
+            cancelRun(run, { interruptForge: true });
         }
         if (linked) {
             stopLinkedRun(normalizedSlot, true);
-            return "缓存 Prompt 生图已停止 · 后端保留已完成图片的读取进度，请等待 Forge 结束后刷新确认";
+            return "缓存生图已停止 · 正在保存已经完成的图片";
         }
         renderInline(normalizedSlot, "warning", "Prompt 任务已停止", run?.unlimited ? `无限 · 已完成 ${run.completed} 条` : "");
         return "Prompt 任务已停止";
@@ -1652,12 +1683,19 @@
         serverQueueWatchers.clear();
         const watcher = { cancelled: false };
         serverQueueWatchers.set(id, watcher);
+        let consecutiveFailures = 0;
         while (!watcher.cancelled) {
             try {
                 const response = await studioFetch(`/llm-prompt-studio/v1/queue/${encodeURIComponent(id)}`, { cache: "no-store" });
-                if (!response.ok) throw new Error(`服务端队列 HTTP ${response.status}`);
+                if (!response.ok) {
+                    const error = new Error(`服务端队列 HTTP ${response.status}`);
+                    error.retryable = response.status === 408 || response.status === 425
+                        || response.status === 429 || response.status >= 500;
+                    throw error;
+                }
                 const snapshot = await response.json();
                 if (watcher.cancelled) break;
+                consecutiveFailures = 0;
                 renderServerQueue(snapshot);
                 const counts = snapshot.counts || {};
                 const total = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
@@ -1668,8 +1706,18 @@
                 if (watcher.cancelled) break;
                 const statusHost = find("llm_prompt_studio_server_queue_status");
                 if (statusHost) statusHost.innerHTML = escapeHtml(`服务端队列轮询失败：${error?.message || error}`);
+                consecutiveFailures += 1;
+                const permanentFailure = error?.retryable === false
+                    || String(error?.message || error).includes("认证失败");
+                if (permanentFailure || consecutiveFailures >= 5) {
+                    if (statusHost) statusHost.innerHTML = escapeHtml(`服务端队列轮询已停止：${error?.message || error}`);
+                    break;
+                }
             }
-            await wait(1000);
+            const delay = consecutiveFailures
+                ? Math.min(1000 * (2 ** (consecutiveFailures - 1)), 8000)
+                : 1000;
+            await wait(delay);
         }
         if (serverQueueWatchers.get(id) === watcher) serverQueueWatchers.delete(id);
         return String(find("llm_prompt_studio_server_queue_status")?.textContent || "服务端队列已结束");

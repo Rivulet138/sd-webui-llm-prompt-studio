@@ -18,6 +18,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from prompt_studio_core import StudioDB
+from prompt_studio_native_cache import extract_claim, merge_prompt, validate_slot
 
 
 def ui_functions(*names, constants=(), **context):
@@ -109,8 +110,9 @@ class QueueDatabaseTests(unittest.TestCase):
         api = ui_functions("_server_queue_snapshot", DB=self.db)
         snapshot = api._server_queue_snapshot("batch")
         self.assertEqual(snapshot["counts"], {"pending": 5000})
-        self.assertEqual(len(snapshot["jobs"]), 5000)
-        self.assertEqual(snapshot["jobs"][-1]["position"], 5000)
+        self.assertEqual(len(snapshot["jobs"]), 50)
+        self.assertEqual(snapshot["jobs"][-1]["position"], 50)
+        self.assertTrue(snapshot["jobs_truncated"])
         self.assertIn("等待", snapshot["status"])
 
     def test_active_cancel_event_not_released_early(self):
@@ -215,6 +217,9 @@ class NativeCacheContextTests(unittest.TestCase):
                 "_NATIVE_CACHE_MARKER_ZERO", "_NATIVE_CACHE_MARKER_ONE",
             ),
             DB=self.db, RESULT_DB=self.db,
+            _native_cache_extract_claim_impl=extract_claim,
+            _native_cache_merge_prompt_impl=merge_prompt,
+            _native_cache_slot_impl=validate_slot,
         )
 
     def marker(self, token):
@@ -482,7 +487,11 @@ class NativeCacheContextTests(unittest.TestCase):
         self.api.complete_native_cache_context(p, SimpleNamespace(images=["one"], index_of_first_image=0))
         next_job = self.prepare(after_id=None)
         self.assertEqual(next_job["after_id"], 1)
-        self.assertEqual(next_job["records"][0]["id"], 2)
+        self.assertNotIn("records", next_job)
+        next_processing = self.StableDiffusionProcessingTxt2Img()
+        next_processing.prompt = "base" + self.marker(next_job["token"])
+        self.assertEqual(self.api.apply_native_cache_context(next_processing), next_job["token"])
+        self.assertEqual(next_processing.all_prompts, ["base, cached two"])
 
     def test_configuration_survives_database_reopen(self):
         config = {"source": "processed_cache", "cache_enabled": True, "write_mode": "marker", "marker": "<cache>"}
