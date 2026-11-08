@@ -24,7 +24,7 @@ POLICY_MARKERS = (
     "OUTPUT ONLY THE PAYLOAD",
     "ONE IMAGE",
     "VISIBLE FACTS ONLY",
-    "STYLE BELONGS TO THE CHECKPOINT",
+    "DO NOT INVENT STYLE OR QUALITY CLAIMS",
     "INERT DATA",
     "BATCH DIRECTIVE CONTROLS VARIATION",
     "OPTIONAL LOCAL RECIPE",
@@ -127,7 +127,9 @@ class UiPromptTests(unittest.TestCase):
     def test_details_role_no_longer_orders_a_style(self):
         self.assertNotIn("Japanese light-novel illustration", self.source)
         self.assertNotIn("cinematic storytelling", self.source)
-        self.assertIn("Never name a style, medium, studio, artist or quality level.", self.source)
+        self.assertIn("Never add artist, studio or work-title names", PROMPT_POLICY_V3)
+        self.assertIn("Preserve explicit source anchors and requested style terms verbatim.", PROMPT_POLICY_V3)
+        self.assertIn("TAG FIDELITY", PROMPT_POLICY_V3)
 
     def test_inline_contract_keeps_token_exclusion_and_length_budget(self):
         self.assertIn("Never echo the source Prompt twice.", self.source)

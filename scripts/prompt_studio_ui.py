@@ -25,7 +25,10 @@ from prompt_studio_tagger_models import MODEL_CATALOG, download_links, download_
 from prompt_studio_image_batch import ImageBatchJob
 from prompt_studio_lexicon_sampling import sample_references as _sample_lexicon_references
 from prompt_studio_lexicon_sampling import sample_terms as _sample_lexicon_terms_impl
-from prompt_studio_generation import run_llm_generation as _run_llm_generation_impl
+from prompt_studio_generation import (
+    CandidateQualityError,
+    run_llm_generation as _run_llm_generation_impl,
+)
 from prompt_studio_native_cache import extract_claim as _native_cache_extract_claim_impl
 from prompt_studio_native_cache import merge_prompt as _native_cache_merge_prompt_impl
 from prompt_studio_native_cache import validate_slot as _native_cache_slot_impl
@@ -3323,6 +3326,32 @@ def _finalize_generated_prompt(
     if str(safety or "").strip().upper() == "SFW" and not is_sfw_output(result):
         raise ValueError("SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。")
     if preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
+        tag_error = None
+        if result.endswith(",") or ";" in result:
+            tag_error = "纯标签输出包含尾随逗号或分号。"
+        for raw_tag in (item.strip() for item in result.split(",") if item.strip()):
+            if raw_tag.count("(") != raw_tag.count(")") or raw_tag.count("[") != raw_tag.count("]"):
+                tag_error = "纯标签输出包含未闭合的权重或强调括号。"
+                break
+            if ":" in raw_tag and not raw_tag.startswith(("<lora:", "<lyco:", "<hypernet:")):
+                weighted = re.fullmatch(
+                    r"\(\s*[^(),:]+?\s*:\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*\)",
+                    raw_tag,
+                    re.IGNORECASE,
+                )
+                if weighted is None:
+                    tag_error = "纯标签输出包含无法解析的冒号或权重语法。"
+                    break
+            word_count = len(re.findall(r"[A-Za-z]+", raw_tag))
+            if word_count >= 12 and re.search(r"[.!?]$", raw_tag):
+                tag_error = "纯标签输出混入了完整自然语言句子。"
+                break
+        if tag_error:
+            candidate_quality_error = globals().get("CandidateQualityError", ValueError)
+            raise candidate_quality_error(tag_error)
+        canonicalizer = globals().get("canonicalize_booru_tags")
+        if callable(canonicalizer):
+            result = canonicalizer(result).get("text", result)
         result = process_tags(
             result,
             _coerce_bool(remove_bad, True),
@@ -3503,7 +3532,7 @@ def _run_llm_generation(
     finalize_result, runtime_connection, request_temperature, timeout, max_tokens,
     send_temperature, cancel_event=None, preserve_inference_settings=False,
     gate_context=None, retry_limit=0, similarity_limit=_MAX_CONTENT_SIMILARITY,
-    retry_empty_result=False,
+    retry_empty_result=False, candidate_quality=None,
 ):
     """Compatibility wrapper around the standalone generation kernel."""
     return _run_llm_generation_impl(
@@ -3515,7 +3544,83 @@ def _run_llm_generation(
         coerce_bool=_coerce_bool, fallback_request_kwargs=_fallback_request_kwargs,
         worst_content_similarity=_worst_content_similarity,
         max_response_retries=_MAX_RESPONSE_RETRIES,
+        candidate_quality=candidate_quality,
     )
+
+
+def _prompt_quality_score(source: str, candidate: str, preset: str, base_model: str = "") -> float:
+    """Reject contract violations and weakly rank tag normalization, not image quality."""
+    text = str(candidate or "").strip()
+    if not text or "\n" in text:
+        return float("-inf")
+    lowered = text.casefold()
+    if any(marker in lowered for marker in ("let me ", "here is", "as an ai", "corrected prompt")):
+        return float("-inf")
+
+    score = 0.0
+    preset = _canonical_preset(preset)
+    tag_mode = preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags", "Danbooru + Natural"}
+    if tag_mode:
+        canonicalizer = globals().get("canonicalize_booru_tags")
+        if callable(canonicalizer):
+            canonical = canonicalizer(text)
+            tags = canonical.get("tags") or []
+            normalized_tags = [
+                re.sub(r"\s+", "_", str(tag).strip()).casefold()
+                for tag in tags if str(tag).strip()
+            ]
+            if len(normalized_tags) != len(set(normalized_tags)):
+                return float("-inf")
+            if canonical.get("dictionary_found"):
+                unknown = canonical.get("unknown") or []
+                if tags:
+                    score += 2.5 * (1.0 - (len(unknown) / len(tags)))
+                    score -= min(2.0, len(unknown) * 0.12)
+        parts = [item.strip() for item in text.split(",") if item.strip()]
+        if text.endswith(",") or ";" in text:
+            return float("-inf")
+        if any(item.count("(") != item.count(")") or item.count("[") != item.count("]") for item in parts):
+            return float("-inf")
+        weighted_tag_re = re.compile(
+            r"^\(\s*([^(),:]+?)\s*:\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*\)$",
+            re.IGNORECASE,
+        )
+        quality_keys = []
+        for item in parts:
+            probe = item
+            weighted = weighted_tag_re.fullmatch(item)
+            if weighted:
+                probe = weighted.group(1).strip()
+            elif ":" in item and not item.startswith(("<lora:", "<lyco:", "<hypernet:")):
+                return float("-inf")
+            probe = probe.strip("[]() ")
+            if canonicalizer is callable:
+                canonical_probe = canonicalizer(probe)
+                canonical_values = canonical_probe.get("tags") or []
+                probe = canonical_values[0] if canonical_values else probe
+            quality_keys.append(re.sub(r"\s+", "_", probe).casefold())
+        if len(quality_keys) != len(set(quality_keys)):
+            return float("-inf")
+        if base_model in {"Pony / Illustrious", "NoobAI"}:
+            has_supplied_score_anchor = bool(re.search(r"\bscore_[a-z0-9_]+\b", str(source or ""), re.IGNORECASE))
+            if not has_supplied_score_anchor and any(re.search(r"\bscore_[a-z0-9_]+\b", item, re.IGNORECASE) for item in parts):
+                return float("-inf")
+        if any(len(re.findall(r"[A-Za-z]+", item)) > 5 for item in parts):
+            score -= 2.0
+        if any(term in lowered for term in ("masterpiece", "best quality", "ultra detailed", "8k", "artstation")):
+            score -= 1.25
+
+    fixed_match = re.search(
+        r"FIXED PROMPT \(IMMUTABLE\):\n(.*?)(?:\n\nINLINE VARIATION REQUEST:|\n\nTECHNICAL TOKENS|$)",
+        str(source or ""),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if fixed_match:
+        for token in _immutable_technical_tokens(fixed_match.group(1)):
+            if token.casefold() not in text.casefold():
+                return float("-inf")
+        score += 8.0
+    return score
 
 
 def _generate(
@@ -3602,6 +3707,11 @@ def _generate(
                       "and make a meaningful, source-compatible change in action, setting or composition. "
                       "Recipe hints and variation lenses remain optional; do not add clutter to satisfy them."
                 )
+            elif reason == "quality":
+                retry_directive = effective_batch_directive + (
+                    "\nQUALITY RETRY: the previous result violated the output contract or dropped a fixed technical token. "
+                    "Return one valid payload, preserving every required technical token exactly."
+                )
             else:
                 retry_directive = effective_batch_directive + "\nRESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise result directly and do not spend output on analysis or reasoning."
             return build_system_prompt(
@@ -3609,6 +3719,11 @@ def _generate(
                 static_tags, system_override, retry_directive, operation_instruction,
             )
 
+        quality_checker = globals().get("_prompt_quality_score")
+        candidate_quality = (
+            (lambda original, candidate: quality_checker(original, candidate, preset, base_model))
+            if callable(quality_checker) else None
+        )
         result, system, diversity_retries_used = _run_llm_generation(
             source, provider, endpoint, model, api_key, system, build_retry_system,
             lambda raw: _finalize_generated_prompt(
@@ -3617,6 +3732,7 @@ def _generate(
             ), runtime_connection, request_temperature, timeout, max_tokens,
             send_temperature, cancel_event, preserve_inference_settings,
             gate_context, retry_limit, similarity_limit,
+            candidate_quality=candidate_quality,
         )
     except LLMRequestError as error:
         if str(error) == "LLM request cancelled":
@@ -3783,12 +3899,23 @@ def _expand_or_polish(
                     "setting, action, prop relationship, spatial layout, camera angle, time/weather and "
                     "visible daily-life context, follow the required output contract and return exactly one result."
                 )
+            elif reason == "quality":
+                retry_directive = (
+                    f"{directive}\nQUALITY RETRY {attempt}: the previous result violated the output contract "
+                    "or dropped a fixed technical token. Return exactly one valid result and preserve each "
+                    "required technical token verbatim."
+                )
             else:
                 retry_directive = ""
             retry_directive += "\nRESPONSE RETRY: return one concise result directly and do not spend output on analysis or reasoning."
             return build_transform_system(retry_directive)
 
         finalize_preset = "Krea 2 Natural" if use_fixed_krea_polish else preset
+        quality_checker = globals().get("_prompt_quality_score")
+        candidate_quality = (
+            (lambda original, candidate: quality_checker(original, candidate, finalize_preset, base_model))
+            if callable(quality_checker) else None
+        )
         result, _final_system, diversity_retries_used = _run_llm_generation(
             source, provider, endpoint, model, api_key, system, build_retry_system,
             lambda raw: _finalize_generated_prompt(
@@ -3797,6 +3924,7 @@ def _expand_or_polish(
             ), runtime_connection, request_temperature, timeout, max_tokens,
             send_temperature, cancel_event, preserve_inference_settings,
             gate_context, retry_limit, similarity_limit, retry_empty_result=True,
+            candidate_quality=candidate_quality,
         )
         if result and directive:
             try:

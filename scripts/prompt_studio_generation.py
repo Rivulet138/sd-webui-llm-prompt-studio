@@ -1,5 +1,11 @@
 """Shared provider call/retry loop used by generation and transformations."""
 
+import math
+
+
+class CandidateQualityError(ValueError):
+    """A provider response is malformed but safe to replace with another candidate."""
+
 
 def run_llm_generation(
     source, provider, endpoint, model, api_key, initial_system, build_retry_system,
@@ -8,7 +14,7 @@ def run_llm_generation(
     gate_context=None, retry_limit=0, similarity_limit=0.82,
     retry_empty_result=False, credentials=None, call_llm=None,
     build_user_message=None, coerce_bool=None, fallback_request_kwargs=None,
-    worst_content_similarity=None, max_response_retries=2,
+    worst_content_similarity=None, max_response_retries=2, candidate_quality=None,
 ):
     """Run one provider request with response retries and diversity gating.
 
@@ -23,6 +29,9 @@ def run_llm_generation(
     accepted = ""
     best_candidate = ""
     best_score = -1.0
+    best_quality = float("-inf")
+    quality_failures = 0
+    quality_passes = 0
     retry_reason = ""
     diversity_retries_used = 0
     attempt = 0
@@ -52,8 +61,34 @@ def run_llm_generation(
             retry_reason = "response"
             attempt += 1
             continue
-        candidate = str(finalize_result(raw_result) or "").strip()
+        raw_candidate = str(raw_result or "").strip()
         system = attempt_system
+        quality = None
+        if candidate_quality is not None:
+            try:
+                quality = float(candidate_quality(source, raw_candidate))
+            except (TypeError, ValueError):
+                quality = float("-inf")
+            if not math.isfinite(quality):
+                quality_failures += 1
+                result = ""
+                if attempt >= max_response_retries:
+                    break
+                retry_reason = "quality"
+                attempt += 1
+                continue
+        try:
+            candidate = str(finalize_result(raw_candidate) or "").strip()
+        except CandidateQualityError:
+            quality_failures += 1
+            result = ""
+            if attempt >= max_response_retries:
+                break
+            retry_reason = "quality"
+            attempt += 1
+            continue
+        if candidate_quality is not None:
+            quality_passes += 1
         if not candidate and retry_empty_result:
             if attempt >= max_response_retries:
                 result = candidate
@@ -65,7 +100,10 @@ def run_llm_generation(
         if not context:
             break
         score = worst_content_similarity(candidate, context, source)
-        if best_candidate == "" or score < best_score:
+        if candidate_quality is not None:
+            if best_candidate == "" or quality > best_quality or (quality == best_quality and score < best_score):
+                best_candidate, best_quality, best_score = candidate, quality, score
+        elif best_candidate == "" or score < best_score:
             best_candidate, best_score = candidate, score
         if score < similarity_limit:
             accepted = candidate
@@ -79,4 +117,6 @@ def run_llm_generation(
         result = accepted
     elif best_candidate:
         result = best_candidate
+    elif candidate_quality is not None and quality_failures and not quality_passes:
+        raise CandidateQualityError("所有 LLM 候选均未通过质量校验。")
     return result, system, diversity_retries_used
