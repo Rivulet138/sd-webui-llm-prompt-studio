@@ -35,6 +35,7 @@ PROCESSED_DB_PATH = DATA_DIR / "processed_prompt_cache.db"
 CREDENTIALS_PATH = DATA_DIR / "credentials" / "llm_credentials.json"
 DEFAULT_WILDCARDS = ROOT / "assets" / "wildcards"
 DEFAULT_RANBOORU_CACHE = ROOT.parent / "sd-webui-ranbooru-reforge" / "user" / "cache" / "tag_cache.db"
+DEFAULT_BOORU_DICTIONARY = ROOT.parent / "a1111-sd-webui-tagcomplete" / "tags" / "danbooru.csv"
 RANBOORU_CONTENT_MODES = {"tags", "natural", "both"}
 RANBOORU_RATING_FILTERS = {"all", "sfw", "nsfw"}
 MAX_RANBOORU_SOURCE_RECORDS = 100000
@@ -256,6 +257,176 @@ def discover_ranbooru_cache() -> Path:
     return DEFAULT_RANBOORU_CACHE
 
 
+def discover_booru_vocabulary_path(
+    dictionary_path: str | Path | None = None,
+) -> Path | None:
+    """Find a Danbooru CSV vocabulary, honoring explicit and environment paths."""
+    if dictionary_path is not None:
+        explicit = Path(str(dictionary_path)).expanduser()
+        return explicit.resolve() if explicit.is_file() else None
+
+    candidates: list[Path] = []
+    for env_name in ("DANBOORU_TAG_DICTIONARY", "BOORU_TAG_DICTIONARY"):
+        configured = os.environ.get(env_name, "").strip().strip('"')
+        if configured:
+            candidates.append(Path(configured).expanduser())
+    candidates.extend((DEFAULT_BOORU_DICTIONARY, ROOT / "tags" / "danbooru.csv"))
+    try:
+        for extension in ROOT.parent.iterdir():
+            if extension.is_dir() and "tagcomplete" in extension.name.casefold():
+                candidates.append(extension / "tags" / "danbooru.csv")
+    except OSError:
+        pass
+
+    for candidate in dict.fromkeys(path.resolve() for path in candidates):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _normalize_booru_lookup(value: Any) -> str:
+    text = str(value or "").strip().casefold()
+    return re.sub(r"\s+", "_", text)
+
+
+BOORU_CATEGORY_NAMES = {
+    0: "general",
+    1: "artist",
+    3: "copyright",
+    4: "character",
+    5: "meta",
+}
+
+
+def load_booru_vocabulary_metadata(
+    dictionary_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Load canonical tags, aliases, categories and frequencies from tagcomplete CSV."""
+    path = discover_booru_vocabulary_path(dictionary_path)
+    if path is None:
+        return {"lookup": {}, "categories": {}, "frequencies": {}, "dictionary_path": None}
+
+    lookup: dict[str, str] = {}
+    categories: dict[str, str] = {}
+    frequencies: dict[str, int] = {}
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as source:
+            for row in csv.reader(source):
+                if not row:
+                    continue
+                canonical = row[0].strip()
+                if not canonical:
+                    continue
+                canonical_key = _normalize_booru_lookup(canonical)
+                if not canonical_key:
+                    continue
+                lookup[canonical_key] = canonical
+                try:
+                    category_id = int(row[1]) if len(row) > 1 and row[1].strip() else -1
+                except (TypeError, ValueError):
+                    category_id = -1
+                categories[canonical] = BOORU_CATEGORY_NAMES.get(category_id, "unknown")
+                try:
+                    frequencies[canonical] = int(row[2]) if len(row) > 2 and row[2].strip() else 0
+                except (TypeError, ValueError):
+                    frequencies[canonical] = 0
+                if len(row) > 3:
+                    for alias in row[3].split(","):
+                        alias_key = _normalize_booru_lookup(alias)
+                        if alias_key:
+                            lookup[alias_key] = canonical
+    except (OSError, csv.Error):
+        return {"lookup": {}, "categories": {}, "frequencies": {}, "dictionary_path": None}
+    return {
+        "lookup": lookup,
+        "categories": categories,
+        "frequencies": frequencies,
+        "dictionary_path": str(path),
+    }
+
+
+def load_booru_vocabulary(
+    dictionary_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Load canonical and alias lookups from tagcomplete's headerless CSV.
+
+    The vocabulary intentionally does not load or expand tag implications.
+    """
+    return load_booru_vocabulary_metadata(dictionary_path)["lookup"]
+
+
+def booru_alias_to_canonical(tag: str, vocabulary: dict[str, str]) -> str | None:
+    """Return the canonical spelling for a known tag, or None if unknown."""
+    return vocabulary.get(_normalize_booru_lookup(tag))
+
+
+def canonicalize_booru_tags(
+    tags: str | Iterable[str],
+    vocabulary: dict[str, str] | None = None,
+    dictionary_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Canonicalize known vocabulary entries while preserving unknown tags.
+
+    This is vocabulary adaptation, not prompt cleanup: it preserves ordering and
+    duplicates, leaves unknown text untouched, and never expands implications.
+    """
+    dictionary_found = vocabulary is not None
+    metadata: dict[str, Any] | None = None
+    resolved_path: Path | None = None
+    if vocabulary is None:
+        metadata = load_booru_vocabulary_metadata(dictionary_path)
+        resolved_path = Path(metadata["dictionary_path"]) if metadata.get("dictionary_path") else None
+        dictionary_found = bool(metadata.get("lookup"))
+        vocabulary = metadata.get("lookup") or {}
+    elif dictionary_path is not None:
+        metadata = load_booru_vocabulary_metadata(dictionary_path)
+        resolved_path = Path(metadata["dictionary_path"]) if metadata.get("dictionary_path") else None
+
+    category_lookup = (metadata or {}).get("categories") or {}
+
+    items = tags.split(",") if isinstance(tags, str) else tags
+    canonical_tags: list[str] = []
+    categories: list[str] = []
+    unknown: list[dict[str, Any]] = []
+    duplicates: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
+    for index, raw_tag in enumerate(items):
+        original = str(raw_tag or "").strip()
+        if not original:
+            continue
+        canonical = booru_alias_to_canonical(original, vocabulary)
+        if canonical is None:
+            canonical_tags.append(original)
+            unknown.append({
+                "index": index,
+                "tag": original,
+                "normalized": _normalize_booru_lookup(original),
+            })
+        else:
+            canonical_tags.append(canonical)
+        categories.append(category_lookup.get(canonical or original, "unknown"))
+        normalized = _normalize_booru_lookup(canonical or original)
+        if normalized in seen:
+            duplicates.append({
+                "index": index,
+                "tag": original,
+                "canonical": canonical or original,
+                "first_index": seen[normalized],
+            })
+        else:
+            seen[normalized] = index
+
+    return {
+        "tags": canonical_tags,
+        "categories": categories,
+        "text": ", ".join(canonical_tags),
+        "unknown": unknown,
+        "duplicates": duplicates,
+        "dictionary_path": str(resolved_path) if resolved_path else None,
+        "dictionary_found": dictionary_found,
+    }
+
+
 def load_ranbooru_cache(
     database_path: str | Path,
     content_mode: str = "both",
@@ -321,8 +492,12 @@ def load_ranbooru_cache(
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         total_sources = int(connection.execute(f"SELECT COUNT(*) FROM tags{where}", params).fetchone()[0])
         effective_limit = requested_limit or MAX_RANBOORU_SOURCE_RECORDS
+        order_by = (
+            "CAST(COALESCE(score, 0) AS INTEGER) DESC, id ASC"
+            if "score" in columns else "id ASC"
+        )
         rows = connection.execute(
-            f"SELECT {', '.join(select_fields)} FROM tags{where} ORDER BY id ASC LIMIT ?",
+            f"SELECT {', '.join(select_fields)} FROM tags{where} ORDER BY {order_by} LIMIT ?",
             (*params, effective_limit),
         ).fetchall()
     finally:

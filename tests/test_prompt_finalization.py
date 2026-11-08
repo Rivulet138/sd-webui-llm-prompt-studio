@@ -7,7 +7,7 @@ import unittest
 TEST_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(TEST_ROOT))
 sys.path.insert(0, str(TEST_ROOT.parent / "scripts"))
-from prompt_studio_core import is_sfw_output, process_tags, regional_format
+from prompt_studio_core import canonicalize_booru_tags, is_sfw_output, process_tags, regional_format
 from test_queue_regressions import ui_functions
 
 
@@ -20,6 +20,9 @@ class PromptFinalizationTests(unittest.TestCase):
             _canonical_output_mode=lambda value: str(value or "").strip(),
             is_sfw_output=is_sfw_output,
             process_tags=process_tags,
+            canonicalize_booru_tags=lambda tags: canonicalize_booru_tags(
+                tags, vocabulary={"red_hair": "red_hair", "1girl": "1girl"}
+            ),
             regional_format=regional_format,
         )
 
@@ -69,6 +72,21 @@ class PromptFinalizationTests(unittest.TestCase):
         payload = json.loads(result)
         self.assertEqual(payload["base_prompt"], "1girl, blue_eyes")
         self.assertEqual(len(payload["regions"]), 2)
+
+    def test_known_booru_aliases_are_canonicalized_before_deduplication(self):
+        result = self.api._finalize_generated_prompt(
+            "1girl, red hair, red_hair, unknown custom tag",
+            "Danbooru Tags",
+            "NSFW",
+            False,
+            "",
+            False,
+            False,
+            0,
+            "Plain Prompt",
+            1,
+        )
+        self.assertEqual(result, "1girl, red_hair, unknown custom tag")
 
     def test_sfw_and_meta_content_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "SFW"):

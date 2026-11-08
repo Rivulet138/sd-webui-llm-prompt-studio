@@ -45,7 +45,7 @@ from prompt_studio_core import (
     BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, MODEL_QUALITY_GUIDANCE, PRESETS, PROCESSED_DB_PATH, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_system_prompt, build_user_message, build_operation_instruction, call_llm, get_provider_profile, is_sfw_output,
     LLMRequestError, discover_provider_models,
-    discover_ranbooru_cache, load_ranbooru_cache, process_tags,
+    discover_ranbooru_cache, load_ranbooru_cache, process_tags, canonicalize_booru_tags,
     regional_format, validate_endpoint, normalize_sampling, _cosine, _tokens,
 )
 
