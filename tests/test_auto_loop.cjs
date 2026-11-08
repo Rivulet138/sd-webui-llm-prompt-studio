@@ -13,7 +13,7 @@ function harness(options = {}) {
     const workerMessages = [];
     const nativeTimer = (callback, ms) => {
         timers.push(ms);
-        return setTimeout(callback, 0);
+        return options.suspendNativeTimers ? 1 : setTimeout(callback, 0);
     };
     const window = {
         localStorage: {
@@ -510,7 +510,7 @@ test("hidden-page waits use only the plugin Worker scheduler", async () => {
     assert.equal(h.timers.length, count + 1);
 });
 
-test("visible or Worker-unsupported waits retain native scheduling", async () => {
+test("Worker-unsupported waits retain native scheduling in either visibility state", async () => {
     const visible = harness();
     const count = visible.timers.length;
     await visible.test.wait(2);
@@ -519,6 +519,21 @@ test("visible or Worker-unsupported waits retain native scheduling", async () =>
     const hiddenCount = hidden.timers.length;
     await hidden.test.wait(2);
     assert.equal(hidden.timers.length, hiddenCount + 1);
+});
+
+test("waits started before hiding already use the Worker scheduler", async () => {
+    const h = harness({ worker: {}, suspendNativeTimers: true });
+    let settled = false;
+    const pending = h.test.wait(25).then(() => { settled = true; });
+    h.document.hidden = true;
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(settled, true, "foreground waits must survive suspension of page timers");
+    await pending;
+    assert.equal(h.workerMessages.length, 1);
+    assert.equal(h.workerMessages[0].ms, 25);
+    assert.equal(h.timers.length, 0);
 });
 
 test("server queue renders status without accessing legacy image payloads", () => {
@@ -594,7 +609,7 @@ test("linked runs always remove their own prompt listeners", () => {
 });
 
 test("native generation restores claims and finishes linked runs", () => {
-    const handleNativeGenerate = source.match(/async function handleNativeGenerate\(slot, generate\)\s*\{([\s\S]*?)\n    \}\n\n\n    function installForgeInterruptHandlers/);
+    const handleNativeGenerate = source.match(/async function handleNativeGenerate\(slot, generate\)\s*\{([\s\S]*?)\n    \}\s+function installForgeInterruptHandlers/);
     assert.ok(handleNativeGenerate, "handleNativeGenerate function should remain discoverable");
     assert.match(handleNativeGenerate[1], /finally\s*\{[\s\S]*restoreNativeCacheClaim\(run\)/);
     assert.match(handleNativeGenerate[1], /finally\s*\{[\s\S]*finishLinkedRun\(run\)/);

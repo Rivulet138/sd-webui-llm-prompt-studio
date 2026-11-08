@@ -231,7 +231,7 @@ class LocalWD14Tagger:
             array = array.transpose(2, 0, 1)
         return np.ascontiguousarray(array[None, ...])
 
-    def interrogate(self, image, model_path, threshold=0.35, character_threshold=0.85):
+    def interrogate_detailed(self, image, model_path, threshold=0.35, character_threshold=0.85):
         import numpy as np
 
         if image is None:
@@ -250,20 +250,35 @@ class LocalWD14Tagger:
                 raise ValueError("模型输出与标签数量不匹配或包含无效分数。")
             if self._family == "cl":
                 scores = 1 / (1 + np.exp(-np.clip(scores.astype(np.float64), -30, 30)))
-                quality = [(name, float(score)) for (name, category), score in zip(self._tags, scores[0])
+                quality = [(name, category, float(score)) for (name, category), score in zip(self._tags, scores[0])
                            if name and category == "quality"]
-                selected = [(name, float(score)) for (name, category), score in zip(self._tags, scores[0])
+                selected = [(name, category, float(score)) for (name, category), score in zip(self._tags, scores[0])
                             if name and category in {"general", "character", "copyright", "artist", "meta", "model"}
                             and score >= float(character_threshold if category == "character" else threshold)]
                 if quality:
-                    best_quality = max(quality, key=lambda item: item[1])
-                    if best_quality[1] >= float(threshold):
+                    best_quality = max(quality, key=lambda item: item[2])
+                    if best_quality[2] >= float(threshold):
                         selected.append(best_quality)
             else:
-                selected = [(name, float(score)) for (name, category), score in zip(self._tags, scores[0])
+                categories = {0: "general", 1: "artist", 3: "copyright", 4: "character", 5: "meta"}
+                selected = [(name, categories.get(category, str(category)), float(score))
+                            for (name, category), score in zip(self._tags, scores[0])
                             if category != 9 and score >= float(character_threshold if category == 4 else threshold)]
-            selected.sort(key=lambda item: item[1], reverse=True)
-            return ", ".join(re.sub(r"([\\()])", r"\\\1", name.replace("_", " ")) for name, _ in selected)
+            selected.sort(key=lambda item: item[2], reverse=True)
+            labels = [{"tag": name, "category": category, "confidence": score}
+                      for name, category, score in selected]
+            prompt = ", ".join(re.sub(r"([\\()])", r"\\\1", item["tag"].replace("_", " ")) for item in labels)
+            return {
+                "prompt": prompt,
+                "tags": labels,
+                "model_path": str(self._model_key[0]),
+                "family": self._family,
+                "threshold": float(threshold),
+                "character_threshold": float(character_threshold),
+            }
+
+    def interrogate(self, image, model_path, threshold=0.35, character_threshold=0.85):
+        return self.interrogate_detailed(image, model_path, threshold, character_threshold)["prompt"]
 
     def unload(self):
         with _forge_lock(), self._lock:
@@ -280,6 +295,11 @@ _TAGGER = LocalWD14Tagger()
 def interrogate_image(image, model_path, threshold=0.35, character_threshold=0.85):
     """Return tags or raise, for batch callers that record individual failures."""
     return _TAGGER.interrogate(image, model_path, threshold, character_threshold)
+
+
+def interrogate_image_detailed(image, model_path, threshold=0.35, character_threshold=0.85):
+    """Return rendered tags and per-tag model evidence for source-aware caching."""
+    return _TAGGER.interrogate_detailed(image, model_path, threshold, character_threshold)
 
 
 def interrogate_local(image, model_path, threshold=0.35, character_threshold=0.85):

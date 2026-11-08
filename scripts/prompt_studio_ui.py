@@ -19,7 +19,7 @@ from typing import Any
 import gradio as gr
 from starlette.requests import Request
 from prompt_studio_wd14 import (
-    discover_local_models, interrogate_local, unload_local_model,
+    discover_local_models, interrogate_image_detailed, interrogate_local, unload_local_model,
 )
 from prompt_studio_tagger_models import MODEL_CATALOG, download_links, download_model, model_directory
 from prompt_studio_image_batch import ImageBatchJob
@@ -5789,7 +5789,7 @@ def _inline_source_controls(source):
     name = names.get(source)
     return (
         gr.update(visible=name is None),
-        (f"{name}：勾选缓存注入后，Forge 每张图读取一条；Batch Count / Batch Size 和无限生图由 Forge 控制。" if name else "使用 LLM 提示词工作室的模型与推理设置。"),
+        ("" if name else "使用 LLM 提示词工作室的模型与推理设置。"),
         gr.update(visible=name is not None),
     )
 
@@ -5799,7 +5799,7 @@ def _create_inline_panel(slot, prompt_target):
     # Keep the txt2img injection focused on optional prompt batch generation.
     # Cache processing is rendered in the Studio tab so it has one canonical UI.
     with gr.Column(elem_id=f"llm_prompt_studio_{slot}_inline", elem_classes=["lps-inline-workbench"]):
-        with gr.Accordion("Prompt 批量生成与缓存注入", open=False, elem_id=f"llm_prompt_studio_{slot}_inline_batch"):
+        with gr.Accordion("LLM Prompt Studio", open=False, elem_id=f"llm_prompt_studio_{slot}_inline_batch"):
             inline_source = gr.Radio(
                 label="Prompt 来源", choices=[
                     ("LLM 自动生成", "llm"),
@@ -5849,9 +5849,8 @@ def _create_inline_panel(slot, prompt_target):
                         elem_id=f"llm_prompt_studio_{slot}_inline_stop",
                     )
             inline_cache_enabled = gr.Checkbox(
-                label="启用缓存 Prompt 注入（使用 Forge 原生 Generate）", value=False,
+                label="启用缓存 Prompt 注入", value=False,
                 elem_id=f"llm_prompt_studio_{slot}_inline_cache_enabled",
-                info="勾选后，每张图读取一条缓存；基础 Prompt 不被改写，数量、批次、无限生图和停止由 Forge 控件控制。",
             )
             with gr.Row(elem_classes=["lps-form-row", "lps-inline-merge"]) as inline_merge:
                 inline_write_mode = gr.Dropdown(
@@ -5870,7 +5869,7 @@ def _create_inline_panel(slot, prompt_target):
                     placeholder="例如 {{LLM}}",
                     elem_id=f"llm_prompt_studio_{slot}_inline_marker",
                 )
-            inline_loop_status = gr.HTML("缓存注入关闭 · Forge 原生 Generate 保持原行为", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+            inline_loop_status = gr.HTML("缓存注入关闭", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
             gr.HTML("", elem_id=f"llm_prompt_studio_{slot}_inline_queue_log", elem_classes=["lps-auto-loop-log"])
             source_outputs = [llm_fields, source_hint, inline_cache_cursor]
             inline_source.change(_inline_source_controls, inputs=[inline_source], outputs=source_outputs, queue=False)
@@ -6015,10 +6014,10 @@ def _wd14_run_batch(folder, recursive, model, threshold, character_threshold, ta
         yield error_message, gr.update(), gr.update()
         return
     def infer(image, model_path, general, character):
-        tags, message = interrogate_local(image, model_path, general, character)
-        if not tags and ("失败" in message or "缺少" in message):
-            raise RuntimeError(message)
-        return tags
+        try:
+            return interrogate_image_detailed(image, model_path, general, character)
+        except ImportError as error:
+            raise RuntimeError(f"内置反推缺少本地运行依赖：{error}") from error
     try:
         yield _wd14_batch_view(job.snapshot())
         for snapshot in job.iter_run(interrogate_fn=infer, retry_failed=mode == "retry"):
@@ -6049,13 +6048,33 @@ def _wd14_save_records(records, base_model, *filters, output_mode="Danbooru Tags
     records = [record for record in (records or []) if record.get("status") == "completed" and str(record.get("prompt") or "").strip()]
     if not records:
         return "没有可保存的反推结果。", gr.update(), gr.update()
-    stats = DB.sync_external_prompts([
-        {"prompt": record["prompt"], "output_mode": output_mode, "base_model": base_model,
-         "source_kind": "wd14", "source_ref": record.get("path") or "prompt:" + hashlib.sha256((str(record["prompt"]) + output_mode + str(base_model)).encode()).hexdigest(),
-         "tags": record.get("path", ""),
-         "score": 0, "score_source": "unrated"}
-        for record in records
-    ])
+    cache_records = []
+    for record in records:
+        details = record.get("details") or {}
+        labels = details.get("tags") or []
+        raw_tags = ", ".join(str(item.get("tag") or "").strip() for item in labels
+                              if isinstance(item, dict) and str(item.get("tag") or "").strip())
+        identity = {
+            "path": str(record.get("path") or ""),
+            "model_path": str(details.get("model_path") or ""),
+            "family": str(details.get("family") or ""),
+            "threshold": details.get("threshold"),
+            "character_threshold": details.get("character_threshold"),
+        }
+        source_ref = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        family = str(details.get("family") or "WD14/CL Tagger")
+        model_name = Path(str(details.get("model_path") or "")).name or "unknown model"
+        score_reason = (
+            f"{family} model prediction; not original Booru annotation. Model: {model_name}; "
+            f"thresholds: general={details.get('threshold', 'unknown')}, "
+            f"character={details.get('character_threshold', 'unknown')}"
+        )
+        cache_records.append({
+            "prompt": record["prompt"], "output_mode": output_mode, "base_model": base_model,
+            "source_kind": "wd14", "source_ref": source_ref, "tags": raw_tags,
+            "score_reason": score_reason,
+        })
+    stats = DB.sync_external_prompts(cache_records)
     return (f"已保存到缓存：新增 {stats['inserted']} · 更新 {stats['updated']} · 已有 {stats['unchanged']}", *_filtered_cache_updates(*filters))
 
 

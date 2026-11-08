@@ -45,7 +45,8 @@ class ImageBatchJob:
 
     Call ``cancel.set()`` to stop after the current inference. To resume, explicitly
     clear the event before calling ``iter_run``. Injected interrogators take
-    (PIL image, model, general threshold, character threshold) and return a string.
+    (PIL image, model, general threshold, character threshold) and return a string
+    or a detailed mapping containing ``prompt`` and model evidence.
     """
 
     def __init__(self, folder, model, threshold=0.35, character_threshold=0.85, recursive=True):
@@ -89,9 +90,17 @@ class ImageBatchJob:
                         prompt = infer(image, self.model, self.threshold, self.character_threshold)
                     finally:
                         image.close()
-                    if not isinstance(prompt, str):
-                        raise TypeError("反推结果必须是提示词文本。")
-                    record.update(prompt=prompt.strip(), status="completed" if prompt.strip() else "skipped", error="")
+                    if isinstance(prompt, dict):
+                        details = dict(prompt)
+                        rendered = details.get("prompt", "")
+                        if not isinstance(rendered, str):
+                            raise TypeError("反推详细结果必须包含文本 prompt。")
+                        record.update(prompt=rendered.strip(), details=details)
+                    elif isinstance(prompt, str):
+                        record.update(prompt=prompt.strip(), details={})
+                    else:
+                        raise TypeError("反推结果必须是提示词文本或详细结果。")
+                    record.update(status="completed" if record["prompt"] else "skipped", error="")
                 except Exception as exc:
                     record.update(prompt="", status="failed", error=str(exc))
                 yield self.snapshot()

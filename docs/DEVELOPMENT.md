@@ -28,3 +28,16 @@
 - 模型发现保持离线；只有用户点击下载才访问模型仓库，模型与标签文件需成对。
 
 跨插件批次使用 `prompt_batch.v1`。修改格式时同时检查 PNG Collector 与 Ranbooru 的读取、写回及错误处理；插件未安装或未提供缓存时，应返回可理解的状态。
+
+## 后台调度回归
+
+```powershell
+node --test tests/test_auto_loop.cjs
+python -m unittest discover -s tests -p 'test_*.py'
+# Forge 根目录（同时应用保活补丁时）
+node --test tests/test_keep_alive.cjs
+```
+
+插件的 Worker 等待与 Forge 的动画帧保活分别验证：前者覆盖前台启动等待后隐藏页面，后者覆盖隐藏切换时已排队回调的迁移、取消和一次性执行。不要将本插件的修复描述为全局计时器替换。
+
+浏览器验证必须读取 `document.hidden` / `document.visibilityState`。Playwright 默认焦点模拟和后台限流关闭参数会掩盖问题；独立 Chrome 经原生 CDP 最小化并确认 `hidden === true` 后，再检查 Gradio 输入更新、事件链和 Native Cache 注入。不能用前台自动化成功代替后台验证，也不能把最小化支持等同于浏览器冻结或电脑睡眠支持。

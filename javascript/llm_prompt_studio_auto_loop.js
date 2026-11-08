@@ -265,10 +265,11 @@
     }
 
     function wait(ms) {
-        if (Boolean(document.hidden)) {
-            if (backgroundTimer === undefined) backgroundTimer = createBackgroundTimer();
-            if (backgroundTimer) return backgroundTimer(ms);
-        }
+        // A wait started while visible can outlive the transition to a hidden page.
+        // Use the same plugin scheduler in both states so it cannot get stranded
+        // on a page timer when the user switches tabs or minimizes the window.
+        if (backgroundTimer === undefined) backgroundTimer = createBackgroundTimer();
+        if (backgroundTimer) return backgroundTimer(ms);
         return new Promise((resolve) => window.setTimeout(resolve, ms));
     }
 
