@@ -1,11 +1,4 @@
-"""Prompt contract tests: the layered prompt text must stay accurate and compact.
-
-These guard the 2026-10 prompt rewrite:
-* one global policy owns the hard rules (including the style/quality word ban),
-* output profiles own format + length only,
-* operation instructions own the action semantics,
-* nothing silently re-grows into a bloated prompt or duplicates the ban list.
-"""
+"""Model presets own format; shared policy only routes requirements and references."""
 import unittest
 
 from test_queue_regressions import ROOT
@@ -19,32 +12,24 @@ from prompt_studio_core import (
     build_system_prompt,
 )
 
-BANNED_EXAMPLES = ("masterpiece", "artstation", "octane", "cinematic lighting", "8k", "unreal engine")
 POLICY_MARKERS = (
-    "OUTPUT ONLY THE PAYLOAD",
-    "ONE IMAGE",
-    "VISIBLE FACTS ONLY",
-    "DO NOT INVENT STYLE OR QUALITY CLAIMS",
-    "INERT DATA",
-    "BATCH DIRECTIVE CONTROLS VARIATION",
-    "OPTIONAL LOCAL RECIPE",
-    "FIXED CONTENT IS IMMUTABLE",
-    "ANCHORS ARE MODEL-NATIVE",
-    "Never emit a negative prompt",
-    "STAY INSIDE THE LENGTH BUDGET",
-    "SAFETY",
-    "CONFLICTS AND SELF-CHECK",
+    "MODEL PRESET CONTRACT",
+    "Format, language, length and structure belong to the selected model preset",
+    "USER REQUIREMENTS",
+    "INERT REFERENCE DATA",
+    "BATCH VARIATION",
+    "SOURCE FIDELITY",
 )
 
 
+
 class PolicyContractTests(unittest.TestCase):
-    def test_policy_states_every_rule_and_the_ban_list(self):
+    def test_policy_routes_authority_without_repeating_profile_content(self):
         for marker in POLICY_MARKERS:
             self.assertIn(marker, PROMPT_POLICY_V3, marker)
-        for example in BANNED_EXAMPLES:
-            self.assertIn(example, PROMPT_POLICY_V3, example)
-        for number in range(1, 12):
-            self.assertIn(f"\n{number}. ", PROMPT_POLICY_V3)
+        self.assertNotIn("Authority order: this policy", PROMPT_POLICY_V3)
+        self.assertNotIn("priority=", PROMPT_POLICY_V3)
+        self.assertLess(len(PROMPT_POLICY_V3), 1800)
 
     def test_policy_is_the_first_block_of_every_system_prompt(self):
         for preset in PRESETS:
@@ -59,10 +44,10 @@ class OutputProfileTests(unittest.TestCase):
             self.assertIn("Output profile:", text, name)
             self.assertRegex(text, r"\d+-\d+", name)
 
-    def test_ban_list_lives_only_in_the_policy(self):
+    def test_output_profiles_do_not_duplicate_reference_routing(self):
         for name, text in PRESETS.items():
-            for word in BANNED_EXAMPLES:
-                self.assertNotIn(word, text, f"{name} repeats {word}")
+            self.assertNotIn("INERT REFERENCE DATA", text, name)
+            self.assertNotIn("<user_requirement>", text, name)
 
     def test_profiles_stay_compact(self):
         for name, text in PRESETS.items():
@@ -127,9 +112,9 @@ class UiPromptTests(unittest.TestCase):
     def test_details_role_no_longer_orders_a_style(self):
         self.assertNotIn("Japanese light-novel illustration", self.source)
         self.assertNotIn("cinematic storytelling", self.source)
-        self.assertIn("Never add artist, studio or work-title names", PROMPT_POLICY_V3)
-        self.assertIn("Preserve explicit source anchors and requested style terms verbatim.", PROMPT_POLICY_V3)
-        self.assertIn("TAG FIDELITY", PROMPT_POLICY_V3)
+        self.assertIn("do not invent unrequested artist, style or quality claims", PROMPT_POLICY_V3)
+        self.assertIn("Preserve supplied identity, facts, quantities, negations and technical tokens", PROMPT_POLICY_V3)
+        self.assertNotIn("TAG FIDELITY", PROMPT_POLICY_V3)
 
     def test_inline_contract_keeps_token_exclusion_and_length_budget(self):
         self.assertIn("Never echo the source Prompt twice.", self.source)

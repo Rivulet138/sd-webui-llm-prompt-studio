@@ -209,8 +209,8 @@ class NativeCacheContextTests(unittest.TestCase):
             "_coerce_bool", "_native_cache_database", "_native_cache_merge_prompt",
             "_native_cache_cleanup_locked", "_native_cache_extract_claim", "_native_cache_prepare",
             "apply_native_cache_context", "_native_cache_release", "_native_cache_get_context",
-            "prepare_native_cache_processing", "complete_native_cache_context", "_native_cache_fail",
-            "track_native_cache_image", "_native_cache_state", "_native_cache_slot",
+            "prepare_native_cache_processing", "_native_cache_fail",
+            "_native_cache_state", "_native_cache_slot",
             constants=(
                 "_NATIVE_CACHE_CONTEXTS", "_NATIVE_CACHE_CONTEXT_LOCK", "_NATIVE_CACHE_CONTEXT_TTL",
                 "_NATIVE_CACHE_MARKER_START", "_NATIVE_CACHE_MARKER_END",
@@ -292,7 +292,7 @@ class NativeCacheContextTests(unittest.TestCase):
         self.assertEqual(self.db.get_native_cache_job(prepared["token"])["state"], "failed")
         self.assertIsNone(self.db.get_native_cache_cursor("txt2img", "cache"))
 
-    def test_styles_applied_once_and_active_release_does_not_commit_or_cancel(self):
+    def test_styles_applied_once_and_completed_release_is_idempotent(self):
         prepared = self.prepare()
         p = self.StableDiffusionProcessingTxt2Img()
         p.prompt, p.styles = "base" + self.marker(prepared["token"]), ["style"]
@@ -300,14 +300,17 @@ class NativeCacheContextTests(unittest.TestCase):
         modules = ModuleType("modules")
         modules.shared = SimpleNamespace(prompt_styles=SimpleNamespace(apply_styles_to_prompt=style))
         with patch.dict(sys.modules, {"modules": modules}):
-            self.api.apply_native_cache_context(p)
-            self.api.apply_native_cache_context(p)
+            self.assertEqual(self.api.apply_native_cache_context(p), prepared["token"])
+            self.assertEqual(self.api.apply_native_cache_context(p), prepared["token"])
         style.assert_called_once_with("base, cached one", ["style"])
+        self.assertEqual(p.all_prompts, ["styled base, cached one"])
         for commit in (True, False):
             result = self.api._native_cache_release(prepared["token"], commit)
-            self.assertFalse(result["committed"])
-            self.assertFalse(result["released"])
-            self.assertEqual(result["state"], "active")
+            self.assertEqual(result, {
+                "released": True, "committed": True, "next_cursor": 1,
+                "completed_count": 1, "state": "completed",
+            })
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 1)
 
     def test_native_comments_filter_positive_prompts_and_keep_raw_infotext(self):
         for comments_after in (False, True):
@@ -335,7 +338,7 @@ class NativeCacheContextTests(unittest.TestCase):
                 self.assertIs(p.negative_prompt, negative)
                 self.assertIs(p._all_negative_prompts_c, raw_negative)
 
-    def test_native_image_indices_ignore_extra_gallery_images(self):
+    def test_native_bridge_commits_at_injection_without_image_callbacks(self):
         prepared = self.prepare(total_images=2)
         p = self.StableDiffusionProcessingTxt2Img()
         p.prompt = "base" + self.marker(prepared["token"])
@@ -343,9 +346,13 @@ class NativeCacheContextTests(unittest.TestCase):
         bridge = self.native_script(SimpleNamespace())
         bridge.before_process(p)
         bridge.process(p)
-        bridge.postprocess_image(p, SimpleNamespace(index=0))
-        bridge.postprocess(p, SimpleNamespace(images=["grid", "one", "extension output"], index_of_first_image=1))
-        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 1)
+        self.assertEqual(p.all_prompts, ["base, cached one", "base, cached two"])
+        job = self.db.get_native_cache_job(prepared["token"])
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["completed_count"], 2)
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 2)
+        for callback in ("postprocess_image", "postprocess_batch", "postprocess"):
+            self.assertNotIn(callback, vars(type(bridge)))
 
     def test_missing_marker_does_not_consume_pending_context(self):
         prepared = self.prepare()
@@ -364,7 +371,9 @@ class NativeCacheContextTests(unittest.TestCase):
         self.assertEqual(processing.prompt, "base")
         self.assertEqual(processing.all_prompts, ["base, cached one"])
         self.assertEqual(processing.main_prompt, "base, cached one")
-        self.assertEqual(self.api._NATIVE_CACHE_CONTEXTS[prepared["token"]]["state"], "active")
+        self.assertEqual(self.api._NATIVE_CACHE_CONTEXTS[prepared["token"]]["state"], "completed")
+        self.assertEqual(self.db.get_native_cache_job(prepared["token"])["completed_count"], 1)
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 1)
 
     def test_reverse_token_order_consumes_the_matching_context(self):
         first = self.prepare(base_prompt="first")
@@ -388,22 +397,22 @@ class NativeCacheContextTests(unittest.TestCase):
         self.assertIsNone(self.api.apply_native_cache_context(processing))
         self.assertEqual(self.api._NATIVE_CACHE_CONTEXTS[prepared["token"]]["state"], "pending")
 
-    def test_release_supports_rollback_and_commit(self):
-        rollback = self.prepare()
-        released = self.api._native_cache_release(rollback["token"], False)
-        self.assertEqual(released["released"], True)
-        self.assertEqual(released["committed"], False)
-        self.assertEqual(self.db.get_native_cache_job(rollback["token"])["state"], "cancelled")
-
-        commit = self.prepare()
-        processing = self.StableDiffusionProcessingTxt2Img()
-        processing.prompt = "base" + self.marker(commit["token"])
-        self.api.apply_native_cache_context(processing)
-        self.assertFalse(self.api._native_cache_release(commit["token"], True)["committed"])
-        self.api.complete_native_cache_context(processing, SimpleNamespace(images=[object()], index_of_first_image=0))
-        committed = self.api._native_cache_release(commit["token"], True)
-        self.assertEqual(committed["released"], True)
-        self.assertEqual(committed["committed"], True)
+    def test_release_before_injection_never_commits_and_cancel_is_idempotent(self):
+        prepared = self.prepare(total_images=2)
+        token = prepared["token"]
+        self.assertEqual(self.api._native_cache_release(token, True), {
+            "released": False, "committed": False, "next_cursor": 0,
+            "completed_count": 0, "state": "pending",
+        })
+        released = self.api._native_cache_release(token, False)
+        self.assertEqual(released, {
+            "released": True, "committed": False, "next_cursor": 0,
+            "completed_count": 0, "state": "cancelled",
+        })
+        for commit in (False, True):
+            self.assertEqual(self.api._native_cache_release(token, commit), released)
+        self.assertEqual(self.db.get_native_cache_job(token)["state"], "cancelled")
+        self.assertIsNone(self.db.get_native_cache_cursor("txt2img", "cache"))
 
 
     def test_invalid_merge_is_rejected_before_job_creation(self):
@@ -443,48 +452,76 @@ class NativeCacheContextTests(unittest.TestCase):
         self.assertEqual(p.all_hr_prompts, p.all_prompts)
         self.assertIsInstance(p.hr_prompt, str)
 
-    def test_completion_persists_without_browser_and_release_is_idempotent(self):
+    def test_injection_persists_without_browser_and_release_is_idempotent(self):
         prepared = self.prepare(total_images=2)
         p = self.StableDiffusionProcessingTxt2Img()
         p.prompt = "base" + self.marker(prepared["token"])
         p.batch_size, p.n_iter = 1, 2
         self.api.apply_native_cache_context(p)
         self.api._NATIVE_CACHE_CONTEXTS.clear()
-        self.api.complete_native_cache_context(p, SimpleNamespace(images=["grid", "one", "two"], index_of_first_image=1))
         fresh = StudioDB(self.db.path)
+        job = fresh.get_native_cache_job(prepared["token"])
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["completed_count"], 2)
+        self.assertTrue(job["committed"])
+        self.assertEqual(job["next_cursor"], 2)
         self.assertEqual(fresh.get_native_cache_cursor("txt2img", "cache"), 2)
-        first = self.api._native_cache_release(prepared["token"], True)
-        self.assertEqual(first, self.api._native_cache_release(prepared["token"], True))
-        self.assertEqual(first, self.api._native_cache_release(prepared["token"], False))
+        with patch.dict(self.api._native_cache_release.__globals__, DB=fresh):
+            first = self.api._native_cache_release(prepared["token"], True)
+            self.assertEqual(first, {
+                "released": True, "committed": True, "next_cursor": 2,
+                "completed_count": 2, "state": "completed",
+            })
+            self.assertEqual(first, self.api._native_cache_release(prepared["token"], True))
+            self.assertEqual(first, self.api._native_cache_release(prepared["token"], False))
+        self.assertEqual(fresh.get_native_cache_job(prepared["token"]), job)
+        self.assertEqual(fresh.get_native_cache_cursor("txt2img", "cache"), 2)
 
-    def test_partial_completion_commits_only_produced_prefix(self):
+    def test_cancel_after_injection_keeps_entire_batch_committed(self):
         prepared = self.prepare(total_images=2)
         p = self.StableDiffusionProcessingTxt2Img()
         p.prompt = "base" + self.marker(prepared["token"])
         p.batch_size, p.n_iter = 1, 2
         self.api.apply_native_cache_context(p)
-        self.api.complete_native_cache_context(p, SimpleNamespace(images=["one"], index_of_first_image=0))
-        result = self.api._native_cache_release(prepared["token"], True)
-        self.assertEqual(result["next_cursor"], 1)
-        self.assertEqual(result["completed_count"], 1)
-        self.assertEqual(result["state"], "partial")
+        result = self.api._native_cache_release(prepared["token"], False)
+        self.assertEqual(result, {
+            "released": True, "committed": True, "next_cursor": 2,
+            "completed_count": 2, "state": "completed",
+        })
+        self.assertEqual(self.db.get_native_cache_job(prepared["token"])["state"], "completed")
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 2)
 
-    def test_skipped_first_batch_does_not_consume_later_records(self):
+    def test_exception_after_successful_injection_does_not_roll_back_batch(self):
         prepared = self.prepare(total_images=2)
         p = self.StableDiffusionProcessingTxt2Img()
         p.prompt = "base" + self.marker(prepared["token"])
         p.batch_size, p.n_iter = 1, 2
-        self.api.apply_native_cache_context(p)
-        self.api.track_native_cache_image(p, SimpleNamespace(index=1))
-        self.api.complete_native_cache_context(p, SimpleNamespace(images=["second"], index_of_first_image=0))
-        self.assertIsNone(self.db.get_native_cache_cursor("txt2img", "cache"))
+        shared = SimpleNamespace(state=SimpleNamespace(interrupt=Mock()))
+        bridge = self.native_script(shared)
+        bridge.before_process(p)
+
+        def apply_then_raise(processing):
+            self.api.apply_native_cache_context(processing)
+            raise RuntimeError("failure after injection")
+
+        with patch.dict(bridge.process.__globals__, apply_native_cache_context=apply_then_raise):
+            with self.assertRaisesRegex(RuntimeError, "failure after injection"):
+                bridge.process(p)
+        shared.state.interrupt.assert_called_once_with()
+        self.assertEqual(p.prompt, "base")
+        self.assertEqual(p.all_prompts, ["base, cached one", "base, cached two"])
+        job = self.db.get_native_cache_job(prepared["token"])
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["completed_count"], 2)
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 2)
+        self.assertTrue(self.api._native_cache_release(prepared["token"], False)["committed"])
 
     def test_server_cursor_is_used_when_client_does_not_override(self):
         prepared = self.prepare()
         p = self.StableDiffusionProcessingTxt2Img()
         p.prompt = "base" + self.marker(prepared["token"])
         self.api.apply_native_cache_context(p)
-        self.api.complete_native_cache_context(p, SimpleNamespace(images=["one"], index_of_first_image=0))
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 1)
         next_job = self.prepare(after_id=None)
         self.assertEqual(next_job["after_id"], 1)
         self.assertNotIn("records", next_job)

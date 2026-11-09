@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock
 
 from test_queue_regressions import ROOT, StudioDB, ui_functions
-from prompt_studio_core import normalize_sampling
+from prompt_studio_core import normalize_sampling, uses_layered_polish
 from prompt_studio_generation import run_llm_generation
 
 GR = SimpleNamespace(update=lambda **kwargs: kwargs)
@@ -93,10 +93,12 @@ class CacheInferenceTests(unittest.TestCase):
             validate_endpoint=lambda value: value,
             PROCESSED_CACHE_INFERENCE_SETTINGS_VERSION=1, _connection_settings=lambda *args: self.base,
             _safe_error=str, _workflow_settings=lambda: workflow,
+            _load_system_prompt_profile=lambda *args: ("", ""),
             _canonical_action=lambda x: x, _canonical_preset=lambda x: x, _canonical_base_model=lambda x: x,
             _canonical_provider=lambda x: x, _canonical_output_mode=lambda x: x,
             _resolve_preset_model=lambda p, b: (p, b), _aligned_preset=lambda p, b: (p, False),
             build_operation_instruction=lambda *args: "Keep source", _static_prompt_reference=lambda x: [],
+            uses_layered_polish=uses_layered_polish,
             build_system_prompt=lambda *args, **kwargs: "system", build_user_message=lambda x: x,
             CREDENTIALS=SimpleNamespace(resolve=Mock(return_value="fake-test-key"), save=Mock(return_value=False), has_matching=Mock(return_value=False)), call_llm=self.llm,
             _MAX_DIVERSITY_RETRIES=1, _MAX_RESPONSE_RETRIES=1,
@@ -105,7 +107,7 @@ class CacheInferenceTests(unittest.TestCase):
                                          "batch_temperature_floor": False},
             _worst_content_similarity=lambda *args, **kwargs: 0.0,
             _remember_diverse_output=lambda *args, **kwargs: True,
-            _fallback_request_kwargs=lambda connection: {}, _finalize_generated_prompt=lambda r, *args: r)
+            _fallback_request_kwargs=lambda connection: {}, _finalize_generated_prompt=lambda r, *args, **kwargs: r)
 
     def test_defaults_are_conservative_and_only_connection_is_inherited(self):
         settings = self.api._processed_cache_inference_settings()

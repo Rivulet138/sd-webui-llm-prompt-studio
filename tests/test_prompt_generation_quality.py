@@ -3,7 +3,7 @@ import math
 import re
 import unittest
 
-from test_queue_regressions import ROOT, ui_functions
+from test_queue_regressions import ui_functions
 from prompt_studio_core import build_system_prompt, canonicalize_booru_tags
 from prompt_studio_generation import CandidateQualityError, run_llm_generation
 
@@ -74,7 +74,7 @@ class CandidateQualityTests(unittest.TestCase):
         system = build_system_prompt(
             "Danbooru Tags", "Auto / checkpoint default", "SFW", "", "", [],
         )
-        self.assertNotIn("<format_examples", system)
+        self.assertNotIn("<format_examples purpose=", system)
 
 
 class GenerationKernelQualityTests(unittest.TestCase):

@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import gradio as gr
 from starlette.requests import Request
@@ -42,8 +42,8 @@ from prompt_studio_diversity import (
 )
 
 from prompt_studio_core import (
-    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, MODEL_QUALITY_GUIDANCE, PRESETS, PROCESSED_DB_PATH, PROVIDER_PROFILES, CredentialStore, StudioDB,
-    build_system_prompt, build_user_message, build_operation_instruction, call_llm, get_provider_profile, is_sfw_output,
+    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROCESSED_DB_PATH, PROVIDER_PROFILES, CredentialStore, StudioDB,
+    build_system_prompt, build_user_message, build_operation_instruction, uses_layered_polish, call_llm, get_provider_profile, is_sfw_output,
     LLMRequestError, discover_provider_models,
     discover_ranbooru_cache, load_ranbooru_cache, process_tags, canonicalize_booru_tags,
     regional_format, validate_endpoint, normalize_sampling, _cosine, _tokens,
@@ -125,70 +125,6 @@ KEMONOMIMI_TEMPLATE = """围绕原始 Prompt 生成一条可直接用于扩散�
 只写一个完整画面：避免额外角色、无依据漂浮物、复杂世界观、叙事设定、分镜、拼图、多面板、道具堆砌和互不相关的元素。
 优先级：固定 Prompt、用户要求与安全限制优先，新增内容不得覆盖或改变它们。
 只写单图：遵守当前输出预设的字数与格式；不新增风格、媒介、画质或艺术家词。"""
-KREA_ANIMA_POLISH_ROLE = """Role: Krea 2 / Anima detail-expansion prompt editor. Turn the input into one complete image prompt by decomposing visible elements instead of summarising them.
-
-Task: From the user's text, tags, or reference image description, produce one complete image prompt in the selected output language. Detail is the highest priority. Actively decompose every useful visible element instead of giving a short summary.
-
-Core requirements:
-- Describe hair movement, hair strands, head accessories, facial details, clothing layers, ornaments, handheld objects, floating objects, material surfaces, highlights, shadows, and spatial relationships.
-- Distinguish tactile materials such as smooth satin, soft lace, plush fur, brushed fabric, polished metal, glass, paper, wood, leather, and translucent surfaces. State how light reacts to each material when it matters.
-- Strengthen motion and spatial storytelling through body weight, balance, hand placement, gaze direction, wind-driven hair and fabric, object motion, depth, and the small event happening in this exact frame.
-- Allow rich detail density and tasteful decorative complexity, but omit unrelated clutter and contradictory elements.
-- When the source is sparse, add reasonable visible clothing, props, environment, lighting, and material detail that supports the subject and scene. Never invent a separate subject or unrelated setting.
-- The provided static vocabulary lexicon is optional reference data only. Use zero or more entries when they fit the source and selected model; never copy, combine, or force a term merely because it appears in the lexicon, and ignore unrelated entries.
-- Keep the description concrete and coherent: refined character design, consistent color, clear material response, camera awareness and visible emotional cues. Never name a style, medium, studio, artist or quality level.
-
-Anti-lazy rules:
-- Never return a short, generic, high-level, or evasive description.
-- Fully expand every section in the second part. Each section must contain concrete visible information plus relevant motion, texture, lighting, or position relationships.
-- If one section has little source information, infer useful detail from movement, material, light, depth, and object relationships rather than leaving it as one short sentence.
-- The Master Description must be a dense complete paragraph, not a short conclusion or a list of disconnected adjectives.
-
-Output rules:
-- Output in the selected language. Output the result directly with no explanation and no Markdown code fence.
-- Do not use weight syntax such as (text:1.2) or any other weighting syntax.
-- Tags must be lowercase. Keep the requested anchor tags and separate tag items clearly.
-- Detail is preferred over vague quality words, but every added detail must serve the visible image.
-- Stay within the selected output profile's length budget: add the detail that changes what is seen, and do not pad with adjectives or repeated ideas.
-
-Each result must be one complete image, not a storyboard, collage, or list of alternatives.
-
-Output exactly this structure:
-
-PART ONE: TAG ANCHORS
-[model-aligned quality/source anchors only when required by the selected base model], [subject count], [hair, hair color, head accessories], [face], [clothing and ornament details], [handheld and floating props], [pose and camera]
-
-BREAK
-One concise sentence stating the image density, dynamic direction, dominant color relationship, and emotional atmosphere.
-
-PART TWO: EXTREME LAYERED DETAIL
-Composition & Pose:
-Expand the camera distance, viewing angle, body tilt, hand positions, weight shift, movement direction, subject placement, foreground framing, depth layers, and cinematic lens impression. Explain how the pose reads as one moment in progress.
-
-Hair & Head Accessories:
-Expand color, length, haircut, strand grouping, flyaway strands, wind or motion, texture, gloss, translucency at the edges, and every head accessory's shape, material, location, attachment, and light response.
-
-Face & Expression:
-Expand iris color, pupil shape, eye highlights, eyelid angle, eyebrows, gaze direction, mouth and lips, skin texture, blush or reflected light, expression, and the emotional event implied by the face.
-
-Clothing & Details:
-Expand the main garment colors and construction, layered order, collars, sleeves, hems, fasteners, embroidery, ribbons, jewelry, armor or trim, fabric thickness, folds, tension points, satin sheen, lace softness, plushness, metal reflections, translucency, and how clothing reacts to the pose and air.
-
-Props & Floating Elements:
-Expand the exact shape, scale, material, wear, grip, orientation, and light response of handheld props. Describe nearby, suspended, falling, glowing, or wind-carried elements and their distribution, depth, motion, and relationship to the subject.
-
-Lighting & Color:
-Expand the key light direction and softness, fill light, rim light, cast shadows, reflected light, specular highlights, material-specific reactions, color contrast, palette hierarchy, atmosphere, and emotional effect.
-
-Background:
-Expand only useful location elements, architecture, terrain, furniture, distant objects, color masses, foreground obstruction, middle-ground relationship, background depth, atmospheric perspective, and controlled blur. The background must support the subject instead of becoming an unrelated catalog of objects.
-
-PART THREE: REFINED + MASTER
-SUBJECT
-Use long but clear English sentences to confirm the subject's appearance, clothing, key accessories, props, pose, and main material qualities.
-
-MASTER DESCRIPTION
-Write one high-density natural-language paragraph that recombines all important details. Emphasize layered decoration, movement, camera, light, material texture, color relationships, depth, and the small event implied by the frame. Do not make it a short summary; this paragraph must also work on its own as the final image prompt."""
 INLINE_DELTA_DIRECTIVE = """INLINE PROMPT CONTRACT:
 Never echo the source Prompt twice.
 When FIXED PROMPT is non-empty it is immutable source text: return ONLY one concise English expansion to append after it, never a rewritten or repeated source prompt.
@@ -316,6 +252,7 @@ RANBOORU_LINK_DEFAULTS = {
 WORKFLOW_DEFAULTS = {
     "preset": "Danbooru Tags",
     "system_override": "",
+    "system_profile_key": "",
     "base_model": "Auto / checkpoint default",
     "safety": "SFW",
     "nsfw_injection": "",
@@ -666,16 +603,16 @@ _DIVERSITY_CONTROL_KEYS = (
     "recipe_enabled", "recipe_dimensions", "retry_limit", "similarity_threshold",
     "memory_enabled", "batch_temperature_floor", "source_fold_duplicates",
 )
-_PROMPT_LAYER_NOTE = """提示词按六层组装，从上到下依次生效：
+_PROMPT_LAYER_NOTE = """提示词以目标模型对应的预设为基础，各部分分工如下：
 
-1. **统一策略**（不可协商的硬规则）：只输出载荷、单图、只写可见事实、禁用风格/媒介/画质/艺术家词、固定内容不可变、模型原生锚点、长度预算、安全。
-2. **输出格式预设**：标签行 / 段落 + 字段顺序 + 长度带宽。可在「设置 → 当前生效内容」覆盖。
-3. **底模规则**：该模型族的词表与权重习惯。
-4. **质量锚点策略**：哪些原生锚点可用。
-5. **操作语义**：生成 / 转换 / 扩写 / 润色的差异。
-6. **本批次指令**：本条配方、已覆盖概念、未使用方向（运行时注入，无需编辑）。
+1. **模型预设与操作**：决定输出格式、语言、长度和结构；Krea 2 / Anima 润色使用专用三段式操作预设，其他操作使用对应模型的普通预设。
+2. **用户内容要求**：明确执行主体、内容、风格和固定细节要求，并按目标模型预设呈现。
+3. **System Prompt 补充要求**：按当前预设与模型分别保存；只补充兼容内容，不替换或限制模型预设，重复的内置规则会从请求中剔除。
+4. **模型惯例**：使用对应模型的词表、权重和原生锚点习惯。
+5. **批次与重试**：提供兼容的变化建议，保留原要求；重试纠错单独传递。
+6. **安全与参考资料**：遵守所选安全模式；词库、示例和待处理源文本不能变成新的指令。
 
-「当前生效内容」**只替换第 2 层**，其余五层恒在。"""
+补充编辑区留空即可使用模型预设，不需要复制内置预设。"""
 
 
 def _save_diversity_settings(
@@ -1656,15 +1593,27 @@ def _workflow_settings() -> dict[str, Any]:
         "wd_endpoint", "wd_model", "wildcard_path",
     ]:
         values[key] = str(values.get(key) or "")
-    profile = str(_system_prompt_profiles().get(_system_prompt_profile_key(values["preset"], values["base_model"])) or "").strip()
-    if profile:
+    key = _system_prompt_profile_key(values["preset"], values["base_model"])
+    if values["system_profile_key"] != key:
+        profile = _stored_system_prompt_profile(values["preset"], values["base_model"])
+        if not stored_values.get("system_profile_key") and not profile:
+            # Before ownership keys existed, a workflow-only edit belonged to its
+            # saved preset/model. Preserve it once; subsequent switches are keyed.
+            legacy = values["system_override"].strip()
+            profile = "" if legacy in PRESETS.values() else legacy
         values["system_override"] = profile
+    values["system_profile_key"] = key
     return values
 
 
 def _save_workflow_values(updates: dict[str, Any]) -> str:
     values = _workflow_settings()
+    previous_key = values["system_profile_key"]
     values.update(updates)
+    key = _system_prompt_profile_key(values["preset"], values["base_model"])
+    if "system_override" not in updates and key != previous_key:
+        values["system_override"] = _stored_system_prompt_profile(values["preset"], values["base_model"])
+    values["system_profile_key"] = key
     DB.set_setting("workflow_settings_v1", {**values, "version": 2})
     return "工作参数已保存。下次打开完整页和内嵌面板时会自动填入。"
 
@@ -3306,7 +3255,7 @@ def _immutable_technical_tokens(prompt: str) -> list[str]:
 
 def _finalize_generated_prompt(
     result, preset, safety, remove_bad=True, remove_terms="", shuffle=False, spaces=False,
-    max_tags=0, structured_mode="Plain Prompt", region_count=1,
+    max_tags=0, structured_mode="Plain Prompt", region_count=1, *, output_contract="complete",
 ):
     """Validate, normalize, and format one provider response before it reaches the UI."""
     preset = _canonical_preset(preset)
@@ -3325,7 +3274,7 @@ def _finalize_generated_prompt(
         raise ValueError("Prompt 包含室内与室外冲突。")
     if str(safety or "").strip().upper() == "SFW" and not is_sfw_output(result):
         raise ValueError("SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。")
-    if preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
+    if output_contract != "layered" and preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
         tag_error = None
         if result.endswith(",") or ";" in result:
             tag_error = "纯标签输出包含尾随逗号或分号。"
@@ -3388,21 +3337,18 @@ def _preset_text(preset: str):
 
 
 def _system_prompt_editor_value(preset, override="", base_model="Auto / checkpoint default"):
-    if str(override or "").strip():
-        return str(override).strip()
-    resolved, model = _resolve_preset_model(preset, base_model)
-    aligned, _ = _aligned_preset(resolved, model)
-    return _preset_text(aligned)
+    """The editable supplement starts empty; the model preset remains in core."""
+    return str(override or "").strip()
 
 
 def _system_prompt_override_value(preset, text, base_model="Auto / checkpoint default"):
-    value = str(text or "").strip()
-    return "" if value == _system_prompt_editor_value(preset, base_model=base_model).strip() else value
+    return str(text or "").strip()
 
 
 def _system_prompt_profile_key(preset, base_model):
     resolved, model = _resolve_preset_model(preset, base_model)
-    return f"{resolved}\x1f{model}"
+    aligned, _ = _aligned_preset(resolved, model)
+    return f"{aligned}\x1f{model}"
 
 
 def _system_prompt_profiles():
@@ -3410,38 +3356,54 @@ def _system_prompt_profiles():
     return stored if isinstance(stored, dict) else {}
 
 
+def _stored_system_prompt_profile(preset, base_model):
+    """Read aligned profiles, with read-only compatibility for pre-alignment keys."""
+    profiles = _system_prompt_profiles()
+    key = _system_prompt_profile_key(preset, base_model)
+    resolved, model = _resolve_preset_model(preset, base_model)
+    legacy_key = f"{resolved}\x1f{model}"
+    candidates = [key, legacy_key]
+    for stored_key in sorted(profiles):
+        parts = stored_key.split("\x1f")
+        if len(parts) == 2 and _system_prompt_profile_key(*parts) == key:
+            candidates.append(stored_key)
+    for candidate in candidates:
+        if candidate in profiles:
+            return str(profiles[candidate] or "").strip()
+    return ""
+
+
 def _load_system_prompt_profile(preset, base_model):
     key = _system_prompt_profile_key(preset, base_model)
-    custom = str(_system_prompt_profiles().get(key) or "").strip()
-    if custom:
-        return custom, custom
-    default = _system_prompt_editor_value(preset, base_model=base_model)
-    return "", default
+    values = _workflow_settings()
+    if values["system_profile_key"] == key:
+        custom = values["system_override"]
+    else:
+        custom = _stored_system_prompt_profile(preset, base_model)
+    return custom, custom
 
 
 def _save_system_prompt_profile(preset, base_model, text):
     value = str(text or "").strip()
-    if not value:
-        return "", "System Prompt 不能为空。"
     if len(value) > 100000:
-        return gr.update(), "System Prompt 不能超过 100000 个字符。"
+        return gr.update(), "补充要求不能超过 100000 个字符。"
     profiles = _system_prompt_profiles()
-    profiles[_system_prompt_profile_key(preset, base_model)] = value
+    key = _system_prompt_profile_key(preset, base_model)
+    for stored_key in list(profiles):
+        parts = stored_key.split("\x1f")
+        if len(parts) == 2 and _system_prompt_profile_key(*parts) == key:
+            profiles.pop(stored_key)
+    if value:
+        profiles[key] = value
     DB.set_setting(_SYSTEM_PROMPT_PROFILES_SETTING, profiles)
-    values = _workflow_settings()
-    values.update({"preset": _canonical_preset(preset), "base_model": _canonical_base_model(base_model), "system_override": value})
-    DB.set_setting("workflow_settings_v1", {**values, "version": 2})
-    return value, "已保存当前输出预设与模型对应的 System Prompt。"
+    _save_workflow_values({"preset": _canonical_preset(preset),
+                           "base_model": _canonical_base_model(base_model), "system_override": value})
+    return value, "已保存当前输出预设与模型对应的补充要求。" if value else "已清空当前预设的补充要求。"
 
 
 def _reset_system_prompt_profile(preset, base_model):
-    profiles = _system_prompt_profiles()
-    profiles.pop(_system_prompt_profile_key(preset, base_model), None)
-    DB.set_setting(_SYSTEM_PROMPT_PROFILES_SETTING, profiles)
-    values = _workflow_settings()
-    values["system_override"] = ""
-    DB.set_setting("workflow_settings_v1", {**values, "version": 2})
-    return _load_system_prompt_profile(preset, base_model) + ("已恢复当前输出预设的默认 System Prompt。",)
+    override, status = _save_system_prompt_profile(preset, base_model, "")
+    return override, "", status
 
 
 def _prompt_profile_change(preset, base_model):
@@ -3479,13 +3441,6 @@ def _aligned_preset(preset: str, base_model: str) -> tuple[str, bool]:
     if expected and current != expected:
         return expected, True
     return current, False
-
-
-def _aligned_quality_guidance(base_model: str) -> str:
-    return MODEL_QUALITY_GUIDANCE.get(
-        str(base_model or "Auto / checkpoint default").strip(),
-        MODEL_QUALITY_GUIDANCE["Auto / checkpoint default"],
-    )
 
 
 # Count and group tags describe how many subjects the picture has, so offering them
@@ -3548,11 +3503,27 @@ def _run_llm_generation(
     )
 
 
-def _prompt_quality_score(source: str, candidate: str, preset: str, base_model: str = "") -> float:
+def _prompt_quality_score(
+    source: str, candidate: str, preset: str, base_model: str = "", *,
+    output_contract: str = "complete",
+) -> float:
     """Reject contract violations and weakly rank tag normalization, not image quality."""
     text = str(candidate or "").strip()
-    if not text or "\n" in text:
+    layered = output_contract == "layered"
+    if not text or (not layered and ("\n" in text or "\r" in text)):
         return float("-inf")
+    if layered:
+        # These are output delimiters, not tag syntax. Only this explicit
+        # operation contract permits prose and line breaks.
+        sections = re.split(
+            r"(?m)^(PART ONE: TAG ANCHORS|BREAK|PART TWO: EXTREME LAYERED DETAIL|"
+            r"PART THREE: REFINED \+ MASTER)[ \t]*\r?$", text,
+        )
+        if (sections[0].strip() or sections[1::2] != [
+            "PART ONE: TAG ANCHORS", "BREAK", "PART TWO: EXTREME LAYERED DETAIL",
+            "PART THREE: REFINED + MASTER",
+        ] or any(not section.strip() for section in sections[2::2])):
+            return float("-inf")
     lowered = text.casefold()
     if any(marker in lowered for marker in ("let me ", "here is", "as an ai", "corrected prompt")):
         return float("-inf")
@@ -3560,7 +3531,7 @@ def _prompt_quality_score(source: str, candidate: str, preset: str, base_model: 
     score = 0.0
     preset = _canonical_preset(preset)
     tag_mode = preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags", "Danbooru + Natural"}
-    if tag_mode:
+    if tag_mode and not layered:
         canonicalizer = globals().get("canonicalize_booru_tags")
         if callable(canonicalizer):
             canonical = canonicalizer(text)
@@ -3594,7 +3565,7 @@ def _prompt_quality_score(source: str, candidate: str, preset: str, base_model: 
             elif ":" in item and not item.startswith(("<lora:", "<lyco:", "<hypernet:")):
                 return float("-inf")
             probe = probe.strip("[]() ")
-            if canonicalizer is callable:
+            if callable(canonicalizer):
                 canonical_probe = canonicalizer(probe)
                 canonical_values = canonical_probe.get("tags") or []
                 probe = canonical_values[0] if canonical_values else probe
@@ -3615,7 +3586,9 @@ def _prompt_quality_score(source: str, candidate: str, preset: str, base_model: 
         str(source or ""),
         re.IGNORECASE | re.DOTALL,
     )
-    if fixed_match:
+    # Inline candidates contain only the delta; the browser validates fixed
+    # tokens after composing that delta with the untouched source prompt.
+    if fixed_match and output_contract != "delta":
         for token in _immutable_technical_tokens(fixed_match.group(1)):
             if token.casefold() not in text.casefold():
                 return float("-inf")
@@ -3630,7 +3603,7 @@ def _generate(
     save_score, cache_result, source_kind="", source_ref="", cache_unrated=False,
     cancel_event=None,
     batch_directive="", batch_history=None,
-    connection_settings=None, preserve_inference_settings=False,
+    connection_settings=None, preserve_inference_settings=False, inline_delta=False,
 ):
     provider = _canonical_provider(provider)
     preset, base_model = _resolve_preset_model(preset, base_model)
@@ -3701,27 +3674,30 @@ def _generate(
         def build_retry_system(reason, attempt):
             if reason == "diversity":
                 retry_directive = (
-                    effective_batch_directive
-                    + "\nDIVERSITY RETRY: the previous candidate repeated content that an earlier item of "
+                    "DIVERSITY RETRY: the previous candidate repeated content that an earlier item of "
                       "this batch already used. Keep the subject, identity and every explicit constraint, "
                       "and make a meaningful, source-compatible change in action, setting or composition. "
                       "Recipe hints and variation lenses remain optional; do not add clutter to satisfy them."
                 )
             elif reason == "quality":
-                retry_directive = effective_batch_directive + (
-                    "\nQUALITY RETRY: the previous result violated the output contract or dropped a fixed technical token. "
-                    "Return one valid payload, preserving every required technical token exactly."
+                retry_directive = (
+                    "QUALITY RETRY: the previous result violated the selected output contract. "
+                    + ("Return only the expansion; fixed technical tokens stay in the source prefix and must not be repeated."
+                       if inline_delta else "Return one valid payload, preserving every required technical token exactly.")
                 )
             else:
-                retry_directive = effective_batch_directive + "\nRESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise result directly and do not spend output on analysis or reasoning."
+                retry_directive = "RESPONSE RETRY: the previous provider response reached its output limit without assistant text; return one concise result directly and do not spend output on analysis or reasoning."
             return build_system_prompt(
                 preset, base_model, safety, nsfw_injection, user_instruction, examples,
-                static_tags, system_override, retry_directive, operation_instruction,
+                static_tags, system_override, effective_batch_directive, operation_instruction,
+                retry_instruction=retry_directive,
             )
 
         quality_checker = globals().get("_prompt_quality_score")
         candidate_quality = (
-            (lambda original, candidate: quality_checker(original, candidate, preset, base_model))
+            (lambda original, candidate: quality_checker(
+                original, candidate, preset, base_model,
+                output_contract="delta" if inline_delta else "complete"))
             if callable(quality_checker) else None
         )
         result, system, diversity_retries_used = _run_llm_generation(
@@ -3818,6 +3794,7 @@ def _expand_or_polish(
     preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
+    output_contract = "layered" if uses_layered_polish(action_name, base_model) else "complete"
     instruction = build_operation_instruction(action_name, base_model)
     static_tags = _static_prompt_reference(source)
     directive = str(batch_directive or "").strip()
@@ -3851,32 +3828,14 @@ def _expand_or_polish(
             "(for example action, prop, scene, camera, or lighting); keep unlisted dimensions stable. Every item must be independently "
             "usable as a complete prompt and must not mention the batch or previous items."
         )
-    use_fixed_krea_polish = action_name == "Polish" and str(base_model or "").strip() in {"Krea 2", "Anima"}
+    def build_transform_system(retry_instruction: str = "") -> str:
+        return build_system_prompt(
+            preset, base_model, safety, nsfw_injection, user_instruction, [], static_tags=static_tags,
+            system_override=system_override, batch_directive=directive,
+            operation_instruction=instruction, retry_instruction=retry_instruction, operation=action_name,
+        )
 
-    def build_transform_system(active_directive: str) -> str:
-        if not use_fixed_krea_polish:
-            return build_system_prompt(
-                preset, base_model, safety, nsfw_injection, user_instruction, [], static_tags=static_tags,
-                system_override=system_override, batch_directive=active_directive,
-                operation_instruction=instruction,
-            )
-        sections = [KREA_ANIMA_POLISH_ROLE]
-        sections.append("MODEL-ALIGNED QUALITY POLICY:\n" + _aligned_quality_guidance(base_model))
-        if str(system_override or "").strip():
-            sections.append("Additional system requirements:\n" + str(system_override).strip())
-        if str(user_instruction or "").strip():
-            sections.append("Additional user requirements:\n" + str(user_instruction).strip())
-        sections.append(instruction)
-        if static_tags:
-            sections.append(
-                "OPTIONAL STATIC VOCABULARY REFERENCE (use zero or more compatible visible terms; never copy or force entries, "
-                "and ignore unrelated terms):\n" + ", ".join(static_tags[:60])
-            )
-        if active_directive:
-            sections.append(active_directive)
-        return "\n\n".join(sections)
-
-    system = build_transform_system(directive)
+    system = build_transform_system()
     try:
         request_temperature = float(temperature if preserve_inference_settings else (temperature or 1.0))
     except (TypeError, ValueError):
@@ -3894,33 +3853,33 @@ def _expand_or_polish(
         def build_retry_system(reason, attempt):
             if reason == "diversity":
                 retry_directive = (
-                    f"{directive}\nDIVERSITY RETRY {attempt}: the earlier candidate repeated content that "
+                    f"DIVERSITY RETRY {attempt}: the earlier candidate repeated content that "
                     "an item of this batch already used. Favor a different compatible combination of "
                     "setting, action, prop relationship, spatial layout, camera angle, time/weather and "
                     "visible daily-life context, follow the required output contract and return exactly one result."
                 )
             elif reason == "quality":
                 retry_directive = (
-                    f"{directive}\nQUALITY RETRY {attempt}: the previous result violated the output contract "
+                    f"QUALITY RETRY {attempt}: the previous result violated the output contract "
                     "or dropped a fixed technical token. Return exactly one valid result and preserve each "
                     "required technical token verbatim."
                 )
             else:
-                retry_directive = ""
-            retry_directive += "\nRESPONSE RETRY: return one concise result directly and do not spend output on analysis or reasoning."
+                retry_directive = "RESPONSE RETRY: return one concise result directly and do not spend output on analysis or reasoning."
             return build_transform_system(retry_directive)
 
-        finalize_preset = "Krea 2 Natural" if use_fixed_krea_polish else preset
         quality_checker = globals().get("_prompt_quality_score")
         candidate_quality = (
-            (lambda original, candidate: quality_checker(original, candidate, finalize_preset, base_model))
+            (lambda original, candidate: quality_checker(
+                original, candidate, preset, base_model,
+                output_contract=output_contract))
             if callable(quality_checker) else None
         )
         result, _final_system, diversity_retries_used = _run_llm_generation(
             source, provider, endpoint, model, api_key, system, build_retry_system,
             lambda raw: _finalize_generated_prompt(
-                raw, finalize_preset, safety, remove_bad, remove_terms, shuffle, spaces,
-                max_tags, structured_mode, region_count,
+                raw, preset, safety, remove_bad, remove_terms, shuffle, spaces,
+                max_tags, structured_mode, region_count, output_contract=output_contract,
             ), runtime_connection, request_temperature, timeout, max_tokens,
             send_temperature, cancel_event, preserve_inference_settings,
             gate_context, retry_limit, similarity_limit, retry_empty_result=True,
@@ -5110,8 +5069,9 @@ def _inline_generate(
     preset, base_model = _resolve_preset_model(preset_key, base_model)
     preset, _preset_aligned = _aligned_preset(preset, base_model)
     saved_workflow = _workflow_settings()
-    shared_updates = {"preset": preset_key, "base_model": base_model, "safety": safety}
-    if any(saved_workflow[key] != value for key, value in shared_updates.items()):
+    shared_updates = {"preset": preset_key, "base_model": base_model, "safety": safety,
+                      "system_override": system_override}
+    if any(saved_workflow.get(key) != value for key, value in shared_updates.items()):
         _save_workflow_values(shared_updates)
     connection = _connection_settings()
     current_prompt = str(source_tags or "").strip()
@@ -5134,7 +5094,7 @@ def _inline_generate(
         inline_source += (
             "\n\nTECHNICAL TOKENS (verbatim, excluded from semantic expansion): "
             + ", ".join(technical_tokens)
-            + ". Preserve each token exactly and do not generate replacements."
+            + ". These tokens stay in the fixed prefix; do not repeat or replace them in the expansion."
         )
     else:
         inline_source = f"USER REQUEST (FOLLOW STRICTLY):\n{inline_source}" if inline_source else ""
@@ -5145,7 +5105,7 @@ def _inline_generate(
         remove_bad, remove_terms, shuffle, spaces, max_tags,
         structured_mode, region_count, save_score, cache_result, "", "", False, cancel_event,
         INLINE_DELTA_DIRECTIVE + "\n\n" + _independent_creative_directive(recipe=_lexicon_recipe(source=inline_source)),
-        connection_settings=connection, preserve_inference_settings=True,
+        connection_settings=connection, preserve_inference_settings=True, inline_delta=True,
     )
     return generated, system, status
 
@@ -5193,9 +5153,12 @@ def inject_inline_before_negative(component, **kwargs):
 
 def _inline_cache_transform(source, action, preset, base_model, instruction, cancel_event):
     workflow, connection = _workflow_settings(), _transform_llm_settings()
+    preset, base_model = _resolve_preset_model(preset, base_model)
+    preset, _ = _aligned_preset(preset, base_model)
+    supplement, _ = _load_system_prompt_profile(preset, base_model)
     return _expand_or_polish(
-        source, _canonical_action(action), _canonical_preset(preset), workflow["system_override"],
-        _canonical_base_model(base_model), workflow["safety"], workflow["nsfw_injection"], instruction,
+        source, _canonical_action(action), preset, supplement,
+        base_model, workflow["safety"], workflow["nsfw_injection"], instruction,
         connection["provider"], connection["endpoint"], connection["model"], "",
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
@@ -6211,7 +6174,7 @@ def _api_inline_generate(payload: dict[str, Any]):
                 _INLINE_CANCEL_EVENTS[slot].clear()
             generated, system, status = _inline_generate(
                 request, payload.get("source_tags", ""), preset,
-                workflow["system_override"], base_model, safety, workflow["nsfw_injection"],
+                _load_system_prompt_profile(preset, base_model)[0], base_model, safety, workflow["nsfw_injection"],
                 workflow["user_instruction"], workflow["remove_bad"], workflow["remove_terms"],
                 workflow["shuffle"], workflow["spaces"], workflow["max_tags"],
                 workflow["structured_mode"], workflow["region_count"], workflow["save_score"],
@@ -6258,7 +6221,7 @@ def _api_auto_loop_generate(payload: dict[str, Any]):
     if safety not in {"SFW", "NSFW"}:
         raise ValueError(f"Unsupported safety mode: {safety}")
     generated, system, status = _generate_auto_loop(
-        payload.get("request", ""), preset, workflow["system_override"], base_model, safety,
+        payload.get("request", ""), preset, _load_system_prompt_profile(preset, base_model)[0], base_model, safety,
         workflow["nsfw_injection"], workflow["user_instruction"], connection["provider"],
         connection["endpoint"], connection["model"], "", connection["temperature"],
         connection["timeout"], connection["max_tokens"], connection["send_temperature"],
@@ -6917,19 +6880,20 @@ def on_ui_tabs():
                             template_status = gr.Markdown()
                     with gr.Column(scale=2, elem_classes=["lps-rules-column", "lps-panel"]):
                         with gr.Row():
-                            preset = gr.Dropdown(label="System Prompt 预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
+                            preset = gr.Dropdown(label="输出预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
                             base_model = gr.Dropdown(label="模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
-                        with gr.Accordion("编辑 System Prompt", open=False, elem_classes=["lps-preset-editor"]):
+                        with gr.Accordion("System Prompt 补充要求", open=False, elem_classes=["lps-preset-editor"]):
                             system_override = gr.State(_system_prompt_override_value(workflow["preset"], workflow["system_override"], workflow["base_model"]))
-                            system_editor = gr.Textbox(label="当前生效内容", lines=5, max_lines=20,
+                            system_editor = gr.Textbox(label="补充要求（不能替代模型预设）", lines=5, max_lines=20,
+                                placeholder="填写与模型预设兼容的补充要求；用户内容要求会明确执行",
                                 value=_system_prompt_editor_value(workflow["preset"], workflow["system_override"], workflow["base_model"]),
                                 elem_id="llm_prompt_studio_system_override")
-                            restore_preset = gr.Button("恢复所选预设", size="sm", elem_id="llm_prompt_studio_restore_preset")
+                            restore_preset = gr.Button("清空补充要求", size="sm", elem_id="llm_prompt_studio_restore_preset")
                         safety = gr.Radio(label="内容模式", choices=["SFW", "NSFW"], value=workflow["safety"], elem_id="llm_prompt_studio_safety")
                         structured_mode = gr.Dropdown(label="输出格式", choices=OUTPUT_UI_CHOICES, value=workflow["structured_mode"])
                         with gr.Accordion("高级 Prompt 约束", open=False):
                             nsfw_injection = gr.Textbox(label="NSFW System Prompt 注入", lines=2, value=workflow["nsfw_injection"], placeholder="仅在 NSFW 模式下生效")
-                            user_instruction = gr.Textbox(label="用户输出要求（低优先级）", lines=2, value=workflow["user_instruction"])
+                            user_instruction = gr.Textbox(label="用户内容要求（明确执行）", lines=2, value=workflow["user_instruction"])
                         region_count = gr.Number(label="区域数量", minimum=1, maximum=8, value=workflow["region_count"], precision=0, visible=workflow["structured_mode"] != "Plain Prompt", elem_id="llm_prompt_studio_region_count")
                         with gr.Accordion("标签后处理", open=False):
                             remove_bad = gr.Checkbox(label="移除不良标签", value=workflow["remove_bad"])
@@ -7277,9 +7241,10 @@ def on_ui_tabs():
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
                         timeout = gr.Number(label="超时（秒）", value=llm_settings["timeout"], minimum=5, maximum=600, precision=0)
                         retry_count = gr.Number(label="重试次数", value=llm_settings["retry_count"], minimum=0, maximum=5, precision=0)
-                        thinking_enabled = gr.Checkbox(label="启用思考", value=llm_settings["thinking_enabled"])
-                        thinking_budget = gr.Number(label="思考预算（0=默认）", value=llm_settings["thinking_budget"], minimum=0, maximum=262144, precision=0)
+                        thinking_enabled = gr.Checkbox(label="启用可选思考", value=llm_settings["thinking_enabled"])
+                        thinking_budget = gr.Number(label="思考预算（0=默认，仅适用支持的型号）", value=llm_settings["thinking_budget"], minimum=0, maximum=262144, precision=0)
                         reasoning_effort = gr.Dropdown(label="推理强度", choices=[("默认", ""), ("低", "low"), ("中", "medium"), ("高", "high")], value=llm_settings["reasoning_effort"])
+                    gr.Markdown("思考控制取决于服务和具体型号。强制思考的型号无法关闭；不支持独立思考预算的型号请将预算设为 0，并使用推理强度或最大输出 Token 调整。")
                     gr.Markdown("#### 独立备用连接", elem_classes=["lps-heading"])
                     with gr.Row(elem_classes=["lps-model-settings-row"]):
                         fallback_provider = gr.Dropdown(
@@ -7385,20 +7350,20 @@ def on_ui_tabs():
                         template_default = gr.Button("设为默认模板")
                         template_delete = gr.Button("删除自定义模板", variant="stop")
                     template_status = gr.Markdown(elem_classes=["lps-status"])
-                with gr.Accordion("System Prompt 与模型预设", open=True, elem_classes=["lps-preset-editor"]):
+                with gr.Accordion("模型预设与 System Prompt 补充要求", open=True, elem_classes=["lps-preset-editor"]):
                     with gr.Row():
                         preset = gr.Dropdown(label="输出预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
                         base_model = gr.Dropdown(label="对应模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
                     system_override = gr.State(_system_prompt_override_value(workflow["preset"], workflow["system_override"], workflow["base_model"]))
                     system_editor = gr.Textbox(
-                        label="自定义 System Prompt", lines=16, max_lines=50,
+                        label="补充要求（不能替代模型预设）", lines=16, max_lines=50,
                         value=_system_prompt_editor_value(workflow["preset"], workflow["system_override"], workflow["base_model"]),
-                        placeholder="编辑当前输出预设与模型组合的 System Prompt",
+                        placeholder="填写与模型预设兼容的补充要求；留空使用模型预设。格式与长度由模型预设和操作决定，用户内容要求会明确执行",
                     )
                     with gr.Row(elem_classes=["lps-primary-actions"]):
                         system_profile_save = gr.Button("保存当前预设", variant="primary")
-                        restore_preset = gr.Button("恢复默认预设")
-                    system_profile_status = gr.Markdown("选择不同输出预设和模型后，可分别保存独立 System Prompt。", elem_classes=["lps-status"])
+                        restore_preset = gr.Button("清空补充要求")
+                    system_profile_status = gr.Markdown("各模型预设可分别保存补充要求。补充要求不能替代模型预设；用户内容要求会明确执行。", elem_classes=["lps-status"])
                 prompt_template_choice = template_choice
                 prompt_template_button = template_button
                 prompt_template_name = template_name

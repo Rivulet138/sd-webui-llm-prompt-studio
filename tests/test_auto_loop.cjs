@@ -12,8 +12,16 @@ function harness(options = {}) {
     const storage = new Map();
     const timers = [];
     const workerMessages = [];
+    const scheduledTimers = new Map();
+    let clock = 0;
+    let nextTimerId = 0;
     const nativeTimer = (callback, ms) => {
         timers.push(ms);
+        if (options.manualTimers) {
+            const id = ++nextTimerId;
+            scheduledTimers.set(id, { callback, due: clock + ms });
+            return id;
+        }
         return options.suspendNativeTimers ? 1 : setTimeout(callback, 0);
     };
     const window = {
@@ -24,7 +32,8 @@ function harness(options = {}) {
         },
         addEventListener() {},
         setTimeout: nativeTimer,
-        clearTimeout,
+        clearTimeout: options.manualTimers ? id => scheduledTimers.delete(id) : clearTimeout,
+        AbortController,
         setInterval,
         clearInterval,
         requestAnimationFrame: (callback) => nativeTimer(callback, 16),
@@ -50,11 +59,26 @@ function harness(options = {}) {
     const context = vm.createContext({ window, document, console, setTimeout: nativeTimer, clearTimeout, setInterval, clearInterval, Blob, Event: DomEvent, AbortController, HTMLInputElement: Control, HTMLTextAreaElement: Control });
     const instrumented = source.replace(
         /\}\)\(\);\s*$/,
-        "window.__probe = { wait, enablePluginKeepAlive, serverQueueRowsHtml, watchServerQueue, requestNativeCacheContext, releaseNativeCacheContext, commitInlineCacheCursor, handleNativeGenerate, nativeCacheConfig, startLinkedRun, syncCacheCursor, restoreNativeCacheState: (...args) => restoreNativeCacheState(...args), installNativeCacheState: () => installNativeCacheState(), setForgeRunner: fn => { runForgeGeneration = fn; } };\n})();",
+        "window.__probe = { wait, enablePluginKeepAlive, serverQueueRowsHtml, watchServerQueue, studioFetch, setStudioFetch: fn => { studioFetch = fn; }, beginInlineRun, requestPromptApi, requestNativeCacheContext, commitInlineCacheCursor, handleNativeGenerate, nativeCacheConfig, startLinkedRun, syncCacheCursor, restoreNativeCacheState: (...args) => restoreNativeCacheState(...args), installNativeCacheState: () => installNativeCacheState(), setForgeRunner: fn => { runForgeGeneration = fn; } };\n})();",
     );
     assert.notEqual(instrumented, source);
     vm.runInContext(instrumented, context, { filename: "llm_prompt_studio_auto_loop.js" });
-    return { window, document, nodes, storage, timers, workerMessages, originals, test: window.__probe };
+    const advanceTime = async ms => {
+        const target = clock + ms;
+        while (true) {
+            const entry = [...scheduledTimers].filter(([, timer]) => timer.due <= target)
+                .sort((a, b) => a[1].due - b[1].due)[0];
+            if (!entry) break;
+            const [id, timer] = entry;
+            clock = timer.due;
+            scheduledTimers.delete(id);
+            timer.callback();
+            await flush();
+        }
+        clock = target;
+        await flush();
+    };
+    return { window, document, nodes, storage, timers, scheduledTimers, advanceTime, workerMessages, originals, test: window.__probe };
 }
 
 class Control {
@@ -239,57 +263,83 @@ test("native prepare fetches durable progress and sends null unless cursor was m
     assert.equal(calls.at(-1).body.after_id, null, "manual cursor is consumed once, not reused on forever clicks");
 });
 
-test("release acknowledges actual partial cursor before legacy local commit", async () => {
-    const h = harness({ fetch: async () => response({ released: true, committed: true, next_cursor: 12, completed_count: 2, state: "partial" }) });
+test("native injection advances the cursor before Forge completes without polling", async () => {
+    const calls = [];
+    const h = harness({ fetch: async url => {
+        calls.push(url);
+        if (url.includes("/prepare")) return response({ token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 90 });
+        assert.match(url, /\/state\?slot=txt2img$/);
+        return response(snapshot());
+    } });
     const form = cacheForm(h);
-    const run = { slot: "txt2img", nativeContextToken: "token", pendingCacheCursor: 90, activeCacheCursor: 90, pendingCacheSource: "txt2img:cache", activeCacheSource: "txt2img:cache" };
-    const released = await h.test.releaseNativeCacheContext(run, true);
-    assert.equal(released.completed_count, 2);
-    assert.equal(run.pendingCacheCursor, 12);
-    assert.equal(run.activeCacheCursor, 12);
-    h.test.commitInlineCacheCursor(run);
-    assert.equal(form.cache_cursor.value, "12");
-    assert.equal(JSON.parse(h.storage.get("llm_prompt_studio_cache_cursors_v1"))["txt2img:cache"], 12);
+    h.test.installNativeCacheState();
+    await h.test.restoreNativeCacheState("txt2img");
+    calls.length = 0;
+    let finishForge;
+    let started;
+    const injecting = new Promise(resolve => { started = resolve; });
+    h.test.setForgeRunner(async (slot, run, generate, afterClick) => {
+        assert.equal(form.cache_cursor.value, "41");
+        assert.notEqual(h.nodes.get("txt2img_prompt").children[0].value, "base prompt", "prepare attached the token claim");
+        afterClick();
+        assert.equal(form.cache_cursor.value, "90");
+        assert.equal(run.cacheCursor, 90);
+        assert.equal(h.nodes.get("txt2img_prompt").children[0].value, "base prompt", "claim is removed after injection");
+        started();
+        await new Promise(resolve => { finishForge = resolve; });
+    });
+    const pending = h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
+    await Promise.race([injecting, pending.then(() => { throw new Error("Forge did not reach injection"); })]);
+    assert.equal(JSON.parse(h.storage.get("llm_prompt_studio_cache_cursors_v1"))["txt2img:cache"], 90);
+    assert.equal(calls.length, 2, "state and prepare are the only requests while Forge is running");
+    finishForge();
+    await pending;
+    assert.equal(calls.length, 2, "completion does not release or poll native cache");
+    assert.equal(form.cache_cursor.value, "90");
 });
 
-test("release waits for Forge postprocess to commit an active native cache job", async () => {
-    let releaseCalls = 0;
+test("native zero-output completion retains the cursor advanced at injection", async () => {
+    const calls = [];
     const h = harness({ fetch: async url => {
-        if (!url.includes("/release")) return response(snapshot());
-        releaseCalls += 1;
-        return releaseCalls === 1
-            ? response({ released: false, committed: false, state: "active", completed_count: 0, next_cursor: 41 })
-            : response({ released: true, committed: true, state: "partial", completed_count: 1, next_cursor: 42 });
+        calls.push(url);
+        return response(url.includes("/prepare")
+            ? { token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 42 } : snapshot());
     } });
-    cacheForm(h);
-    const run = {
-        slot: "txt2img", nativeContextToken: "token", pendingCacheCursor: 41,
-        activeCacheCursor: 41, pendingCacheSource: "txt2img:cache", activeCacheSource: "txt2img:cache",
-    };
-    const released = await h.test.releaseNativeCacheContext(run, true);
-    assert.equal(releaseCalls, 2);
-    assert.equal(released.committed, true);
-    assert.equal(run.pendingCacheCursor, 42);
+    const form = cacheForm(h);
+    h.test.installNativeCacheState();
+    await h.test.restoreNativeCacheState("txt2img");
+    calls.length = 0;
+    h.test.setForgeRunner(async (slot, run, generate, afterClick) => { afterClick(); });
+    await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
+    assert.equal(form.cache_cursor.value, "42");
+    assert.equal(calls.length, 2);
+    assert.equal(calls.some(url => /release|progress/.test(url)), false);
+    assert.match(h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML, /缓存 Prompt 已注入/);
 });
 
-test("cancel release also waits for a delayed partial native-cache commit", async () => {
-    let releaseCalls = 0;
+test("native stop after injection preserves the full injected cursor and removes claims", async () => {
+    const calls = [];
     const h = harness({ fetch: async url => {
-        if (!url.includes("/release")) return response(snapshot());
-        releaseCalls += 1;
-        return releaseCalls === 1
-            ? response({ released: false, committed: false, state: "active", completed_count: 0, next_cursor: 41 })
-            : response({ released: true, committed: true, state: "partial", completed_count: 2, next_cursor: 43 });
+        calls.push(url);
+        return response(url.includes("/prepare")
+            ? { token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 90 } : snapshot());
     } });
-    cacheForm(h);
-    const run = {
-        slot: "txt2img", nativeContextToken: "token", pendingCacheCursor: 41,
-        activeCacheCursor: 41, pendingCacheSource: "txt2img:cache", activeCacheSource: "txt2img:cache",
-    };
-    const released = await h.test.releaseNativeCacheContext(run, false);
-    assert.equal(releaseCalls, 2);
-    assert.equal(released.committed, true);
-    assert.equal(run.pendingCacheCursor, 43);
+    const form = cacheForm(h);
+    h.test.installNativeCacheState();
+    await h.test.restoreNativeCacheState("txt2img");
+    calls.length = 0;
+    let activeRun;
+    h.test.setForgeRunner(async (slot, run, generate, afterClick) => {
+        activeRun = run;
+        afterClick();
+        h.window.llmPromptStudioAutoLoop.cancelInline(slot);
+    });
+    await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
+    assert.equal(activeRun.cancelled, true);
+    assert.equal(form.cache_cursor.value, "90");
+    assert.equal(calls.length, 2, "native stop does not issue LLM cancel or cache release");
+    assert.equal(h.nodes.get("txt2img_prompt").children[0].value, "base prompt");
+    assert.equal(h.nodes.get("txt2img_prompt").children[0].listeners.input.length, 0);
 });
 
 test("prepare actual cursor stays visible when progress advanced after the state read", async () => {
@@ -306,26 +356,32 @@ test("prepare actual cursor stays visible when progress advanced after the state
     assert.equal(h.test.syncCacheCursor("txt2img", "cache"), 57);
 });
 
-test("native status uses completed_count, not requested batch count", async () => {
-    const h = harness({ fetch: async url => response(url.includes("/prepare")
-        ? { token: "a".repeat(32), count: 4, after_id: 41, next_cursor: 90 }
-        : url.includes("/release") ? { released: true, committed: true, next_cursor: 12, completed_count: 2, state: "partial" } : snapshot()) });
-    cacheForm(h);
-    h.nodes.set("txt2img_batch_size", new Control("DIV").append(new Control("INPUT", "4")));
+test("native status reports injection without waiting for image completion counts", async () => {
+    const calls = [];
+    const h = harness({ fetch: async url => {
+        calls.push(url);
+        return response(url.includes("/prepare")
+            ? { token: "a".repeat(32), count: 4, after_id: 41, next_cursor: 90 } : snapshot());
+    } });
+    const form = cacheForm(h);
     h.test.installNativeCacheState();
     await h.test.restoreNativeCacheState("txt2img");
-    h.test.setForgeRunner(async () => {});
+    calls.length = 0;
+    h.nodes.set("txt2img_batch_size", new Control("DIV").append(new Control("INPUT", "4")));
+    h.test.setForgeRunner(async (slot, run, generate, afterClick) => { afterClick(); });
     await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
     const status = h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML;
-    assert.match(status, /2\s*\/\s*4/);
-    assert.doesNotMatch(status, /读取进度 ID|next_cursor/);
-    assert.doesNotMatch(status, /已完成 4|完成 4 张/);
+    assert.match(status, /缓存 Prompt 已注入/);
+    assert.match(status, /插件游标已推进/);
+    assert.equal(form.cache_cursor.value, "90");
+    assert.equal(calls.length, 2);
+    assert.doesNotMatch(status, /已完成 4|完成 4 张|4\s*\/\s*4/);
 });
 
 test("native browser failure never claims backend work was uncommitted", async () => {
     const h = harness({ fetch: async url => response(url.includes("/prepare")
         ? { token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 42 }
-        : url.includes("/release") ? { released: false, committed: false, state: "active", completed_count: 0, next_cursor: 41 } : snapshot()) });
+        : snapshot()) });
     cacheForm(h);
     h.test.installNativeCacheState();
     await h.test.restoreNativeCacheState("txt2img");
@@ -413,63 +469,58 @@ test("nullable processed progress remains blank and manual cursors stay source s
     assert.equal(calls.findLast(item => item.url.includes("/prepare")).body.after_id, 7);
 });
 
-test("zero-output and unconfirmed completion stop queued clicks without speculative cursor", async () => {
-    for (const committed of [false, true]) {
-        let prepares = 0;
+test("native completion or browser failure discards queued clicks without rolling back injection", async () => {
+    for (const fail of [false, true]) {
+        const calls = [];
         const h = harness({ fetch: async url => {
-            if (url.includes("/prepare")) { prepares++; return response({ token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 99 }); }
-            return response(url.includes("/release") ? { released: true, committed, next_cursor: 41, completed_count: 0, state: "completed" } : snapshot());
+            calls.push(url);
+            return response(url.includes("/prepare")
+                ? { token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 99 } : snapshot());
         } });
         const form = cacheForm(h);
         h.test.installNativeCacheState();
         await h.test.restoreNativeCacheState("txt2img");
-        h.test.setForgeRunner(async (slot, run) => { run.pendingNativeClick = true; });
+        calls.length = 0;
+        let activeRun;
+        h.test.setForgeRunner(async (slot, run, generate, afterClick) => {
+            activeRun = run;
+            afterClick();
+            run.pendingNativeClick = true;
+            if (fail) throw new Error("browser timeout");
+        });
         await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
-        await new Promise(resolve => setTimeout(resolve, 15));
-        assert.equal(prepares, 1);
-        assert.equal(form.cache_cursor.value, "41");
-        assert.notEqual(JSON.parse(h.storage.get("llm_prompt_studio_cache_cursors_v1") || "{}")["txt2img:cache"], 99);
+        assert.equal(activeRun.pendingNativeClick, false);
+        assert.equal(activeRun.busy, false);
+        assert.equal(form.cache_cursor.value, "99");
+        assert.equal(JSON.parse(h.storage.get("llm_prompt_studio_cache_cursors_v1"))["txt2img:cache"], 99);
+        assert.equal(calls.length, 2, "no completion acknowledgement or extra prepare");
+        if (fail) assert.match(h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML, /browser timeout.*插件游标已推进/);
     }
 });
 
-test("cancelled batches retain the backend-produced prefix and truthful stop status", async () => {
-    const h = harness({ fetch: async url => response(url.includes("/prepare")
-        ? { token: "a".repeat(32), count: 4, after_id: 41, next_cursor: 99 }
-        : url.includes("/release") ? { released: true, committed: true, next_cursor: 43, completed_count: 2, state: "partial" } : snapshot()) });
+test("cancelled native batches keep the full injection cursor without completion accounting", async () => {
+    const calls = [];
+    const h = harness({ fetch: async url => {
+        calls.push(url);
+        return response(url.includes("/prepare")
+            ? { token: "a".repeat(32), count: 4, after_id: 41, next_cursor: 99 } : snapshot());
+    } });
     const form = cacheForm(h);
-    h.nodes.set("txt2img_batch_size", new Control("DIV").append(new Control("INPUT", "4")));
     h.test.installNativeCacheState();
     await h.test.restoreNativeCacheState("txt2img");
-    h.test.setForgeRunner(async () => {
+    calls.length = 0;
+    h.nodes.set("txt2img_batch_size", new Control("DIV").append(new Control("INPUT", "4")));
+    h.test.setForgeRunner(async (slot, run, generate, afterClick) => {
+        afterClick();
         const message = h.window.llmPromptStudioAutoLoop.cancelInline("txt2img");
-        assert.match(message, /正在保存已经完成的图片/);
-        assert.doesNotMatch(message, /未提交/);
+        assert.match(message, /已停止/);
     });
     await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
-    assert.equal(form.cache_cursor.value, "43");
+    assert.equal(form.cache_cursor.value, "99");
+    assert.equal(calls.length, 2);
     const status = h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML;
-    assert.match(status, /2\s*\/\s*4/);
-    assert.doesNotMatch(status, /未提交|可重试/);
-});
-
-test("browser failure stops clicks queued during release acknowledgement", async () => {
-    let prepares = 0;
-    let activeRun;
-    const h = harness({ fetch: async url => {
-        if (url.includes("/prepare")) { prepares++; return response({ token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 99 }); }
-        if (url.includes("/release")) {
-            if (prepares === 1) activeRun.pendingNativeClick = true;
-            return response({ released: false, committed: false, state: "active" });
-        }
-        return response(snapshot());
-    } });
-    cacheForm(h);
-    h.test.installNativeCacheState();
-    await h.test.restoreNativeCacheState("txt2img");
-    h.test.setForgeRunner(async (slot, run) => { activeRun = run; throw new Error("browser timeout"); });
-    await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
-    await new Promise(resolve => setTimeout(resolve, 15));
-    assert.equal(prepares, 1);
+    assert.match(status, /缓存生图已停止/);
+    assert.doesNotMatch(status, /2\s*\/\s*4|未提交|可重试/);
 });
 
 test("script changes during prepare are rejected before native click", async () => {
@@ -480,7 +531,7 @@ test("script changes during prepare are rejected before native click", async () 
             form.script.value = "X/Y/Z plot";
             return response({ token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 42 });
         }
-        return response(url.includes("/release") ? { released: true, committed: false, state: "released" } : snapshot());
+        return response(snapshot());
     } });
     form = cacheForm(h);
     h.test.installNativeCacheState();
@@ -492,16 +543,30 @@ test("script changes during prepare are rejected before native click", async () 
     assert.match(h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML, /Script/);
 });
 
-test("invalid completion and release network errors never publish a speculative cursor", async () => {
-    const h = harness({ fetch: async () => response({ committed: true, next_cursor: null, completed_count: 0 }) });
-    cacheForm(h);
-    const run = { slot: "txt2img", nativeContextToken: "token", pendingCacheCursor: 99, activeCacheCursor: 99 };
-    await assert.rejects(h.test.releaseNativeCacheContext(run, true), /进度无效/);
-    h.window.fetch = async () => { throw new Error("release offline"); };
-    await assert.rejects(h.test.releaseNativeCacheContext(run, true), /release offline/);
-    assert.equal(await h.test.releaseNativeCacheContext(run, false), null);
-    assert.equal(run.nativeReleaseError, "release offline");
-    assert.equal(h.storage.size, 0);
+test("invalid prepare or transport failure never publishes an injection cursor or launches Forge", async () => {
+    for (const prepare of [
+        { token: "", count: 1, after_id: 41, next_cursor: 99 },
+        { token: "a".repeat(32), count: 1, after_id: 41, next_cursor: null },
+        { token: "a".repeat(32), count: 0, after_id: 41, next_cursor: 99 },
+        new Error("prepare offline"),
+    ]) {
+        const h = harness({ fetch: async url => {
+            if (!url.includes("/prepare")) return response(snapshot());
+            if (prepare instanceof Error) throw prepare;
+            return response(prepare);
+        } });
+        const form = cacheForm(h);
+        h.test.installNativeCacheState();
+        await h.test.restoreNativeCacheState("txt2img");
+        let forgeRuns = 0;
+        h.test.setForgeRunner(async () => { forgeRuns++; });
+        await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
+        assert.equal(forgeRuns, 0);
+        assert.equal(form.cache_cursor.value, "41");
+        assert.equal(h.storage.has("llm_prompt_studio_cache_cursors_v1"), false);
+        assert.equal(h.nodes.get("txt2img_prompt").children[0].value, "base prompt");
+        assert.match(h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML, /注入未执行/);
+    }
 });
 
 test("plugin never replaces page-global timers or RAF", () => {
@@ -638,4 +703,318 @@ test("inline controls retain their public cancellation API", () => {
     const h = harness();
     assert.equal(typeof h.window.llmPromptStudioAutoLoop.inlineOnce, "function");
     assert.equal(typeof h.window.llmPromptStudioAutoLoop.cancelInline, "function");
+});
+
+
+// Virtual time keeps provider budgets and cancellation races deterministic.
+const abortableFetch = signal => new Promise((resolve, reject) => {
+    const abort = () => reject(new Error("transport aborted"));
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+});
+
+test("generation defers all deadlines to the backend, including retries and fallback", async () => {
+    for (const endpoint of ["inline-generate", "auto-loop-generate"]) {
+        let finish;
+        const h = harness({ manualTimers: true, fetch: (url, options) => new Promise((resolve, reject) => {
+            finish = resolve;
+            options.signal.addEventListener("abort", () => reject(new Error("transport aborted")), { once: true });
+        }) });
+        const run = h.test.beginInlineRun("txt2img", "txt2img");
+        const pending = h.test.requestPromptApi(run, endpoint, { slot: "txt2img" });
+        const result = pending.catch(error => error);
+        await h.advanceTime(24 * 60 * 60 * 1000);
+        assert.deepEqual(h.timers, [], endpoint + " must not impose a competing browser deadline");
+        assert.ok(run.abortController, "the request remains cancellable after extended backend retries");
+        finish(response({ prompt: "one cat" }));
+        assert.equal((await result).prompt, "one cat");
+        assert.equal(h.scheduledTimers.size, 0);
+    }
+});
+
+test("legal 90 to 600 second inline generation keeps its request ID and succeeds", async () => {
+    for (const slot of ["txt2img", "img2img"]) {
+        let resolveGeneration;
+        const calls = [];
+        const h = harness({ manualTimers: true, fetch: (url, options) => {
+            calls.push({ url, options });
+            if (url.endsWith("/inline-generate")) return new Promise((resolve, reject) => {
+                resolveGeneration = resolve;
+                options.signal.addEventListener("abort", () => reject(new Error("transport aborted")), { once: true });
+            });
+            return Promise.resolve(response({ cancelled: true }));
+        } });
+        const run = h.test.beginInlineRun(slot, slot);
+        const pending = h.test.requestPromptApi(run, "inline-generate", { slot });
+        const result = pending.catch(error => error);
+        const id = run.requestId;
+        assert.ok(id);
+        for (const elapsed of [90000, 510000]) {
+            await h.advanceTime(elapsed);
+            assert.equal(calls[0].options.signal.aborted, false, "legal backend generation is still running");
+            assert.equal(run.requestId, id);
+        }
+        assert.equal(calls[0].options.credentials, "same-origin");
+        assert.equal("timeoutMs" in calls[0].options, false, "internal budget is not forwarded to fetch");
+        assert.equal(JSON.parse(calls[0].options.body).request_id, id);
+        resolveGeneration(response({ prompt: "one cat" }));
+        assert.equal((await result).prompt, "one cat");
+        assert.equal(calls.length, 1, "success never sends cancellation");
+        assert.equal(run.requestId, "");
+        assert.equal(run.abortController, null);
+        assert.equal(h.scheduledTimers.size, 0);
+    }
+});
+
+test("ordinary state requests still time out at exactly fifteen seconds", async () => {
+    const calls = [];
+    const h = harness({ manualTimers: true, fetch: (url, options) => {
+        calls.push({ url, options });
+        return abortableFetch(options.signal);
+    } });
+    const pending = h.test.studioFetch("/llm-prompt-studio/v1/native-cache/state?slot=txt2img").catch(error => error);
+    await h.advanceTime(14999);
+    assert.equal(calls[0].options.signal.aborted, false);
+    await h.advanceTime(1);
+    assert.equal(calls[0].options.signal.aborted, true);
+    assert.match((await pending).message, /超时/);
+    assert.deepEqual(h.timers, [15000]);
+    assert.equal(calls.length, 1);
+    assert.equal(h.scheduledTimers.size, 0);
+});
+
+// Force a deadline only in cancellation regression tests, without changing the
+// production generation budget or the request/cancel implementation.
+function forceGenerationDeadline(h) {
+    const fetch = h.test.studioFetch;
+    h.test.setStudioFetch((url, options, consumeResponse) => fetch(url, {
+        ...options,
+        ...(url.endsWith("/inline-generate") ? { timeoutMs: 15000 } : {}),
+    }, consumeResponse));
+}
+
+test("inline timeout cancels the exact slot and ID before clearing it, once per request", async () => {
+    for (const slot of ["txt2img", "img2img"]) {
+        const cancels = [];
+        let run;
+        const h = harness({ manualTimers: true, fetch: (url, options) => {
+            if (url.endsWith("/inline-generate")) return abortableFetch(options.signal);
+            cancels.push({ body: JSON.parse(options.body), liveId: run.requestId, signal: options.signal });
+            return Promise.resolve(response({ cancelled: true }));
+        } });
+        forceGenerationDeadline(h);
+        run = h.test.beginInlineRun(slot, slot);
+        const ids = [];
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const pending = h.test.requestPromptApi(run, "inline-generate", { slot }).catch(error => error);
+            ids.push(run.requestId);
+            const budget = h.timers.at(-1);
+            await h.advanceTime(budget);
+            assert.match((await pending).message, /超时/);
+            assert.equal(cancels.length, attempt + 1);
+            assert.deepEqual(cancels[attempt].body, { slot, request_id: ids[attempt] });
+            assert.equal(cancels[attempt].liveId, ids[attempt], "cancel is sent while the request ID is still owned");
+            assert.equal(cancels[attempt].signal.aborted, false, "cancel has an independent signal");
+            assert.equal(run.requestId, "");
+            assert.equal(run.abortController, null);
+            assert.equal(h.timers.at(-1), 15000, "cancel itself uses the ordinary request budget");
+            assert.equal(h.scheduledTimers.size, 0);
+        }
+        assert.notEqual(ids[0], ids[1], "a new request can be cancelled independently");
+    }
+});
+
+test("timeout cancellation failure preserves the timeout error and clears local state", async () => {
+    let cancels = 0;
+    const h = harness({ manualTimers: true, fetch: (url, options) => {
+        if (url.endsWith("/inline-generate")) return abortableFetch(options.signal);
+        cancels++;
+        return Promise.reject(new Error("cancel offline"));
+    } });
+    forceGenerationDeadline(h);
+    const run = h.test.beginInlineRun("txt2img", "txt2img");
+    const pending = h.test.requestPromptApi(run, "inline-generate", { slot: "txt2img" }).catch(error => error);
+    await h.advanceTime(h.timers[0]);
+    assert.equal(cancels, 1);
+    assert.match((await pending).message, /超时/);
+    assert.equal(run.requestId, "");
+    assert.equal(run.abortController, null);
+    assert.equal(h.scheduledTimers.size, 0);
+});
+
+test("repeated user stop sends one inline cancel and aborts the generation transport", async () => {
+    for (const slot of ["txt2img", "img2img"]) {
+        const calls = [];
+        const h = harness({ manualTimers: true, fetch: (url, options) => {
+            calls.push({ url, body: JSON.parse(options.body), signal: options.signal });
+            return url.endsWith("/inline-generate") ? abortableFetch(options.signal) : Promise.resolve(response({ cancelled: true }));
+        } });
+        const run = h.test.beginInlineRun(slot, slot);
+        const pending = h.test.requestPromptApi(run, "inline-generate", { slot }).catch(error => error);
+        const id = run.requestId;
+        h.window.llmPromptStudioAutoLoop.cancelInline(slot);
+        h.window.llmPromptStudioAutoLoop.cancelInline(slot);
+        assert.equal(calls[0].signal.aborted, true);
+        assert.equal((await pending).message, "已取消");
+        await flush();
+        assert.equal(calls.length, 2, "two stops and the rejected fetch share one backend cancellation");
+        assert.deepEqual(calls[1].body, { slot, request_id: id });
+        assert.equal(calls[1].signal.aborted, false);
+        assert.equal(run.requestId, "");
+        assert.equal(run.abortController, null);
+        assert.equal(h.scheduledTimers.size, 0);
+    }
+});
+
+test("user stop racing the timeout does not duplicate backend cancellation", async () => {
+    let cancels = 0;
+    const h = harness({ manualTimers: true, fetch: (url, options) => {
+        if (url.endsWith("/inline-generate")) return abortableFetch(options.signal);
+        cancels++;
+        return Promise.resolve(response({ cancelled: true }));
+    } });
+    forceGenerationDeadline(h);
+    const run = h.test.beginInlineRun("txt2img", "txt2img");
+    const pending = h.test.requestPromptApi(run, "inline-generate", { slot: "txt2img" }).catch(error => error);
+    const timeout = [...h.scheduledTimers.values()][0].callback;
+    timeout();
+    h.window.llmPromptStudioAutoLoop.cancelInline("txt2img");
+    h.window.llmPromptStudioAutoLoop.cancelInline("txt2img");
+    assert.equal((await pending).message, "已取消");
+    await flush();
+    assert.equal(cancels, 1);
+    assert.equal(run.requestId, "");
+    assert.equal(h.scheduledTimers.size, 0);
+});
+
+test("HTTP and network failures clear inline state without sending timeout cancellation", async () => {
+    for (const failure of [new Error("backend offline"), { ok: false, status: 500, json: async () => ({ detail: "generation failed" }) }]) {
+        const calls = [];
+        const h = harness({ manualTimers: true, fetch: async url => {
+            calls.push(url);
+            if (failure instanceof Error) throw failure;
+            return failure;
+        } });
+        const run = h.test.beginInlineRun("txt2img", "txt2img");
+        await assert.rejects(h.test.requestPromptApi(run, "inline-generate", { slot: "txt2img" }), /backend offline|generation failed/);
+        assert.equal(calls.length, 1);
+        assert.equal(run.requestId, "");
+        assert.equal(run.abortController, null);
+        assert.equal(h.scheduledTimers.size, 0);
+    }
+});
+
+
+test("inline JSON body keeps its ID and abort signal until parsing completes", async () => {
+    for (const slot of ["txt2img", "img2img"]) {
+        let finishBody;
+        let reading = false;
+        let signal;
+        const calls = [];
+        const h = harness({ manualTimers: true, fetch: async (url, options) => {
+            calls.push(url);
+            signal = options.signal;
+            return { ok: true, status: 200, json: () => {
+                reading = true;
+                return new Promise(resolve => { finishBody = resolve; });
+            } };
+        } });
+        const run = h.test.beginInlineRun(slot, slot);
+        const pending = h.test.requestPromptApi(run, "inline-generate", { slot });
+        await flush();
+        assert.equal(reading, true);
+        const id = run.requestId;
+        const controller = run.abortController;
+        await h.advanceTime(600000);
+        assert.equal(run.requestId, id);
+        assert.ok(id);
+        assert.equal(run.abortController, controller);
+        assert.equal(signal.aborted, false);
+        assert.deepEqual(h.timers, []);
+        finishBody({ prompt: "one cat" });
+        assert.equal((await pending).prompt, "one cat");
+        assert.equal(run.requestId, "");
+        assert.equal(run.abortController, null);
+        assert.equal(calls.length, 1);
+    }
+});
+
+test("stop during inline JSON parsing aborts the body and cancels the exact request once", async () => {
+    for (const slot of ["txt2img", "img2img"]) {
+        const cancels = [];
+        let bodySignal;
+        let reading = false;
+        let run;
+        const h = harness({ manualTimers: true, fetch: async (url, options) => {
+            if (url.endsWith("/inline-cancel")) {
+                cancels.push({ body: JSON.parse(options.body), liveId: run.requestId });
+                return response({ cancelled: true });
+            }
+            bodySignal = options.signal;
+            return { ok: true, status: 200, json: () => {
+                reading = true;
+                return abortableFetch(bodySignal);
+            } };
+        } });
+        run = h.test.beginInlineRun(slot, slot);
+        const pending = h.test.requestPromptApi(run, "inline-generate", { slot }).catch(error => error);
+        await flush();
+        assert.equal(reading, true);
+        const id = run.requestId;
+        await h.advanceTime(600000);
+        h.window.llmPromptStudioAutoLoop.cancelInline(slot);
+        h.window.llmPromptStudioAutoLoop.cancelInline(slot);
+        assert.equal(bodySignal.aborted, true, "external abort forwarding survives response headers");
+        assert.equal((await pending).message, "已取消");
+        await flush();
+        assert.deepEqual(cancels, [{ body: { slot, request_id: id }, liveId: id }]);
+        assert.equal(run.requestId, "");
+        assert.equal(run.abortController, null);
+        assert.equal(h.scheduledTimers.size, 0);
+    }
+});
+
+test("an explicit finite request budget includes response JSON reading", async () => {
+    let reading = false;
+    const h = harness({ manualTimers: true, fetch: async (url, options) => ({
+        ok: true, status: 200, json: () => { reading = true; return abortableFetch(options.signal); },
+    }) });
+    const pending = h.test.studioFetch("/status", {}, response => response.json()).catch(error => error);
+    await flush();
+    assert.equal(reading, true);
+    assert.equal(h.scheduledTimers.size, 1, "headers do not clear the body deadline");
+    await h.advanceTime(15000);
+    assert.equal((await pending).name, "TimeoutError");
+    assert.equal(h.scheduledTimers.size, 0);
+});
+
+test("an explicit inline deadline during JSON parsing cancels before ID cleanup", async () => {
+    const cancels = [];
+    let reading = false;
+    let run;
+    const h = harness({ manualTimers: true, fetch: async (url, options) => {
+        if (url.endsWith("/inline-cancel")) {
+            cancels.push({ body: JSON.parse(options.body), liveId: run.requestId });
+            return response({ cancelled: true });
+        }
+        return { ok: true, status: 200, json: () => {
+            reading = true;
+            return abortableFetch(options.signal);
+        } };
+    } });
+    forceGenerationDeadline(h);
+    run = h.test.beginInlineRun("txt2img", "txt2img");
+    const pending = h.test.requestPromptApi(run, "inline-generate", { slot: "txt2img" }).catch(error => error);
+    await flush();
+    assert.equal(reading, true);
+    const id = run.requestId;
+    await h.advanceTime(14999);
+    assert.equal(run.requestId, id);
+    assert.equal(cancels.length, 0);
+    await h.advanceTime(1);
+    assert.equal((await pending).name, "TimeoutError");
+    assert.deepEqual(cancels, [{ body: { slot: "txt2img", request_id: id }, liveId: id }]);
+    assert.equal(run.requestId, "");
+    assert.equal(run.abortController, null);
+    assert.equal(h.scheduledTimers.size, 0);
 });

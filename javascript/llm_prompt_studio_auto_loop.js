@@ -185,8 +185,8 @@
         return CHOICE_ALIASES[text] || text;
     }
 
-    async function studioFetch(url, options = {}) {
-        const timeoutMs = Math.max(1000, Number(options.timeoutMs ?? 15000));
+    async function studioFetch(url, options = {}, consumeResponse = null) {
+        const timeoutMs = options.timeoutMs === 0 ? 0 : Math.max(1000, Number(options.timeoutMs ?? 15000));
         const externalSignal = options.signal;
         const controller = new AbortController();
         const fetchOptions = { ...options };
@@ -198,23 +198,31 @@
             if (externalSignal.aborted) controller.abort();
             else externalSignal.addEventListener("abort", abortExternal, { once: true });
         }
-        const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-        let response;
+        let timedOut = false;
+        const timer = timeoutMs > 0 ? window.setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+        }, timeoutMs) : null;
         try {
-            response = await window.fetch(url, fetchOptions);
+            const response = await window.fetch(url, fetchOptions);
+            if (response.status === 401 || response.status === 403) {
+                throw new Error(`Studio API 认证失败 (HTTP ${response.status})，请先在当前页面完成登录或检查 --api-auth 配置`);
+            }
+            // Keep the deadline and external abort listener through body parsing.
+            const result = consumeResponse ? await consumeResponse(response) : response;
+            if (controller.signal.aborted) throw new Error("请求已中止");
+            return result;
         } catch (error) {
             if (controller.signal.aborted) {
-                throw new Error(`Studio API 请求超时或已取消：${url}`);
+                const abortedError = new Error(`Studio API 请求超时或已取消：${url}`);
+                abortedError.name = timedOut ? "TimeoutError" : "AbortError";
+                throw abortedError;
             }
             throw error;
         } finally {
-            window.clearTimeout(timer);
+            if (timer != null) window.clearTimeout(timer);
             externalSignal?.removeEventListener?.("abort", abortExternal);
         }
-        if (response.status === 401 || response.status === 403) {
-            throw new Error(`Studio API 认证失败 (HTTP ${response.status})，请先在当前页面完成登录或检查 --api-auth 配置`);
-        }
-        return response;
     }
 
     function setValue(id, value, options = {}) {
@@ -441,7 +449,7 @@
     function baseRunState(scope, slot, target = slot) {
         return {
             id: createId(scope), scope, slot, target, cancelled: false,
-            abortController: null, requestId: "", forgeStarted: false, forgeTaskId: "",
+            abortController: null, requestId: "", cancelledRequestId: "", forgeStarted: false, forgeTaskId: "",
         };
     }
 
@@ -669,24 +677,30 @@
         run.abortController = controller;
         if (requestId) run.requestId = requestId;
         try {
-            const response = await studioFetch(`/llm-prompt-studio/v1/${path}`, {
+            return await studioFetch(`/llm-prompt-studio/v1/${path}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 cache: "no-store",
                 body: JSON.stringify(requestPayload),
+                // Provider timeouts, HTTP/quality retries and fallback own the
+                // generation budget. A separate browser deadline can cut it short.
+                timeoutMs: 0,
                 ...(controller ? { signal: controller.signal } : {}),
+            }, async response => {
+                let data = null;
+                try { data = await response.json(); } catch { data = null; }
+                if (!response.ok) {
+                    const detail = data?.detail || data?.error || `HTTP ${response.status}`;
+                    throw new Error(String(detail));
+                }
+                const prompt = String(data?.prompt || "").trim();
+                if (!prompt) throw new Error(String(data?.status || "LLM 未返回可用 Prompt"));
+                assertActive(run);
+                return data;
             });
-            let data = null;
-            try { data = await response.json(); } catch { data = null; }
-            if (!response.ok) {
-                const detail = data?.detail || data?.error || `HTTP ${response.status}`;
-                throw new Error(String(detail));
-            }
-            const prompt = String(data?.prompt || "").trim();
-            if (!prompt) throw new Error(String(data?.status || "LLM 未返回可用 Prompt"));
-            assertActive(run);
-            return data;
         } catch (error) {
+            // Send the matching backend cancellation before finally drops the ID.
+            if (requestId && error?.name === "TimeoutError") cancelInlineRequest(run);
             if (controller?.signal.aborted || run.cancelled) throw new Error("已取消");
             throw error;
         } finally {
@@ -698,7 +712,9 @@
     function cancelInlineRequest(run) {
         const slot = run?.slot === "img2img" ? "img2img" : "txt2img";
         const requestId = String(run?.requestId || "").trim();
-        if (!requestId || typeof window.fetch !== "function") return;
+        if (!requestId || run.cancelledRequestId === requestId || typeof window.fetch !== "function") return;
+        // A timeout and repeated Stop clicks may race before request cleanup.
+        run.cancelledRequestId = requestId;
         // Compatibility marker for existing contract checks: the request is
         // sent through studioFetch, which delegates to window.fetch.
         // window.fetch("/llm-prompt-studio/v1/inline-cancel"

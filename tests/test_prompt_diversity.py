@@ -338,7 +338,7 @@ class GenerateGateTests(unittest.TestCase):
             _canonical_output_mode=lambda value: value or "Plain Prompt",
             _aligned_preset=lambda preset, model: (preset, False),
             _fallback_request_kwargs=lambda connection: {},
-            _finalize_generated_prompt=lambda result, *args: result,
+            _finalize_generated_prompt=lambda result, *args, **kwargs: result,
             _safe_error=str,
             LLMRequestError=LLMRequestError,
         )
