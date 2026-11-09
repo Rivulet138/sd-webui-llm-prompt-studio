@@ -796,7 +796,6 @@
             await waitForForgeGeneration(tab, run, beforeStatus, taskId, 1800000, beforeLog, launchObserved);
         } finally {
             run.forgeLaunching = false;
-            if (typeof afterClick === "function") afterClick();
             run.forgeStarted = false;
             run.forgeTaskId = "";
             const completedTaskId = taskId || currentForgeTaskId(tab) || (launchObserved ? previousTaskId : "");
@@ -1336,13 +1335,13 @@
             assertActive(run);
             run.activeCacheCursor = run.pendingCacheCursor;
             run.activeCacheSource = run.pendingCacheSource;
-            commitInlineCacheCursor(run);
             injected = true;
             validateNativeForgeScript(slot);
-            nativeGenerateBypass[slot] += 1;
-            generate.click();
-            await wait(0);
-            renderInline(slot, "success", "缓存 Prompt 已注入", "插件游标已推进，Forge 正在处理");
+            await runForgeGeneration(slot, run, generate, () => {
+                commitInlineCacheCursor(run);
+                restoreNativeCacheClaim(run);
+                renderInline(slot, "success", "缓存 Prompt 已注入", "插件游标已推进，Forge 正在处理");
+            });
         } catch (error) {
             const message = String(error?.message || error);
             run.pendingNativeClick = false;
