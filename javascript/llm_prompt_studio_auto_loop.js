@@ -1219,60 +1219,6 @@
         return data;
     }
 
-    async function releaseNativeCacheContext(run, commit) {
-        const token = String(run?.nativeContextToken || "").trim();
-        if (!token) return;
-        try {
-            // Forge can hide its busy controls before the native postprocess
-            // callback commits the cache job. Retry only that transient active
-            // state so a successful render is not reported as a backend error.
-            const maxReleasePolls = 20;
-            for (let attempt = 0; attempt < maxReleasePolls; attempt += 1) {
-                const response = await studioFetch("/llm-prompt-studio/v1/native-cache/release", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    cache: "no-store",
-                    body: JSON.stringify({ token, commit: Boolean(commit) }),
-                });
-                if (!response.ok) throw new Error(`释放缓存生图上下文失败：HTTP ${response.status}`);
-                let data = null;
-                try { data = await response.json(); } catch { data = null; }
-                if (commit && data?.committed !== true) {
-                    if (data?.state === "active" && attempt + 1 < maxReleasePolls) {
-                        await wait(250);
-                        continue;
-                    }
-                    throw new Error("Forge 尚未完成最后的图片保存");
-                }
-                if (!commit && data?.state === "active" && attempt + 1 < maxReleasePolls) {
-                    await wait(250);
-                    continue;
-                }
-                if (data?.committed === true) {
-                    const cursor = normalizeCacheCursor(data.next_cursor, null);
-                    const count = normalizeCacheCursor(data.completed_count, null);
-                    if (cursor == null || count == null) throw new Error("后端完成进度无效，请刷新读取进度");
-                    run.pendingCacheCursor = cursor;
-                    run.activeCacheCursor = cursor;
-                    run.nativeCompletedCount = count;
-                    const sourceKey = run.activeCacheSource || run.pendingCacheSource;
-                    if (sourceKey) {
-                        const [slot, source] = sourceKey.split(":");
-                        const ui = nativeCacheUiState(slot);
-                        if (ui.snapshot) ui.snapshot.cursors[source] = cursor;
-                    }
-                }
-                run.nativeContextToken = "";
-                return data;
-            }
-        } catch (error) {
-            if (!commit) run.nativeContextToken = "";
-            if (commit) throw error;
-            run.nativeReleaseError = String(error?.message || error);
-            return null;
-        }
-    }
-
     function startLinkedRun(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         const normalizedConfig = inlineConfig(slot, config);
@@ -1383,47 +1329,32 @@
             run.lastWrittenPrompt = currentPrompt;
             run.promptEdited = false;
         }
-        let completed = false;
+        let injected = false;
         try {
             renderInline(slot, "warning", "正在准备缓存生图", "即将交给 Forge 处理");
             await requestNativeCacheContext(config, run);
             assertActive(run);
             run.activeCacheCursor = run.pendingCacheCursor;
             run.activeCacheSource = run.pendingCacheSource;
-            validateNativeForgeScript(slot);
-            await runForgeGeneration(slot, run, generate);
-            assertActive(run);
-            const released = await releaseNativeCacheContext(run, true);
             commitInlineCacheCursor(run);
-            const count = released.completed_count;
-            run.completed += count;
-            completed = count > 0;
-            const partial = count < run.nativeImageCount;
-            if (!completed) run.pendingNativeClick = false;
-            renderInline(slot, partial ? "warning" : "success", partial ? "已停止，部分图片已保存" : "本批生图完成",
-                count + ' / ' + run.nativeImageCount + ' 张图片 · 可以继续生成');
+            injected = true;
+            validateNativeForgeScript(slot);
+            nativeGenerateBypass[slot] += 1;
+            generate.click();
+            await wait(0);
+            renderInline(slot, "success", "缓存 Prompt 已注入", "插件游标已推进，Forge 正在处理");
         } catch (error) {
             const message = String(error?.message || error);
             run.pendingNativeClick = false;
-            const released = await releaseNativeCacheContext(run, false);
-            if (released?.committed === true) {
-                commitInlineCacheCursor(run);
-                run.completed += released.completed_count;
-            }
-            const progress = released?.committed === true
-                ? released.completed_count + ' / ' + run.nativeImageCount + ' 张图片已保存 · 可以继续生成'
-                : run.cancelled
-                    ? "Forge 正在保存已经完成的图片，完成后缓存位置会自动更新"
-                    : message + " · 请检查 Forge 状态后重试";
             renderInline(
                 slot,
-                released?.committed === true || run.cancelled ? "warning" : "error",
-                released?.committed === true ? "已停止，部分图片已保存" : run.cancelled ? "正在完成停止" : "本批生图未完成",
-                progress,
+                injected ? "warning" : "error",
+                injected ? "缓存 Prompt 已注入，Forge 启动失败" : "缓存 Prompt 注入未执行",
+                injected ? `${message} · 插件游标已推进` : message,
             );
             discardPendingInlineCache(run);
         } finally {
-            if (!completed) discardPendingInlineCache(run);
+            discardPendingInlineCache(run);
             restoreNativeCacheClaim(run);
             const current = promptRawValue(slot);
             if (run.promptEdited) {
@@ -1434,18 +1365,8 @@
             run.busy = false;
             run.forgeStarted = false;
             run.forgeTaskId = "";
-            const continueRun = completed && run.pendingNativeClick && !run.cancelled && nativeCacheEnabled(slot);
             run.pendingNativeClick = false;
-            if (continueRun) {
-                const pendingRun = run;
-                wait(0).then(() => {
-                    if (linkedRuns[slot] === pendingRun && !pendingRun.cancelled) {
-                        void handleNativeGenerate(slot, generate);
-                    }
-                });
-            } else {
-                finishLinkedRun(run);
-            }
+            finishLinkedRun(run);
         }
     }
 

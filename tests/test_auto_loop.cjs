@@ -5,6 +5,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { test } = require("node:test");
 const source = fs.readFileSync(path.join(__dirname, "../javascript/llm_prompt_studio_auto_loop.js"), "utf8");
+const forgeUiSource = fs.readFileSync(path.join(__dirname, "../../../javascript/ui.js"), "utf8");
 
 // Exercise the browser code in a VM with native-cache controls and transport.
 function harness(options = {}) {
@@ -165,6 +166,18 @@ test("native config restores actual controls after mount without saving or gener
     assert.match(calls[0].url, /\/state\?slot=txt2img$/);
     assert.equal(h.nodes.get("txt2img_generate").clicks || 0, 0);
     assert.equal(h.test.syncCacheCursor("txt2img", "processed_cache"), 17);
+});
+
+test("Forge progress callbacks only update controls while they own the task ID", () => {
+    for (const tab of ["txt2img", "img2img"]) {
+        const taskKey = `${tab}_task_id`;
+        const submit = forgeUiSource.match(new RegExp(`function ${tab === "txt2img" ? "submit" : "submit_img2img"}\\(\\)\\s*\\{([\\s\\S]*?)\\n\\}`));
+        const restore = forgeUiSource.match(new RegExp(`function restoreProgress${tab === "txt2img" ? "Txt2img" : "Img2img"}\\(\\)\\s*\\{([\\s\\S]*?)\\n\\}`));
+        assert.ok(submit, `${tab} submit callback should remain discoverable`);
+        assert.ok(restore, `${tab} restore callback should remain discoverable`);
+        assert.match(submit[1], new RegExp(`localGet\\("${taskKey}"\\) !== id\\) return;[\\s\\S]*localRemove\\("${taskKey}"\\)`));
+        assert.match(restore[1], new RegExp(`localGet\\("${taskKey}"\\) !== id\\) return;`));
+    }
 });
 
 test("late restoration preserves user edits and saves merged config only", async () => {

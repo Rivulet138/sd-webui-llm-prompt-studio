@@ -4823,39 +4823,14 @@ def apply_native_cache_context(processing) -> str | None:
         processing._llm_prompt_studio_native_cache_token = context["token"]
         if not DB.transition_native_cache_job(claim_token, "applying", "active"):
             raise ValueError("缓存任务激活失败，已停止本次生图")
+        if DB.complete_native_cache_job(claim_token, len(prompts)) is None:
+            raise ValueError("缓存游标提交失败，已停止本次生图")
         _native_cache_get_context(claim_token)
     LOGGER.info(
         "Native cache Prompt injection applied: %s images, source=%s, cursor=%s",
         len(prompts), context["source"], context["next_cursor"],
     )
     return context["token"]
-
-
-def track_native_cache_image(processing, image) -> None:
-    if not getattr(processing, "_llm_prompt_studio_native_cache_token", ""):
-        return
-    indices = getattr(processing, "_llm_prompt_studio_native_cache_indices", None)
-    if indices is None:
-        indices = set()
-        processing._llm_prompt_studio_native_cache_indices = indices
-    indices.add(int(image.index))
-    DB.touch_native_cache_job(str(getattr(processing, "_llm_prompt_studio_native_cache_token", "")))
-
-
-def complete_native_cache_context(processing, processed) -> None:
-    token = getattr(processing, "_llm_prompt_studio_native_cache_token", "")
-    if not token:
-        return
-    indices = getattr(processing, "_llm_prompt_studio_native_cache_indices", None)
-    if indices is not None:
-        count = 0
-        while count in indices:
-            count += 1
-    else:
-        count = max(0, len(processed.images) - int(getattr(processed, "index_of_first_image", 0) or 0))
-    with _NATIVE_CACHE_CONTEXT_LOCK:
-        DB.complete_native_cache_job(token, count)
-        _native_cache_get_context(token)
 
 
 def _native_cache_release(token: str, commit: bool = False) -> dict[str, Any]:

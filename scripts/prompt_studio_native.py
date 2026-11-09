@@ -5,8 +5,6 @@ from modules import scripts, shared
 from prompt_studio_ui import (
     apply_native_cache_context,
     prepare_native_cache_processing,
-    track_native_cache_image,
-    complete_native_cache_context,
     _native_cache_fail,
 )
 
@@ -42,9 +40,6 @@ class Script(scripts.Script):
             _native_cache_fail(p)
             raise
 
-    def postprocess_image(self, p, pp, *args):
-        track_native_cache_image(p, pp)
-
     def before_process_batch(self, p, *args, **kwargs):
         # Comments may run before or after our process hook. Restore only the
         # positive raw infotext after all process hooks have finished.
@@ -52,5 +47,3 @@ class Script(scripts.Script):
         if raw is not None:
             p._all_prompts_c = list(raw)
 
-    def postprocess(self, p, processed, *args):
-        complete_native_cache_context(p, processed)
