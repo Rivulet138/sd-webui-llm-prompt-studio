@@ -530,6 +530,101 @@ class NativeCacheContextTests(unittest.TestCase):
         self.assertEqual(self.api.apply_native_cache_context(next_processing), next_job["token"])
         self.assertEqual(next_processing.all_prompts, ["base, cached two"])
 
+    def test_prepare_returns_saved_state_and_resolves_cursor_without_client_read(self):
+        for slot in ("txt2img", "img2img"):
+            for source in ("cache", "processed_cache"):
+                other_source = "processed_cache" if source == "cache" else "cache"
+                config = {"source": source, "cache_enabled": True, "write_mode": "marker", "marker": "<saved>"}
+                self.api._native_cache_state(slot, config)
+                self.db.set_setting(f"native_cache_cursor:{slot}:{source}", 1)
+                self.db.set_setting(f"native_cache_cursor:{slot}:{other_source}", 17)
+                expected = {"config": config, "cursors": {source: 1, other_source: 17}}
+                for override in ({}, {"after_id": None}, {"after_id": 0}):
+                    with self.subTest(slot=slot, source=source, override=override):
+                        payload = {"slot": slot, "source": source, "base_prompt": "base", **override}
+                        state = Mock(wraps=self.api._native_cache_state)
+                        with patch.dict(self.api._native_cache_prepare.__globals__, _native_cache_state=state):
+                            prepared = self.api._native_cache_prepare(payload)
+                        self.assertIn("cache_state", prepared)
+                        self.assertEqual(prepared["cache_state"], expected)
+                        state.assert_called_once_with(slot)
+                        after_id = 0 if override.get("after_id") == 0 else 1
+                        self.assertEqual(prepared["after_id"], after_id)
+                        self.assertEqual(prepared["next_cursor"], after_id + 1)
+                        self.assertEqual(prepared["count"], 1)
+                        self.assertEqual(self.db.get_native_cache_job(prepared["token"])["after_id"], after_id)
+                        self.assertNotIn("records", prepared)
+                        self.assertEqual(self.db.get_native_cache_cursor(slot, source), 1)
+
+    def test_terminal_contexts_release_text_without_changing_persisted_jobs(self):
+        self.db.save_prompt("large cached prompt " * 2048)
+        self.db.save_prompt("another large cached prompt " * 2048)
+        for state in ("completed", "failed", "cancelled"):
+            with self.subTest(state=state):
+                prepared = self.prepare(after_id=2, total_images=2, base_prompt="base " * 4096,
+                                        marker="unused marker " * 2048)
+                token = prepared["token"]
+                pending = self.db.get_native_cache_job(token)
+                processing = self.StableDiffusionProcessingTxt2Img()
+                processing.prompt = pending["base_prompt"] + self.marker(token)
+                processing.batch_size, processing.n_iter = 1, 2
+                if state == "completed":
+                    self.api.apply_native_cache_context(processing)
+                elif state == "failed":
+                    self.api._native_cache_fail(processing)
+                else:
+                    self.api._native_cache_release(token, False)
+                persisted = self.db.get_native_cache_job(token)
+                self.assertEqual(persisted["state"], state)
+                for key in ("records", "base_prompt", "marker"):
+                    self.assertEqual(persisted[key], pending[key])
+                first_release = None
+                for commit in (None, False, True, False):
+                    if commit is not None:
+                        released = self.api._native_cache_release(token, commit)
+                        if first_release is None:
+                            first_release = released
+                        self.assertEqual(released, first_release)
+                    cached = self.api._NATIVE_CACHE_CONTEXTS[token]
+                    self.assertEqual(cached["state"], state)
+                    self.assertTrue({"records", "base_prompt", "marker"}.isdisjoint(cached))
+                    self.assertLess(len(json.dumps(cached)), 512)
+                    self.assertEqual(self.db.get_native_cache_job(token), persisted)
+                self.assertEqual(first_release["committed"], state == "completed")
+                self.assertEqual(first_release["completed_count"], 2 if state == "completed" else 0)
+
+    def test_unfinished_contexts_reload_full_payload_from_database(self):
+        for state in ("pending", "applying", "active"):
+            with self.subTest(state=state):
+                prepared = self.prepare(total_images=2)
+                token = prepared["token"]
+                if state in {"applying", "active"}:
+                    self.assertTrue(self.db.transition_native_cache_job(token, "pending", "applying"))
+                if state == "active":
+                    self.assertTrue(self.db.transition_native_cache_job(token, "applying", "active"))
+                persisted = self.db.get_native_cache_job(token)
+                self.api._NATIVE_CACHE_CONTEXTS.clear()
+                reopened = StudioDB(self.db.path)
+                with patch.dict(self.api._native_cache_get_context.__globals__, DB=reopened):
+                    self.assertEqual(self.api._native_cache_get_context(token), persisted)
+                    released = self.api._native_cache_release(token, True)
+                    self.assertFalse(released["released"])
+                    self.assertFalse(released["committed"])
+                    self.assertEqual(released["state"], state)
+                    self.assertEqual(reopened.get_native_cache_job(token), persisted)
+                    if state == "pending":
+                        processing = self.StableDiffusionProcessingTxt2Img()
+                        processing.prompt = "base" + self.marker(token)
+                        processing.batch_size, processing.n_iter = 1, 2
+                        self.assertEqual(self.api.apply_native_cache_context(processing), token)
+                        self.assertEqual(processing.all_prompts, ["base, cached one", "base, cached two"])
+                    else:
+                        if state == "applying":
+                            self.assertTrue(reopened.transition_native_cache_job(token, "applying", "active"))
+                        self.assertEqual(reopened.complete_native_cache_job(token, 2)["state"], "completed")
+                    self.assertTrue(self.api._native_cache_release(token, False)["committed"])
+                    self.assertEqual(reopened.get_native_cache_cursor("txt2img", "cache"), 2)
+
     def test_configuration_survives_database_reopen(self):
         config = {"source": "processed_cache", "cache_enabled": True, "write_mode": "marker", "marker": "<cache>"}
         self.api._native_cache_state("img2img", config)

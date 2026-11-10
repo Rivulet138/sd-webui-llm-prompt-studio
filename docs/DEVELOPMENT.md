@@ -31,6 +31,10 @@
 
 Native Cache 在成功注入 Forge 的整批 Prompt 时即持久化完成状态并提交整批游标，不等待实际产图。注入前取消或失败不提交；成功注入后取消或异常不回滚，重复 release 保持已提交结果，不增加 Forge 轮询或逐图回调追踪。
 
+Native Cache 的 claim 只在原生 `submit` / `submit_img2img` 返回的 Prompt 参数中附加，不写入可见文本框，不触发 Prompt 的 input/change 联动。原生启动必须等到本轮 submit 捕获，按钮或日志变化不能代替该确认；没有准备上下文的普通生图 submit 在缓存注入启用时应报错，不得静默退回基础 Prompt 生图；图库 Upscale 的独立参数布局保持原生行为。浏览器停止等待后，仍存在的 Forge task ID 与中断控件继续代表忙碌，不得伪造完成状态。
+
+资源约束：Native Cache prepare 返回 `cache_state: {config, cursors}`，前端每批只发 prepare，保留面板初始化和用户编辑保存请求。等待已捕获的 Forge 任务期间只检查任务标识，终态再读取日志；无任务标识的兼容路径保留原状态检测。控件绑定记录 host 与 input/button 身份，稳定页面更新仅检查连接与包含关系，控件重新挂载时恢复设置，submit 包装独立按函数引用检查。内存上下文字典只保存 `created_at/state`，完整记录保存在数据库中。队列视图最多显示 100 条，未变化内容不重复写 DOM；任务完成判断始终使用完整 `counts`。
+
 ## 后台调度回归
 
 ```powershell

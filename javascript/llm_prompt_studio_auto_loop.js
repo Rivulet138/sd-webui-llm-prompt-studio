@@ -71,6 +71,7 @@
     const inlineRuns = { txt2img: null, img2img: null };
     const linkedRuns = { txt2img: null, img2img: null };
     const nativeGenerateBypass = { txt2img: 0, img2img: 0 };
+    const nativeSubmitBridges = new WeakSet();
     // Forge keeps its task marker in localStorage for a short period while
     // the progress callback is switching the controls back to idle. Keep the
     // last task completed by Studio per tab so a new run can distinguish that
@@ -80,8 +81,10 @@
     const processedCacheCursors = { txt2img: 0, img2img: 0 };
     const CACHE_CURSOR_STORAGE_KEY = "llm_prompt_studio_cache_cursors_v1";
     const nativeCacheUi = {};
+    const nativeUiBindings = { txt2img: null, img2img: null };
     const NATIVE_CACHE_CONFIG_FIELDS = ["source", "cache_enabled", "write_mode", "marker"];
     const serverQueueWatchers = new Map();
+    const serverQueueRendered = new WeakMap();
     const CHOICE_ALIASES = Object.freeze({
         "Danbooru 标签": "Danbooru Tags",
         "Danbooru 标签 + 自然语言": "Danbooru + Natural",
@@ -513,13 +516,20 @@
             const taskReplaced = Boolean(taskId) && Boolean(currentTaskId) && currentTaskId !== taskId;
             const busy = taskId ? taskTracked : isForgeBusy(tab, run);
             sawBusy ||= busy;
+            if (taskReplaced) {
+                throw new Error(`${tab} generation task ownership changed; prompt returned to pending`);
+            }
+            // A matching task marker is enough while Forge owns the job.
+            // Read potentially large status/log DOM only at the terminal check.
+            if (taskTracked) {
+                if (budget.expired()) break;
+                await waitForUiSignal(250);
+                continue;
+            }
             const currentStatus = String(statusHost?.textContent || "");
             const currentLog = currentForgeLog(tab);
             const logChanged = currentLog !== beforeLog;
             const statusCompleted = currentStatus !== beforeStatus && SUCCESS_PATTERN.test(currentStatus);
-            if (taskReplaced) {
-                throw new Error(`${tab} generation task ownership changed; prompt returned to pending`);
-            }
             if (!sawBusy && !taskId && !statusCompleted && !logChanged && launchBudget.expired()) {
                 throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
             }
@@ -775,9 +785,22 @@
             // Consume this bypass only for the native click that is about to
             // be dispatched. Keep it after the hidden-page guard so a failed
             // launch cannot leak a bypass into the next user click.
-            if (run.native) validateNativeForgeScript(tab);
+            if (run.native) {
+                validateNativeForgeScript(tab);
+                installNativeSubmitBridges();
+                const submitName = tab === "txt2img" ? "submit" : "submit_img2img";
+                if (!nativeSubmitBridges.has(window[submitName])) {
+                    throw new Error("Forge submit 未就绪，缓存注入未启动");
+                }
+            }
             nativeGenerateBypass[tab] += 1;
-            generate.click();
+            try {
+                generate.click();
+            } finally {
+                // A disabled/detached control may not dispatch a click. Never
+                // let its unused bypass escape into the next user request.
+                nativeGenerateBypass[tab] = 0;
+            }
             taskId = currentForgeTaskId(tab);
             // Forge's Gradio submit callback can run on a later animation
             // frame. Always wait for a fresh task ID, including native
@@ -787,11 +810,11 @@
             const launchBudget = createTimeoutBudget(10000);
             await wait(0);
             taskId = currentForgeTaskId(tab);
-            while (!taskId || taskId === previousTaskId) {
-                const launchEvidence = (!wasGenerateDisabled && Boolean(generate.disabled))
+            while (run.native ? !run.nativeSubmitCaptured : (!taskId || taskId === previousTaskId)) {
+                const launchEvidence = !run.native && ((!wasGenerateDisabled && Boolean(generate.disabled))
                     || String(find(`${tab}_status`)?.textContent || "") !== beforeStatus
-                    || currentForgeLog(tab) !== beforeLog;
-                if (launchEvidence) {
+                    || currentForgeLog(tab) !== beforeLog);
+                if (!run.native && launchEvidence) {
                     // A very fast Forge task may create and remove its task ID
                     // between two samples. Changed native controls/status/log
                     // still prove that the click was submitted.
@@ -803,6 +826,7 @@
                 await wait(25);
                 taskId = currentForgeTaskId(tab);
             }
+            if (run.native) taskId = run.nativeSubmittedTaskId;
             run.forgeStarted = true;
             run.forgeTaskId = taskId;
             run.forgeLaunching = false;
@@ -814,14 +838,19 @@
             run.forgeLaunching = false;
             run.forgeStarted = false;
             run.forgeTaskId = "";
-            const completedTaskId = taskId || currentForgeTaskId(tab) || (launchObserved ? previousTaskId : "");
-            if (completedTaskId) {
+            const remainingTaskId = currentForgeTaskId(tab);
+            const completedTaskId = run.native ? run.nativeSubmittedTaskId
+                : taskId || (launchObserved ? previousTaskId : "");
+            // A browser timeout/cancellation does not finish a queued or active
+            // Forge job. Keep its busy marker so Generate forever cannot pile
+            // more native requests onto the GPU queue.
+            if (completedTaskId && remainingTaskId !== completedTaskId) {
                 run.lastCompletedForgeTaskId = completedTaskId;
                 lastCompletedForgeTaskIds[tab] = completedTaskId;
             }
             const generateControl = findButton(`${tab}_generate`);
             const interrupting = find(`${tab}_interrupting`);
-            if (generateControl && !generateControl.disabled && !isControlShown(interrupting)) {
+            if (!remainingTaskId && generateControl && !generateControl.disabled && !isControlShown(interrupting)) {
                 const interrupt = find(`${tab}_interrupt`);
                 if (interrupt) interrupt.style.display = "none";
             }
@@ -1023,19 +1052,24 @@
         const ui = nativeCacheUiState(slot);
         if (ui.loading) return ui.loading;
         ui.attempted = true;
-        ui.loading = (async () => {
+        ui.loading = Promise.resolve().then(async () => {
             try {
                 const fetched = !ui.snapshot;
                 if (!ui.snapshot) {
-                    ui.snapshot = await fetchNativeCacheState(slot);
-                    ui.savedConfig = JSON.stringify(ui.snapshot.config);
+                    const initialState = await fetchNativeCacheState(slot);
+                    // A prepare response may have arrived while initialization
+                    // was in flight; its cursor is newer than this GET.
+                    if (!ui.snapshot) ui.snapshot = initialState;
+                    ui.savedConfig = JSON.stringify(initialState.config);
                 }
                 for (const field of NATIVE_CACHE_CONFIG_FIELDS) {
                     const host = find(inlineId(slot, field));
-                    if (!host || ui.applied.get(field) === host) continue;
+                    const element = input(inlineId(slot, field));
+                    const applied = ui.applied.get(field);
+                    if (!host || !element || (applied?.host === host && applied.element === element)) continue;
                     const value = ui.edited.has(field) ? ui.values[field] : ui.snapshot.config[field];
                     if (await restoreNativeCacheControl(slot, field, value, ui)) {
-                        ui.applied.set(field, host);
+                        ui.applied.set(field, { host, element });
                         ui.observed[field] = nativeCacheSetting(slot, field);
                     }
                 }
@@ -1047,8 +1081,12 @@
                 throw error;
             } finally {
                 ui.loading = null;
+                if (ui.restorePending) {
+                    ui.restorePending = false;
+                    void restoreNativeCacheState(slot).catch(() => {});
+                }
             }
-        })();
+        });
         return ui.loading;
     }
 
@@ -1080,8 +1118,8 @@
         }, 250);
     }
 
-    function installNativeCacheState() {
-        for (const slot of ["txt2img", "img2img"]) {
+    function installNativeCacheState(slots = ["txt2img", "img2img"]) {
+        for (const slot of slots) {
             const ui = nativeCacheUiState(slot);
             let mounted = false;
             for (const field of [...NATIVE_CACHE_CONFIG_FIELDS, "cache_cursor"]) {
@@ -1125,7 +1163,12 @@
                     });
                 }
             }
-            if (mounted && (!ui.attempted || ui.snapshot)) void restoreNativeCacheState(slot).catch(() => {});
+            if (mounted && (!ui.attempted || ui.snapshot)) {
+                // New controls can appear after the current async pass already
+                // visited their field. Reconcile once more before going idle.
+                if (ui.loading) ui.restorePending = true;
+                else void restoreNativeCacheState(slot).catch(() => {});
+            }
         }
     }
 
@@ -1175,11 +1218,7 @@
 
     async function requestNativeCacheContext(config, run) {
         const ui = nativeCacheUiState(config.slot);
-        const snapshot = await fetchNativeCacheState(config.slot);
         assertActive(run);
-        if (ui.snapshot) ui.snapshot.cursors = snapshot.cursors;
-        else ui.snapshot = snapshot;
-        showNativeCacheProgress(config.slot, config.source);
         const selectedScript = validateNativeForgeScript(config.slot);
         const settings = readNativeBatchSettings(config.slot);
         const totalImages = Math.max(1, settings.batch_size * settings.batch_count);
@@ -1187,6 +1226,7 @@
         // UI values and localStorage are never authoritative for native jobs.
         const manual = ui.manualCursors[config.source];
         const afterId = manual?.value ?? null;
+        const basePrompt = run.basePrompt;
         const response = await studioFetch("/llm-prompt-studio/v1/native-cache/prepare", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1197,7 +1237,7 @@
                 after_id: afterId,
                 selected_script: selectedScript,
                 total_images: totalImages,
-                base_prompt: run.basePrompt,
+                base_prompt: basePrompt,
                 write_mode: config.writeMode,
                 marker: config.marker,
                 allow_wrap: true,
@@ -1211,23 +1251,28 @@
         const actualAfterId = normalizeCacheCursor(data?.after_id, null);
         const count = Number(data?.count || 0);
         run.nativeContextToken = token;
-        if (!token || nextCursor == null || actualAfterId == null || count !== totalImages) {
+        if (!token || nextCursor == null || actualAfterId == null || count !== totalImages
+            || !data.cache_state?.config || !data.cache_state?.cursors) {
             throw new Error("后端未准备完整的缓存生图上下文，未启动本次生图");
         }
+        const claimSuffix = nativeClaimSuffix(token);
+        // Preparation returns the authoritative state; preserve local config
+        // edits and in-flight saves while refreshing only the cursor snapshot.
+        if (ui.snapshot) ui.snapshot.cursors = data.cache_state.cursors;
+        else ui.snapshot = data.cache_state;
         if (ui.manualCursors[config.source] === manual) delete ui.manualCursors[config.source];
         ui.snapshot.cursors[config.source] = actualAfterId;
         run.cacheCursorSource = cacheCursorKey(config.slot, config.source === "processed_cache");
         run.cacheCursor = actualAfterId;
         showNativeCacheProgress(config.slot, config.source);
-        const claimSuffix = nativeClaimSuffix(token);
-        const claimPrompt = `${promptRawValue(config.slot)}${claimSuffix}`;
-        setValue(`${config.slot}_prompt`, claimPrompt);
+        // Keep the claim out of the visible textbox. Prompt input listeners
+        // (including other extensions) must not parse and write it back while
+        // Gradio is capturing this request. The submit bridge attaches it to
+        // the serialized argument instead.
         run.nativeClaimSuffix = claimSuffix;
-        run.nativeClaimPrompt = claimPrompt;
-        run.lastWrittenPrompt = claimPrompt;
-        // Gradio serializes the textbox state on the next render turn. Yield
-        // once so the native Generate request cannot capture the old prompt.
-        await wait(0);
+        run.nativeClaimPrompt = basePrompt + claimSuffix;
+        run.nativeSubmitCaptured = false;
+        run.nativeSubmittedTaskId = "";
         run.nativeImageCount = count;
         run.pendingCacheCursor = nextCursor;
         run.pendingCacheSource = cacheCursorKey(config.slot, config.source === "processed_cache");
@@ -1237,14 +1282,14 @@
     function startLinkedRun(config) {
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         const normalizedConfig = inlineConfig(slot, config);
-        const rawPrompt = promptRawValue(slot);
-        const currentPrompt = stripStaleNativeClaim(rawPrompt);
-        if (currentPrompt !== rawPrompt) setValue(`${slot}_prompt`, currentPrompt);
         const existing = linkedRuns[slot];
         if (existing && !existing.cancelled) {
             existing.config = normalizedConfig;
             return existing;
         }
+        const rawPrompt = promptRawValue(slot);
+        const currentPrompt = stripStaleNativeClaim(rawPrompt);
+        if (currentPrompt !== rawPrompt) setValue(`${slot}_prompt`, currentPrompt);
         const run = {
             ...baseRunState("linked", slot), busy: false, count: 0, completed: 0,
             native: true, config: normalizedConfig, basePrompt: currentPrompt,
@@ -1255,6 +1300,7 @@
             pendingNativeClick: false, nativeRetryTimer: null, forgeLaunching: false,
             lastCompletedForgeTaskId: lastCompletedForgeTaskIds[slot], nativeContextToken: "", nativeImageCount: 0,
             nativeClaimSuffix: "", nativeClaimPrompt: "",
+            nativeSubmitCaptured: false, nativeSubmittedTaskId: "",
         };
         run.promptElement = input(`${slot}_prompt`);
         run.promptListener = (event) => {
@@ -1386,8 +1432,8 @@
     }
 
 
-    function installForgeInterruptHandlers() {
-        for (const slot of ["txt2img", "img2img"]) {
+    function installForgeInterruptHandlers(slots = ["txt2img", "img2img"]) {
+        for (const slot of slots) {
             const interrupt = findButton(`${slot}_interrupt`);
             if (interrupt && interrupt.dataset.llmPromptStudioIntercepted !== "true") {
                 interrupt.dataset.llmPromptStudioIntercepted = "true";
@@ -1398,8 +1444,51 @@
         }
     }
 
-    function installNativeGenerateInterceptors() {
+    function installNativeSubmitBridges() {
         for (const slot of ["txt2img", "img2img"]) {
+            const name = slot === "txt2img" ? "submit" : "submit_img2img";
+            const original = window[name];
+            if (typeof original !== "function" || nativeSubmitBridges.has(original)) continue;
+            const bridge = function (...args) {
+                // Forge gallery Upscale also calls submit(), with gallery,
+                // index and generation_info ahead of its prompt. It does not
+                // consume a new native cache batch.
+                if (slot === "txt2img" && Array.isArray(args[1]) && typeof args[4] === "string") {
+                    return original.apply(this, args);
+                }
+                const run = linkedRuns[slot];
+                if (!run?.native || !run.forgeLaunching) {
+                    if (nativeCacheEnabled(slot)) {
+                        throw new Error("缓存注入尚未准备，请使用 Generate 按钮提交生图");
+                    }
+                    return original.apply(this, args);
+                }
+                assertActive(run);
+                if (run.nativeSubmitCaptured) throw new Error("缓存生图请求不可重复提交");
+                const index = slot === "txt2img" ? 1 : 2;
+                if (!run.nativeClaimSuffix || typeof args[index] !== "string"
+                    || stripStaleNativeClaim(args[index]) !== stripStaleNativeClaim(run.nativeClaimPrompt)
+                    || run.promptEdited) {
+                    throw new Error("正面 Prompt 在准备缓存时发生变化，请重新生成");
+                }
+                const result = original.apply(this, args);
+                if (!Array.isArray(result) || typeof result[index] !== "string") {
+                    throw new Error("Forge submit 返回格式不兼容，缓存注入未提交");
+                }
+                // Reattach after other wrappers have produced their final
+                // arguments, even if an inner bridge already captured them.
+                result[index] = stripStaleNativeClaim(result[index]) + run.nativeClaimSuffix;
+                run.nativeSubmitCaptured = true;
+                run.nativeSubmittedTaskId = String(result[0] || "");
+                return result;
+            };
+            nativeSubmitBridges.add(bridge);
+            window[name] = bridge;
+        }
+    }
+
+    function installNativeGenerateInterceptors(slots = ["txt2img", "img2img"]) {
+        for (const slot of slots) {
             const toggle = find(inlineId(slot, "cache_enabled"))?.querySelector('input[type="checkbox"]');
             if (toggle && toggle.dataset.llmPromptStudioNativeCacheStatus !== "true") {
                 toggle.dataset.llmPromptStudioNativeCacheStatus = "true";
@@ -1600,16 +1689,38 @@
     }
 
     function serverQueueRowsHtml(rows) {
-        return rows.length ? rows.map((row) =>
+        if (!rows.length) return '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
+        const limit = 100;
+        const firstPending = rows.length > limit
+            ? rows.findIndex(row => !["completed", "error", "cancelled", "expired"].includes(row.status)) : 0;
+        const start = firstPending < 0 ? Math.max(0, rows.length - limit) : firstPending;
+        const visible = rows.slice(start, start + limit);
+        const summary = rows.length > limit
+            ? `<div class="lps-auto-loop-empty">显示第 ${start + 1}–${start + visible.length} 条，共 ${rows.length} 条</div>` : "";
+        return summary + visible.map((row) =>
             `<div class="lps-server-queue-row"><span>${escapeHtml(row.position)}</span><b>${escapeHtml(row.status)}</b><small>${escapeHtml(row.error || "")}</small></div>`
-        ).join("") : '<div class="lps-auto-loop-empty">暂无服务端队列记录。</div>';
+        ).join("");
+    }
+
+    function renderQueueHtml(host, html) {
+        if (!host) return;
+        const previous = serverQueueRendered.get(host);
+        if (previous?.html === html && previous.dom === host.innerHTML) return;
+        host.innerHTML = html;
+        // innerHTML normalizes entities; remember the browser's representation
+        // as well so unchanged snapshots skip writes and errors can recover.
+        serverQueueRendered.set(host, { html, dom: host.innerHTML });
     }
 
     function renderServerQueue(snapshot) {
         const statusHost = find("llm_prompt_studio_server_queue_status");
         const logHost = find("llm_prompt_studio_server_queue_log");
-        if (statusHost) statusHost.innerHTML = escapeHtml(snapshot?.status || "服务端队列状态未知");
-        if (logHost) logHost.innerHTML = serverQueueRowsHtml(Array.isArray(snapshot?.jobs) ? snapshot.jobs : []);
+        const statusHtml = escapeHtml(snapshot?.status || "服务端队列状态未知");
+        renderQueueHtml(statusHost, statusHtml);
+        if (logHost) {
+            const logHtml = serverQueueRowsHtml(Array.isArray(snapshot?.jobs) ? snapshot.jobs : []);
+            renderQueueHtml(logHost, logHtml);
+        }
     }
 
     async function watchServerQueue(batchId) {
@@ -1661,14 +1772,33 @@
     }
 
 
-    installForgeInterruptHandlers();
-    installNativeGenerateInterceptors();
-    installNativeCacheState();
-    if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(() => {
-        installForgeInterruptHandlers();
-        installNativeGenerateInterceptors();
-        installNativeCacheState();
-    });
+    function refreshNativeUiBindings() {
+        // Other extensions can wrap submit without replacing any DOM nodes.
+        installNativeSubmitBridges();
+        for (const slot of ["txt2img", "img2img"]) {
+            const prior = nativeUiBindings[slot];
+            if (prior && prior.every(({ host, control }) => host.isConnected && control.isConnected
+                && (host === control || host.contains(control)))) continue;
+            // An unmounted panel needs just one sentinel lookup until it appears.
+            if (!prior && !find(inlineId(slot, "cache_enabled"))) continue;
+            installForgeInterruptHandlers([slot]);
+            installNativeGenerateInterceptors([slot]);
+            installNativeCacheState([slot]);
+            const ids = [`${slot}_generate`, `${slot}_interrupt`,
+                ...[...NATIVE_CACHE_CONFIG_FIELDS, "cache_cursor"].map(field => inlineId(slot, field))];
+            const bindings = ids.map((id, index) => {
+                const host = find(id);
+                const control = index < 2
+                    ? (host?.matches("button") ? host : host?.querySelector("button"))
+                    : host?.querySelector("textarea, input, select");
+                return { host, control };
+            });
+            nativeUiBindings[slot] = bindings.every(({ host, control }) => host && control) ? bindings : null;
+        }
+    }
+
+    refreshNativeUiBindings();
+    if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(refreshNativeUiBindings);
     window.llmPromptStudioAutoLoop = {
         inlineOnce,
         cancelInline,

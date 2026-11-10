@@ -217,7 +217,7 @@ Krea 2 / Anima 的「润色」使用专用三段式输出：标签锚点、分�
 - 替换当前 Prompt。
 - 插入到标记位置。
 
-使用 Native Cache 时，Forge Script 设为 `None`，缓存数量应与本次批次数量一致。
+使用 Native Cache 时，Forge Script 设为 `None`，缓存数量应与本次批次数量一致。任务标记随生图请求传递，正面 Prompt 文本框保留固定内容；启用注入后请通过 Generate 按钮提交生图。
 
 #### 切换标签页与最小化
 

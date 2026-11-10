@@ -54,6 +54,7 @@ DB = StudioDB()
 RESULT_DB = StudioDB(PROCESSED_DB_PATH)
 CREDENTIALS = CredentialStore()
 LOGGER = logging.getLogger(__name__)
+# TTL bookkeeping only; full recoverable contexts are read from DB.
 _NATIVE_CACHE_CONTEXTS: dict[str, dict[str, Any]] = {}
 _NATIVE_CACHE_CONTEXT_LOCK = threading.RLock()
 _NATIVE_CACHE_CONTEXT_TTL = 30 * 60
@@ -4609,7 +4610,7 @@ def _native_cache_state(slot: str, config: dict[str, Any] | None = None) -> dict
 def _native_cache_get_context(token: str) -> dict[str, Any] | None:
     context = DB.get_native_cache_job(str(token or ""))
     if context is not None:
-        _NATIVE_CACHE_CONTEXTS[context["token"]] = context
+        _NATIVE_CACHE_CONTEXTS[context["token"]] = {"created_at": context["created_at"], "state": context["state"]}
     return context
 
 
@@ -4628,7 +4629,8 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("缓存注入暂不支持可选 Script；请将 Forge Script 设为 None")
     try:
         total_images = int(payload.get("total_images") or 1)
-        stored_cursor = DB.get_native_cache_cursor(slot, source)
+        cache_state = _native_cache_state(slot)
+        stored_cursor = cache_state["cursors"][source]
         after_id = int(payload["after_id"] if payload.get("after_id") is not None else stored_cursor or 0)
         if total_images < 1 or total_images > 100000 or after_id < 0:
             raise ValueError("invalid range")
@@ -4684,12 +4686,13 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     with _NATIVE_CACHE_CONTEXT_LOCK:
         _native_cache_cleanup_locked()
         DB.save_native_cache_job(context)
-        _NATIVE_CACHE_CONTEXTS[token] = context
+        _NATIVE_CACHE_CONTEXTS[token] = {"created_at": context["created_at"], "state": context["state"]}
     return {
         "token": token,
         "count": total_images,
         "after_id": after_id,
         "next_cursor": context["next_cursor"],
+        "cache_state": cache_state,
     }
 
 
