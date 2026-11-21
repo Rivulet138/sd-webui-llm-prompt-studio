@@ -191,7 +191,7 @@ Preserve supplied weights. Never emit score tags or a tag dump; state useful vis
 
 输出一个简洁的自然语言段落，场景由用户请求决定。按主体数量与身份、外观与服装、动作或姿势及表情、场景与重要物体、取景或构图、时间与天气及光线、具体颜色与材质事实排序。只描述可见内容，省去情节、背景故事、内心活动、对白和旁白。保留已有权重，使用具体视觉事实，避免 score 标签和标签堆砌。
 
-## 2. 四种操作模板
+## 2. 六种操作模板
 
 操作模板只说明当前任务。模型预设负责输出格式、词汇、顺序和目标模型约定，不在每个操作模板中重复。
 
@@ -242,6 +242,30 @@ Polish the supplied source while preserving its meaning.
 **中文对照**
 
 在保留源内容含义的前提下润色。
+
+### ConvertThenPolish
+
+**实际英文**
+
+```text
+Convert the supplied source, then polish the converted result.
+```
+
+**中文对照**
+
+先转换为所选模型预设，再润色转换结果。
+
+### ConvertThenExpand
+
+**实际英文**
+
+```text
+Convert the supplied source, then expand the converted result.
+```
+
+**中文对照**
+
+先转换为所选模型预设，再扩写转换结果。
 
 ## 5. UI 内置创作模板
 
@@ -452,7 +476,7 @@ RESPONSE RETRY: the previous provider response reached its output limit without 
 
 1. 每条记录独立构造用户请求，并通过同一系统提示词与模型预设处理。
 2. “忠实”模式不附加变化指令，且会复用同一输入的结果。
-3. “独立变化”模式额外加入完整单图合同、可选变化维度、请求 ID、可选词库配方以及本批已用内容上下文。勾选“静态词库抽样”后，逐条要求、共享要求和随机题材都会按批次抽取词库配方。
+3. “独立变化”模式额外加入完整单图合同、可选变化维度、请求 ID、可选词库配方以及本批已用内容上下文。勾选“静态词库抽样”，或在提示词页开启词库配方后，批量请求会按条抽取词库配方。配方只是可选参考，模型可省略不适合当前画面的词条。
 4. 变化只作用于请求未固定的维度。重复检测失败时执行多样性重试，重试不改变用户约束。
 5. Convert 和 Polish 使用各自的操作模板，不继承独立变化指令，避免缓存润色被批量创意规则污染。
 

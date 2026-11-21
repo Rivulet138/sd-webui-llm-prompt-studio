@@ -2,7 +2,7 @@
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from test_queue_regressions import ui_functions
 from test_prompt_generation_quality import quality_api
@@ -227,6 +227,40 @@ class PromptReviewFixTests(unittest.TestCase):
                         self.assertNotIn(marker, calls[0][4])
                     self.assertEqual(calls[0][6], 0.0)
 
+    def test_convert_then_polish_passes_converted_text_to_polish(self):
+        api, _calls = self.generation_api("unused")
+        chained_call = Mock(side_effect=[("converted prompt", "converted"), ("polished prompt", "polished")])
+        namespace = api._expand_or_polish.__globals__
+        with patch.dict(namespace, {"_expand_or_polish": chained_call}):
+            result, status = self.invoke(api, "ConvertThenPolish", source="source prompt")
+        self.assertEqual(result, "polished prompt")
+        self.assertIn("格式转换完成", status)
+        self.assertEqual(chained_call.call_args_list[0].args[1], "Convert")
+        self.assertEqual(chained_call.call_args_list[0].args[0], "source prompt")
+        self.assertEqual(chained_call.call_args_list[1].args[1], "Polish")
+        self.assertEqual(chained_call.call_args_list[1].args[0], "converted prompt")
+
+    def test_convert_then_expand_passes_converted_text_to_expand(self):
+        api, _calls = self.generation_api("unused")
+        chained_call = Mock(side_effect=[("converted prompt", "converted"), ("expanded prompt", "expanded")])
+        namespace = api._expand_or_polish.__globals__
+        with patch.dict(namespace, {"_expand_or_polish": chained_call}):
+            result, status = self.invoke(api, "ConvertThenExpand", source="source prompt")
+        self.assertEqual(result, "expanded prompt")
+        self.assertIn("格式转换完成", status)
+        self.assertEqual(chained_call.call_args_list[0].args[1], "Convert")
+        self.assertEqual(chained_call.call_args_list[1].args[1], "Expand")
+        self.assertEqual(chained_call.call_args_list[1].args[0], "converted prompt")
+
+    def test_chained_post_processing_stops_when_conversion_fails(self):
+        api, _calls = self.generation_api("unused")
+        chained_call = Mock(return_value=("", "conversion failed"))
+        namespace = api._expand_or_polish.__globals__
+        with patch.dict(namespace, {"_expand_or_polish": chained_call}):
+            result, status = self.invoke(api, "ConvertThenPolish", source="source prompt")
+        self.assertEqual(result, "")
+        self.assertIn("格式转换失败", status)
+        chained_call.assert_called_once()
     def test_expand_keeps_creative_lexicon_and_diversity_context(self):
         api, calls = self.generation_api("1girl, reading, by_window")
         namespace = api._expand_or_polish.__globals__

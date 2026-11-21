@@ -185,6 +185,7 @@ class KemonomimiPromptTests(unittest.TestCase):
             _independent_batch_directive=lambda index, lenses, recipe=None: self.api._recipe_directive_block(recipe),
             _connection_settings=lambda: options,
             _workflow_settings=lambda: options,
+            _diversity_settings=self.api._diversity_settings,
             _save_workflow_values=Mock(), _immutable_technical_tokens=lambda source: [],
             _AUTO_LOOP_CANCEL=threading.Event(), _BATCH_CANCEL=threading.Event(),
             _BATCH_LOCK=threading.Lock(), _BATCH_CONTROL_LOCK=threading.Lock(),
@@ -233,6 +234,35 @@ class KemonomimiPromptTests(unittest.TestCase):
         schedule.assert_not_called()
         self.assertIn("失败 0", results[-1])
         self.assertIn("新增 1", results[-1])
+
+    def test_batch_recipe_runs_for_static_sampling_and_shares_used_terms(self):
+        api, options, _generated, recipe, _schedule = self.caller_api()
+        list(api._batch_generate(
+            source_text="", skip_existing=False, skip_failed=False,
+            sources_override=["task one", "task two"], sample_static=True, **options,
+        ))
+        self.assertEqual(recipe.call_count, 2)
+        used_terms = [call.args[0] for call in recipe.call_args_list]
+        self.assertIs(used_terms[0], used_terms[1])
+        self.assertTrue(all(isinstance(terms, set) for terms in used_terms))
+
+    def test_batch_recipe_runs_when_enabled_without_static_sampling(self):
+        api, options, _generated, recipe, _schedule = self.caller_api()
+        self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": True})
+        list(api._batch_generate(
+            source_text="", skip_existing=False, skip_failed=False,
+            sources_override=["task one"], sample_static=False, **options,
+        ))
+        recipe.assert_called_once()
+
+    def test_batch_recipe_stays_disabled_when_both_options_are_off(self):
+        api, options, _generated, recipe, _schedule = self.caller_api()
+        self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": False})
+        list(api._batch_generate(
+            source_text="", skip_existing=False, skip_failed=False,
+            sources_override=["task one"], sample_static=False, **options,
+        ))
+        recipe.assert_not_called()
 
     def test_recipe_hints_can_be_omitted_without_forcing_a_replacement(self):
         block = self.api._recipe_directive_block([("prop", "物品", "paper lantern")])
