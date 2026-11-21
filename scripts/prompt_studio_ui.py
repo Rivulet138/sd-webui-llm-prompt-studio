@@ -227,7 +227,13 @@ OUTPUT_UI_CHOICES = [
 PROVIDER_UI_CHOICES = [(profile["ui_label"], provider) for provider, profile in PROVIDER_PROFILES.items()]
 OUTPUT_VALUE_ALIASES = {label: value for label, value in OUTPUT_UI_CHOICES}
 PROVIDER_VALUE_ALIASES = {label: value for label, value in PROVIDER_UI_CHOICES}
-ACTION_UI_CHOICES = [("格式转换", "Convert"), ("扩写", "Expand"), ("润色", "Polish")]
+ACTION_UI_CHOICES = [
+    ("格式转换", "Convert"),
+    ("格式转换 → 润色", "ConvertThenPolish"),
+    ("格式转换 → 扩写", "ConvertThenExpand"),
+    ("扩写", "Expand"),
+    ("润色", "Polish"),
+]
 JSON_VARIATION_MODE_CHOICES = [("多样灵感", "independent"), ("保留原意转换", "faithful")]
 ACTION_VALUE_ALIASES = {label: value for label, value in ACTION_UI_CHOICES}
 VARIATION_MODE_VALUE_ALIASES = {label: value for label, value in JSON_VARIATION_MODE_CHOICES}
@@ -882,6 +888,7 @@ def _sample_lexicon_terms(
 def _lexicon_recipe(
     used_terms: set[str] | None = None, count: int | None = None,
     dimensions: Iterable[str] | None = None, source: str = "",
+    allow_when_disabled: bool = False,
 ) -> list[tuple[str, str, str]]:
     """Sample one local-lexicon term per independent visual dimension for one item.
 
@@ -891,7 +898,7 @@ def _lexicon_recipe(
     and the coverage plan from ``_recipe_schedule``.
     """
     settings = _diversity_settings()
-    if not settings["recipe_enabled"]:
+    if not settings["recipe_enabled"] and not allow_when_disabled:
         return []
     requested = int(settings["recipe_dimensions"] if count is None else count)
     planned = [str(item) for item in (dimensions or ()) if str(item)]
@@ -2736,6 +2743,10 @@ def _batch_generate(
     pending, inserted, duplicates, score_updates, skipped, failed, request_count = [], 0, 0, 0, 0, 0, 0
     batch_history = []
     used_lenses: set[str] = set()
+    used_recipe_terms: set[str] = set()
+    diversity_settings = globals().get("_diversity_settings")
+    recipe_enabled = bool(diversity_settings().get("recipe_enabled")) if callable(diversity_settings) else False
+    use_batch_recipe = bool(sample_static or recipe_enabled)
     # One seed per batch run: the coverage plan is deterministic inside the run
     # and different between runs, so reruns explore new mixes.
     recipe_seed = random.SystemRandom().getrandbits(32)
@@ -2812,12 +2823,21 @@ def _batch_generate(
             generated, last_status = "", ""
             request_count += 1
             try:
+                recipe = []
+                if use_batch_recipe:
+                    recipe = _lexicon_recipe(
+                        used_recipe_terms,
+                        dimensions=_recipe_schedule(index, recipe_seed, source=f"{source} {base_prompt}"),
+                        source=f"{source} {base_prompt}",
+                        allow_when_disabled=bool(sample_static),
+                    )
+                batch_directive = _independent_batch_directive(index, used_lenses, recipe=recipe)
                 generated, _system, last_status = _generate(
                     source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     0, False, "", "", False, _BATCH_CANCEL,
-                    _independent_batch_directive(index, used_lenses) + "\n" + (
+                    batch_directive + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{total_label} 条。"
                         "批次上下文中的结果只用于排除重复，不要复制其措辞、构图、动作或物品组合；"
                         "请根据原要求自由选择变化，不要把任何变化维度当作硬性模板。"
@@ -3874,6 +3894,30 @@ def _expand_or_polish(
     connection_settings=None, preserve_inference_settings=False,
 ):
     action_name = _canonical_action(action)
+    chained_actions = {
+        "ConvertThenPolish": ("Convert", "Polish"),
+        "ConvertThenExpand": ("Convert", "Expand"),
+    }
+    if action_name in chained_actions:
+        first_action, second_action = chained_actions[action_name]
+        converted, convert_status = _expand_or_polish(
+            source, first_action, preset, system_override, base_model, safety, nsfw_injection,
+            user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens,
+            send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode,
+            region_count, cancel_event, "", None, connection_settings, preserve_inference_settings,
+        )
+        if not converted:
+            return "", f"格式转换失败：{convert_status}"
+        result, follow_up_status = _expand_or_polish(
+            converted, second_action, preset, system_override, base_model, safety, nsfw_injection,
+            user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens,
+            send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode,
+            region_count, cancel_event, batch_directive, previous_outputs, connection_settings,
+            preserve_inference_settings,
+        )
+        if not result:
+            return "", f"格式转换完成，但后续处理失败：{follow_up_status}"
+        return result, f"格式转换完成，{follow_up_status}"
     provider = _canonical_provider(provider)
     preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)

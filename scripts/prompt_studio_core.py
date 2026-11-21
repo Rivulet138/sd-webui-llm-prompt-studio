@@ -120,6 +120,8 @@ When source details conflict, follow the user's explicit resolution; otherwise o
 OPERATION_INSTRUCTIONS = {
     "Generate": "Create one prompt from the user's image request.",
     "Convert": "Convert the supplied source to the selected model preset.",
+    "ConvertThenPolish": "Convert the supplied source, then polish the converted result.",
+    "ConvertThenExpand": "Convert the supplied source, then expand the converted result.",
     "Expand": "Expand only the aspects the user asks to develop.",
     "Polish": "Polish the supplied source while preserving its meaning.",
 }
