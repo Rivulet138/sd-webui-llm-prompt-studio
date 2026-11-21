@@ -29,6 +29,12 @@ class Script(scripts.Script):
     def before_process(self, p, *args):
         prepare_native_cache_processing(p)
 
+    def apply_native_cache_for_script(self, p):
+        """Explicit entry for compatible selectable scripts before child jobs."""
+        self.before_process(p)
+        self.process(p)
+        return getattr(p, "_llm_prompt_studio_native_cache_token", None)
+
     def process(self, p, *args):
         try:
             token = apply_native_cache_context(p)

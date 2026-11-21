@@ -42,11 +42,12 @@ from prompt_studio_diversity import (
 )
 
 from prompt_studio_core import (
-    BASE_MODEL_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROCESSED_DB_PATH, PROVIDER_PROFILES, CredentialStore, StudioDB,
-    build_system_prompt, build_user_message, build_operation_instruction, uses_layered_polish, call_llm, get_provider_profile, is_sfw_output,
+    MODEL_PRESET_FORMATS, MODEL_PRESET_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROCESSED_DB_PATH, PROVIDER_PROFILES, CredentialStore, StudioDB,
+    build_system_prompt, build_user_message, build_operation_instruction, call_llm, get_provider_profile, is_sfw_output,
     LLMRequestError, discover_provider_models,
     discover_ranbooru_cache, load_ranbooru_cache, process_tags, canonicalize_booru_tags,
     regional_format, validate_endpoint, normalize_sampling, _cosine, _tokens,
+    prompt_constraint_conflicts, prompt_constraint_violations,
 )
 
 
@@ -82,6 +83,20 @@ def _coerce_bool(value, default: bool = False) -> bool:
     return bool(default)
 
 
+def _bounded_setting(value, default, lower, upper, cast):
+    """Parse a persisted/UI setting without letting malformed values abort a job."""
+    try:
+        parsed = cast(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    try:
+        if parsed != parsed:  # NaN
+            parsed = default
+    except TypeError:
+        parsed = default
+    return max(lower, min(parsed, upper))
+
+
 DEFAULT_LLM_SETTINGS = {
     "provider": "OpenAI Compatible",
     "endpoint": "http://127.0.0.1:1234/v1",
@@ -108,14 +123,15 @@ PROCESSED_CACHE_INFERENCE_SETTINGS_VERSION = 1
 TRANSFORM_LLM_SETTINGS_VERSION = 1
 TRANSFORM_LLM_SETTINGS_KEY = "transform_llm_settings_v1"
 MAX_SERVER_QUEUE_REQUESTS = 5000
+MAX_CACHE_TRANSFORM_RECORDS = 500
 SERVER_QUEUE_PENDING_TTL = 6 * 60 * 60
 GENERAL_CREATIVE_REQUEST_TEMPLATE = """围绕原始 Prompt 的核心主体，创作一条全新、独立成图的日系插画方向。
 
 必须保留：主体身份、用户明确固定的特征与限制，以及固定 Prompt 里的权重与技术标记。
-可自由选择：场景、动作、构图、服装、道具、时间、天气、光线与配色。
+只在用户明确允许变化的维度内创作；保留已指定的场景、服装、道具、时间、天气与光线。未指定的维度无需填充，不添加无关元素。
 每条只写一个画面：不写分镜、拼图、多面板，也不写备选方案。
-批量要求：各条在场景/动作/道具/光线上明显不同，不要只改同义词、颜色或标签顺序，也不要套用固定场景清单。
-长度与格式：遵守当前输出预设规定的字数和字段顺序；不新增风格、媒介、画质或艺术家词。
+批量要求：仅在允许变化的维度内区分各条；无法有意义地区分时保持简洁，不为避免重复而添加场景或道具。
+长度与格式：遵守当前输出预设的格式和字段顺序，按实际内容决定长度；不新增风格、媒介、画质或艺术家词。
 静态词库只作参考，仅在贴合画面时取用，不要堆砌无关元素。"""
 KEMONOMIMI_TEMPLATE = """围绕原始 Prompt 生成一条可直接用于扩散模型的兽耳可爱角色单图 Prompt。
 
@@ -130,36 +146,35 @@ INLINE_DELTA_DIRECTIVE = """INLINE PROMPT CONTRACT:
 Never echo the source Prompt twice.
 When FIXED PROMPT is non-empty it is immutable source text: return ONLY one concise English expansion to append after it, never a rewritten or repeated source prompt.
 Do not alter, translate, duplicate or include any technical token (for example <lora:...>) or trigger word from the fixed prompt; those are excluded from semantic variation.
-Vary action, environment, camera, composition, lighting, atmosphere or materials without contradicting the fixed text, and stay inside the output profile's length budget.
+Vary only aspects explicitly open to variation in the user's request, without contradicting the fixed text. Do not add unrelated subjects, props, settings, weather or lighting merely for variety.
 When FIXED PROMPT is empty, return one complete, directly usable English image prompt that follows the user's request.
 Either way: prompt text only — no title, explanation, analysis, alternatives or meta commentary."""
 PRESET_UI_CHOICES = [
     ("Danbooru 标签", "Danbooru Tags"),
-    ("Pony / Illustrious 标签", "Pony / Illustrious Tags"),
-    ("Danbooru 标签 + 自然语言", "Danbooru + Natural"),
+    ("Danbooru + 自然语言", "Danbooru + Natural"),
     ("自然语言", "Natural Language"),
-    ("Flux 自然语言", "Flux Natural"),
+    ("Pony / Illustrious 标签", "Pony / Illustrious Tags"),
     ("NoobAI 标签", "NoobAI Tags"),
+    ("Flux 自然语言", "Flux Natural"),
     ("Anima 标签", "Anima Tags"),
     ("Krea 2 自然语言", "Krea 2 Natural"),
 ]
-MODEL_UI_CHOICES = [
-    ("自动 / 使用底模默认规则", "Auto / checkpoint default"),
-    ("Pony / Illustrious", "Pony / Illustrious"),
-    ("NoobAI", "NoobAI"),
-    ("Flux", "Flux"),
-    ("Anima", "Anima"),
-    ("Krea 2", "Krea 2"),
+MODEL_UI_CHOICES = [(model, model) for model in MODEL_PRESET_FORMATS]
+MODEL_PRESET_SELECTIONS = {
+    "Danbooru Tags": ("Danbooru Tags", ""),
+    "Danbooru + Natural": ("Danbooru + Natural", ""),
+    "Natural Language": ("Natural Language", ""),
+    **{model: (preset, model) for model, preset in MODEL_PRESET_FORMATS.items()},
+}
+MODEL_PRESET_UI_CHOICES = [
+    ("Danbooru 标签", "Danbooru Tags"),
+    ("Danbooru + 自然语言", "Danbooru + Natural"),
+    ("自然语言", "Natural Language"),
+    *MODEL_UI_CHOICES,
 ]
 PRESET_VALUE_ALIASES = {label: value for label, value in PRESET_UI_CHOICES}
 BASE_MODEL_VALUE_ALIASES = {label: value for label, value in MODEL_UI_CHOICES}
-PRESET_MODEL_OVERRIDES = {
-    "Pony / Illustrious Tags": ("Danbooru Tags", "Pony / Illustrious"),
-    "Flux Natural": ("Natural Language", "Flux"),
-    "NoobAI Tags": ("NoobAI Tags", "NoobAI"),
-    "Anima Tags": ("Anima Tags", "Anima"),
-    "Krea 2 Natural": ("Krea 2 Natural", "Krea 2"),
-}
+MODEL_PRESET_VALUE_ALIASES = {label: value for label, value in MODEL_PRESET_UI_CHOICES}
 
 
 def _canonical_preset(value: Any) -> str:
@@ -173,12 +188,34 @@ def _canonical_base_model(value: Any) -> str:
     return BASE_MODEL_VALUE_ALIASES.get(text, text)
 
 
-def _resolve_preset_model(preset: Any, base_model: Any) -> tuple[str, str]:
-    """Resolve the single user-facing preset into its output profile and model rules."""
+def _model_preset_value(preset: Any, base_model: Any) -> str:
     canonical_preset = _canonical_preset(preset)
-    override = PRESET_MODEL_OVERRIDES.get(canonical_preset)
-    if override:
-        return override
+    if canonical_preset in MODEL_PRESET_SELECTIONS:
+        return canonical_preset
+    for value, (output_format, _) in MODEL_PRESET_SELECTIONS.items():
+        if output_format == canonical_preset:
+            return value
+    return "Pony / Illustrious"
+
+
+def _model_preset_components(selection: Any) -> tuple[str, str]:
+    text = str(selection or "").strip()
+    value = MODEL_PRESET_VALUE_ALIASES.get(text, text)
+    return MODEL_PRESET_SELECTIONS.get(value, MODEL_PRESET_SELECTIONS["Pony / Illustrious"])
+
+
+def _model_preset_state(selection: Any) -> tuple[str, str]:
+    return _model_preset_components(selection)
+
+
+def _resolve_preset_model(preset: Any, base_model: Any) -> tuple[str, str]:
+    """Decode the selected preset and its stored format/model identifiers."""
+    canonical_preset = _canonical_preset(preset)
+    if canonical_preset in MODEL_PRESET_SELECTIONS:
+        return MODEL_PRESET_SELECTIONS[canonical_preset]
+    for profile in MODEL_PRESET_SELECTIONS.values():
+        if profile[0] == canonical_preset:
+            return profile
     return canonical_preset, _canonical_base_model(base_model)
 
 
@@ -214,21 +251,6 @@ def _canonical_action(value: Any) -> str:
 def _canonical_variation_mode(value: Any) -> str:
     text = str(value or "").strip()
     return VARIATION_MODE_VALUE_ALIASES.get(text, text)
-PRESET_BASE_MODEL_DEFAULTS = {
-    "NoobAI Tags": "NoobAI",
-    "Anima Tags": "Anima",
-    "Krea 2 Natural": "Krea 2",
-    "Natural Language": "Auto / checkpoint default",
-    "Danbooru Tags": "Auto / checkpoint default",
-    "Danbooru + Natural": "Auto / checkpoint default",
-}
-MODEL_PRESET_ALIGNMENT = {
-    "Pony / Illustrious": "Danbooru Tags",
-    "NoobAI": "NoobAI Tags",
-    "Flux": "Natural Language",
-    "Anima": "Anima Tags",
-    "Krea 2": "Krea 2 Natural",
-}
 RANBOORU_CONTENT_CHOICES = [
     ("Tag Prompt", "tags"),
     ("自然语言 Prompt", "natural"),
@@ -251,10 +273,10 @@ RANBOORU_LINK_DEFAULTS = {
     "natural_base_model": "Krea 2",
 }
 WORKFLOW_DEFAULTS = {
-    "preset": "Danbooru Tags",
+    "preset": "Pony / Illustrious Tags",
     "system_override": "",
     "system_profile_key": "",
-    "base_model": "Auto / checkpoint default",
+    "base_model": "Pony / Illustrious",
     "safety": "SFW",
     "nsfw_injection": "",
     "user_instruction": "",
@@ -279,6 +301,7 @@ _INLINE_SLOTS: set[str] = set()
 _INLINE_LOCK = threading.RLock()
 _BATCH_CANCEL = threading.Event()
 _BATCH_LOCK = threading.Lock()
+_INLINE_CACHE_PROCESS_LOCK = threading.Lock()
 _BATCH_CONTROL_LOCK = threading.Lock()
 _BATCH_ACTIVE_TASK_ID = ""
 _STUDIO_CANCEL_EVENTS: dict[str, threading.Event] = {}
@@ -304,12 +327,7 @@ _VARIATION_DIMENSIONS = (
 )
 _BATCH_VARIATION_FOCI = _VARIATION_DIMENSIONS  # Backward-compatible test/API name; selection is no longer cyclic.
 _COMPLETE_PROMPT_CONTRACT = (
-    "Complete prompt contract: keep every source-fixed subject, identity, tag and restriction. "
-    "Make the recipe items visible only when they naturally support this image; choose one clear action, "
-    "one readable expression and one coherent setting. Add a prop, camera detail, time, weather, light, "
-    "color or material only when it improves the picture; do not force every category or fill the "
-    "foreground/midground/background. Follow the selected output profile's format and length budget; "
-    "one coherent single image per item, no checklist, storyboard or collage."
+    "Return one independently usable prompt for one image, not a checklist, storyboard or collage."
 )
 _INDEPENDENT_BATCH_LOCK = threading.Lock()
 _independent_batch_sequence = 0
@@ -338,7 +356,7 @@ _DIVERSITY_SETTINGS_KEY = "prompt_diversity_v1"
 _DIVERSITY_MEMORY_SETTING = "prompt_diversity_memory_v1"
 _SYSTEM_PROMPT_PROFILES_SETTING = "prompt_system_profiles_v1"
 _DIVERSITY_SETTINGS_DEFAULTS = {
-    "recipe_enabled": True,
+    "recipe_enabled": False,
     "recipe_dimensions": 3,
     "retry_limit": 1,
     "similarity_threshold": _MAX_CONTENT_SIMILARITY,
@@ -425,10 +443,9 @@ def _independent_batch_directive(
     lenses = _choose_variation_lenses(used_lenses, count=2)
     nonce = uuid.uuid4().hex[:12]
     return (
-        "Independent single-image batch item. " + _COMPLETE_PROMPT_CONTRACT + " "
-        f"Optional underused variation lenses for this item: {', '.join(lenses)}. Use them as loose inspiration, never as a fixed template; "
-        "choose fresh compatible details and avoid repeated concepts, actions, and props from the diversity ledger. Do not vary only style, quality words, synonyms, or tag order. "
-        "Use static vocabulary only as a reference. "
+        _COMPLETE_PROMPT_CONTRACT + " "
+        f"Optional variation lenses: {', '.join(lenses)}. Use only lenses allowed by the request. "
+        "Prefer distinct compatible choices when possible; if no meaningful variation is allowed, stay concise. "
         f"独立请求标识: {nonce}."
         + _recipe_directive_block(recipe)
     )
@@ -451,7 +468,7 @@ def _independent_creative_directive(
     nonce = uuid.uuid4().hex[:12]
     return (
         "Independent single-image inline request. " + _COMPLETE_PROMPT_CONTRACT + " "
-        f"Optional underused variation lenses: {', '.join(lenses)}. Reinterpret them freely and avoid repeated concepts from the diversity ledger. "
+        f"Optional underused variation lenses: {', '.join(lenses)}. Use a lens only if the request permits that dimension; do not introduce unrelated elements for variety. "
         "Use static vocabulary only as a reference. "
         f"Independent request id: {nonce}."
         + _recipe_directive_block(recipe)
@@ -585,7 +602,7 @@ def _diversity_settings() -> dict[str, Any]:
     if isinstance(stored, dict):
         merged.update({key: value for key, value in stored.items() if key in merged})
     return {
-        "recipe_enabled": _coerce_bool(merged.get("recipe_enabled"), True),
+        "recipe_enabled": _coerce_bool(merged.get("recipe_enabled"), False),
         "recipe_dimensions": _diversity_int(merged.get("recipe_dimensions"), 3, 1, 6),
         "retry_limit": _diversity_int(merged.get("retry_limit"), 1, 0, _MAX_DIVERSITY_RETRIES),
         "similarity_threshold": _diversity_float(
@@ -604,16 +621,16 @@ _DIVERSITY_CONTROL_KEYS = (
     "recipe_enabled", "recipe_dimensions", "retry_limit", "similarity_threshold",
     "memory_enabled", "batch_temperature_floor", "source_fold_duplicates",
 )
-_PROMPT_LAYER_NOTE = """提示词以目标模型对应的预设为基础，各部分分工如下：
+_PROMPT_LAYER_NOTE = """提示词由用户要求和目标模型预设共同决定，各部分职责如下：
 
-1. **模型预设与操作**：决定输出格式、语言、长度和结构；Krea 2 / Anima 润色使用专用三段式操作预设，其他操作使用对应模型的普通预设。
-2. **用户内容要求**：明确执行主体、内容、风格和固定细节要求，并按目标模型预设呈现。
-3. **System Prompt 补充要求**：按当前预设与模型分别保存；只补充兼容内容，不替换或限制模型预设，重复的内置规则会从请求中剔除。
-4. **模型惯例**：使用对应模型的词表、权重和原生锚点习惯。
-5. **批次与重试**：提供兼容的变化建议，保留原要求；重试纠错单独传递。
-6. **安全与参考资料**：遵守所选安全模式；词库、示例和待处理源文本不能变成新的指令。
+1. **用户图像请求与附加要求**：决定画面内容、风格和固定细节，是内容判断的依据。
+2. **模型预设**：统一决定语言、标签体系、格式、顺序、目标模型惯例、权重和质量锚点处理方式。
+3. **操作类型**：选择生成、转换、扩展或润色；具体任务边界由操作决定。
+4. **System Prompt 补充要求**：按当前预设与模型分别保存，仅补充兼容要求。
+5. **词库与格式示例**：提供可选词汇或格式参考，不提供新的画面指令。
+6. **批次与安全设置**：只在对应模式启用时生效，不能覆盖用户明确要求。
 
-补充编辑区留空即可使用模型预设，不需要复制内置预设。"""
+补充编辑区留空即可使用内置预设，无需复制其中的规则。"""
 
 
 def _save_diversity_settings(
@@ -622,7 +639,7 @@ def _save_diversity_settings(
 ) -> str:
     """Persist the prompt-page controls; every value is clamped again on read."""
     payload = {
-        "recipe_enabled": _coerce_bool(recipe_enabled, True),
+        "recipe_enabled": _coerce_bool(recipe_enabled, False),
         "recipe_dimensions": _diversity_int(recipe_dimensions, 3, 1, 6),
         "retry_limit": _diversity_int(retry_limit, 1, 0, _MAX_DIVERSITY_RETRIES),
         "similarity_threshold": _diversity_float(
@@ -668,7 +685,6 @@ def _prompt_preview_text() -> str:
     try:
         workflow = _workflow_settings()
         preset, base_model = _resolve_preset_model(workflow["preset"], workflow["base_model"])
-        preset, _aligned = _aligned_preset(preset, base_model)
         return build_system_prompt(
             preset, base_model, workflow["safety"], workflow["nsfw_injection"],
             workflow["user_instruction"], [], None,
@@ -1195,19 +1211,49 @@ def _server_queue_prepare_prompt(job, config, history, lenses, cancel_event):
         if not prompt:
             raise RuntimeError("直接生图队列中的 Prompt 为空")
         return prompt, "直接使用已处理 Prompt", True
+    temperature = _bounded_setting(config.get("temperature", 1.0), 1.0, 0.0, 2.0, float)
+    timeout = _bounded_setting(config.get("timeout", 90), 90, 5, 600, int)
+    max_tokens = _bounded_setting(config.get("max_tokens", 8096), 8096, 0, 262144, int)
+    max_tags = _bounded_setting(config.get("max_tags", 0) or 0, 0, 0, 100000, int)
+    region_count = _bounded_setting(config.get("region_count", 1) or 1, 1, 1, 128, int)
+    save_score = _bounded_setting(config.get("save_score", 0) or 0, 0, 0, 1, float)
+    retry_count = _bounded_setting(config.get("retry_count", 2), 2, 0, 5, int)
+    thinking_budget = _bounded_setting(config.get("thinking_budget", 0) or 0, 0, 0, 262144, int)
+    try:
+        sampling = normalize_sampling(config.get("top_p"), config.get("top_k"))
+    except (TypeError, ValueError, OverflowError):
+        sampling = {}
+    connection_snapshot = {
+        "provider": config.get("provider", "OpenAI Compatible"),
+        "endpoint": config.get("endpoint", ""),
+        "model": config.get("model", ""),
+        "temperature": temperature,
+        "timeout": timeout,
+        "max_tokens": max_tokens,
+        "send_temperature": _coerce_bool(config.get("send_temperature"), True),
+        "retry_count": retry_count,
+        "thinking_enabled": _coerce_bool(config.get("thinking_enabled"), False),
+        "thinking_budget": thinking_budget,
+        "reasoning_effort": str(config.get("reasoning_effort") or "").strip(),
+        "top_p": sampling.get("top_p"),
+        "top_k": sampling.get("top_k"),
+        "fallback_provider": config.get("fallback_provider", ""),
+        "fallback_endpoint": config.get("fallback_endpoint", ""),
+        "fallback_model": config.get("fallback_model", ""),
+    }
     generated, _system, status = _generate(
         job["request"], "", config.get("preset", "Danbooru Tags"), config.get("system_override", ""),
-        config.get("base_model", "Auto / checkpoint default"), config.get("safety", "SFW"),
+        config.get("base_model", "Pony / Illustrious"), config.get("safety", "SFW"),
         config.get("nsfw_injection", ""), config.get("user_instruction", ""),
         config.get("provider", "OpenAI Compatible"), config.get("endpoint", ""), config.get("model", ""), "",
-        float(config.get("temperature", 1.0)), int(config.get("timeout", 90) or 90),
-        int(config.get("max_tokens", 8096) or 8096), _coerce_bool(config.get("send_temperature"), True),
+        temperature, timeout, max_tokens, _coerce_bool(config.get("send_temperature"), True),
         _coerce_bool(config.get("remove_bad"), True), config.get("remove_terms", ""), _coerce_bool(config.get("shuffle"), False),
-        _coerce_bool(config.get("spaces"), False), int(config.get("max_tags", 0) or 0),
-        config.get("structured_mode", "Plain Prompt"), int(config.get("region_count", 1) or 1),
-        float(config.get("save_score", 0) or 0), False,
+        _coerce_bool(config.get("spaces"), False), max_tags,
+        config.get("structured_mode", "Plain Prompt"), region_count,
+        save_score, False,
         "server_queue", f"server_queue:{job['batch_id']}:{job['position']}", True, cancel_event,
         _independent_batch_directive(job["position"], lenses), batch_history=history,
+        connection_settings=connection_snapshot,
         preserve_inference_settings=True,
     )
     return generated, status, False
@@ -1335,7 +1381,15 @@ def _enqueue_server_queue(payload: dict[str, Any], cancel_event=None) -> dict[st
     merged = {
         "preset": workflow["preset"], "base_model": workflow["base_model"], "safety": workflow["safety"],
         "temperature": connection["temperature"],
+        "top_p": connection.get("top_p"), "top_k": connection.get("top_k"),
         "timeout": connection["timeout"], "max_tokens": connection["max_tokens"], "send_temperature": connection["send_temperature"],
+        "retry_count": connection.get("retry_count", 2),
+        "thinking_enabled": connection.get("thinking_enabled", False),
+        "thinking_budget": connection.get("thinking_budget", 0),
+        "reasoning_effort": connection.get("reasoning_effort", ""),
+        "fallback_provider": connection.get("fallback_provider", ""),
+        "fallback_endpoint": connection.get("fallback_endpoint", ""),
+        "fallback_model": connection.get("fallback_model", ""),
         "provider": connection["provider"], "endpoint": connection["endpoint"], "model": connection["model"],
         "system_override": workflow["system_override"], "nsfw_injection": workflow["nsfw_injection"], "user_instruction": workflow["user_instruction"],
         **{key: workflow[key] for key in ("remove_bad", "remove_terms", "shuffle", "spaces", "max_tags", "structured_mode", "region_count", "save_score")},
@@ -1347,15 +1401,20 @@ def _enqueue_server_queue(payload: dict[str, Any], cancel_event=None) -> dict[st
         merged[key] = _coerce_bool(merged.get(key), default)
     if merged["direct_prompt"] and target != "txt2img":
         raise ValueError("直接 Prompt 队列只支持 txt2img 生图")
-    merged["preset"], _preset_aligned = _aligned_preset(merged["preset"], merged["base_model"])
     batch_id = uuid.uuid4().hex
     if cancel_event is not None:
         with _SERVER_QUEUE_CANCEL_LOCK:
             _SERVER_QUEUE_CANCEL_EVENTS[batch_id] = cancel_event
-    count = DB.enqueue_server_queue(batch_id, [
-        {"request": request, "position": index, "target": merged["target"], "config": merged}
-        for index, request in enumerate(requests, start=1)
-    ])
+    try:
+        count = DB.enqueue_server_queue(batch_id, [
+            {"request": request, "position": index, "target": merged["target"], "config": merged}
+            for index, request in enumerate(requests, start=1)
+        ])
+    except Exception:
+        if cancel_event is not None:
+            with _SERVER_QUEUE_CANCEL_LOCK:
+                _SERVER_QUEUE_CANCEL_EVENTS.pop(batch_id, None)
+        raise
     if cancel_event is not None and cancel_event.is_set():
         DB.cancel_server_queue(batch_id)
         _release_server_queue_cancel_event(batch_id)
@@ -1427,11 +1486,12 @@ def _cache_choices(records: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return choices
 
 
-def _cache_records(query: str = "", min_score: float = 0, output_mode: str = "全部", base_model: str = "全部") -> list[dict[str, Any]]:
+def _cache_records(query: str = "", min_score: float = 0, output_mode: str = "全部", base_model: str = "全部",
+                   limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
     normalized_output_mode = _canonical_preset(output_mode)
     normalized_base_model = _canonical_base_model(base_model)
     return DB.list_prompts(
-        str(query or ""), limit=None,
+        str(query or ""), limit=limit, offset=offset,
         min_score=float(min_score or 0),
         output_mode="" if normalized_output_mode == "全部" else normalized_output_mode,
         base_model="" if normalized_base_model == "全部" else normalized_base_model,
@@ -1443,16 +1503,23 @@ def _refresh_cache(query: str = "", min_score: float = 0, output_mode: str = "�
 
 
 def _cache_page_update(query="", min_score=0, output_mode="全部", base_model="全部", page=1):
-    records = _cache_records(query, min_score, output_mode, base_model)
-    pages = max(1, (len(records) + CACHE_PAGE_SIZE - 1) // CACHE_PAGE_SIZE)
+    normalized_output_mode = _canonical_preset(output_mode)
+    normalized_base_model = _canonical_base_model(base_model)
+    total = DB.count_prompts(
+        str(query or ""), float(min_score or 0),
+        "" if normalized_output_mode == "全部" else normalized_output_mode,
+        "" if normalized_base_model == "全部" else normalized_base_model,
+    )
+    pages = max(1, (total + CACHE_PAGE_SIZE - 1) // CACHE_PAGE_SIZE)
     page = max(1, min(int(page or 1), pages))
-    visible = records[(page - 1) * CACHE_PAGE_SIZE:page * CACHE_PAGE_SIZE]
-    message = f"匹配 {len(records)} 条 · 第 {page}/{pages} 页 · 每页 {CACHE_PAGE_SIZE} 条。点击行编辑全文。"
+    visible = _cache_records(query, min_score, output_mode, base_model,
+                             limit=CACHE_PAGE_SIZE, offset=(page - 1) * CACHE_PAGE_SIZE)
+    message = f"匹配 {total} 条 · 第 {page}/{pages} 页 · 每页 {CACHE_PAGE_SIZE} 条。点击行编辑全文。"
     return gr.update(value=_as_rows(visible)), gr.update(choices=_cache_choices(visible), value=[]), message, page
 
 
 def _filtered_cache_updates(query: str = "", min_score: float = 0, output_mode: str = "全部", base_model: str = "全部", selected=None):
-    records = _cache_records(query, min_score, output_mode, base_model)
+    records = _cache_records(query, min_score, output_mode, base_model, limit=CACHE_PAGE_SIZE)
     available_ids = {str(record["id"]) for record in records}
     retained_selection = [value for value in _selected_values(selected) if value in available_ids]
     return (
@@ -1505,7 +1572,7 @@ def _ranbooru_link_settings() -> dict[str, Any]:
         if values[key] not in PRESETS:
             values[key] = RANBOORU_LINK_DEFAULTS[key]
     for key in ("tag_base_model", "natural_base_model"):
-        if values[key] not in BASE_MODEL_GUIDANCE:
+        if values[key] and values[key] not in MODEL_PRESET_GUIDANCE:
             values[key] = RANBOORU_LINK_DEFAULTS[key]
     try:
         values["min_source_score"] = max(0, int(values["min_source_score"] or 0))
@@ -1560,12 +1627,15 @@ def _workflow_settings() -> dict[str, Any]:
     if stored_version < 2:
         values["batch_skip_existing"] = False
     preset_values = {value for _, value in PRESET_UI_CHOICES}
-    model_values = {value for _, value in MODEL_UI_CHOICES}
+    model_values = {"", *(value for _, value in MODEL_UI_CHOICES)}
     output_values = {value for _, value in OUTPUT_UI_CHOICES}
     if values["preset"] not in preset_values:
         values["preset"] = WORKFLOW_DEFAULTS["preset"]
     if values["base_model"] not in model_values:
-        values["base_model"] = WORKFLOW_DEFAULTS["base_model"]
+        values["base_model"] = ""
+    values["preset"], values["base_model"] = _model_preset_components(
+        _model_preset_value(values["preset"], values["base_model"])
+    )
     if values["structured_mode"] not in output_values:
         values["structured_mode"] = WORKFLOW_DEFAULTS["structured_mode"]
     if values["safety"] not in {"SFW", "NSFW"}:
@@ -1611,6 +1681,9 @@ def _save_workflow_values(updates: dict[str, Any]) -> str:
     values = _workflow_settings()
     previous_key = values["system_profile_key"]
     values.update(updates)
+    values["preset"], values["base_model"] = _resolve_preset_model(
+        values["preset"], values["base_model"]
+    )
     key = _system_prompt_profile_key(values["preset"], values["base_model"])
     if "system_override" not in updates and key != previous_key:
         values["system_override"] = _stored_system_prompt_profile(values["preset"], values["base_model"])
@@ -2100,10 +2173,10 @@ def _load_record(record_id):
     except (TypeError, ValueError):
         record = None
     if not record:
-        return "", "", "", "Danbooru Tags", "Auto / checkpoint default", 0, "", "未找到该记录"
+        return "", "", "", "Danbooru Tags", "Pony / Illustrious", 0, "", "未找到该记录"
     return (
         str(record["id"]), record["prompt"], record["negative_prompt"],
-        record["output_mode"] or "Danbooru Tags", record["base_model"] or "Auto / checkpoint default",
+        record["output_mode"] or "Danbooru Tags", record["base_model"] or "Pony / Illustrious",
         record["score"], record["tags"],
         f"已载入记录 #{record['id']}，可在下方编辑全文。",
     )
@@ -2159,7 +2232,7 @@ def _select_cache_row_from_view(page, query, min_score, output_mode, base_model,
 def _load_selected_record(selected_ids):
     values = _selected_values(selected_ids)
     if len(values) != 1:
-        return "", "", "", "Danbooru Tags", "Auto / checkpoint default", 0, "", f"已选择 {len(values)} 条。编辑前请选择一条记录。"
+        return "", "", "", "Danbooru Tags", "Pony / Illustrious", 0, "", f"已选择 {len(values)} 条。编辑前请选择一条记录。"
     return _load_record(values[0])
 
 
@@ -2498,7 +2571,7 @@ def _build_inspiration_sources(
     topic_pool: str = "",
     base_prompt: str = "",
     lock_known: bool = True,
-    sample_static: bool = True,
+    sample_static: bool = False,
     shared_request: str = "",
 ) -> tuple[list[str], dict[str, int]]:
     """Create varied batch requests when the user has no per-line request."""
@@ -2558,7 +2631,7 @@ def _build_inspiration_sources(
     return sources, {"ignored": 0, "duplicates": 0, "generated": len(sources), **dedupe_stats}
 
 
-def _preview_batch_sources(source_text, skip_existing, preset, base_model, generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=True, shared_request=""):
+def _preview_batch_sources(source_text, skip_existing, preset, base_model, generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=False, shared_request=""):
     sources, stats = _build_inspiration_sources(source_text, generation_count, topic_pool, base_prompt, lock_known, sample_static, shared_request)
     cached_sources = DB.existing_source_prompts(sources, preset, base_model) if skip_existing else set()
     cached = sum(1 for source in sources if source in cached_sources)
@@ -2626,7 +2699,7 @@ def _batch_generate(
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     query="", min_score=0, filter_output_mode="全部", filter_base_model="全部", existing_issues=None, task_id="",
-    generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=True,
+    generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=False,
     shared_request="",
     sources_override=None,
 ):
@@ -2638,7 +2711,6 @@ def _batch_generate(
     if sources_override is not None:
         sources = list(sources_override)[:200]
     preset, base_model = _resolve_preset_model(preset, base_model)
-    preset, _preset_aligned = _aligned_preset(preset, base_model)
     if not sources:
         yield _batch_output("没有可生成的批量任务。", gr.update(), gr.update(), existing_issues or [])
         return
@@ -2649,10 +2721,18 @@ def _batch_generate(
     with _BATCH_CONTROL_LOCK:
         _BATCH_ACTIVE_TASK_ID = task_id
         _BATCH_CANCEL.clear()
-    cached_sources = {
-        source for source in set(sources)
-        if skip_existing and DB.has_source_prompt(source, preset, base_model)
-    }
+    try:
+        cached_sources = {
+            source for source in set(sources)
+            if skip_existing and DB.has_source_prompt(source, preset, base_model)
+        }
+    except BaseException:
+        with _BATCH_CONTROL_LOCK:
+            if _BATCH_ACTIVE_TASK_ID == task_id:
+                _BATCH_ACTIVE_TASK_ID = ""
+                _BATCH_CANCEL.clear()
+        _BATCH_LOCK.release()
+        raise
     pending, inserted, duplicates, score_updates, skipped, failed, request_count = [], 0, 0, 0, 0, 0, 0
     batch_history = []
     used_lenses: set[str] = set()
@@ -2732,20 +2812,12 @@ def _batch_generate(
             generated, last_status = "", ""
             request_count += 1
             try:
-                recipe = _lexicon_recipe(
-                    set(),  # Keep recipe sampling independent; do not deplete the lexicon across calls.
-                    dimensions=_recipe_schedule(index, recipe_seed, source=source),
-                    source=source,
-                )
                 generated, _system, last_status = _generate(
                     source, "", preset, system_override, base_model, safety, nsfw_injection, user_instruction,
                     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     0, False, "", "", False, _BATCH_CANCEL,
-                    _independent_batch_directive(
-                        index, used_lenses,
-                        recipe,
-                    ) + "\n" + (
+                    _independent_batch_directive(index, used_lenses) + "\n" + (
                         f"这是同一批次中的独立任务第 {index}/{total_label} 条。"
                         "批次上下文中的结果只用于排除重复，不要复制其措辞、构图、动作或物品组合；"
                         "请根据原要求自由选择变化，不要把任何变化维度当作硬性模板。"
@@ -2934,7 +3006,7 @@ def _studio_generate(
     provider, endpoint, model, api_key, temperature, timeout, max_tokens, send_temperature,
     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
     query="", min_score=0, filter_output_mode="全部", filter_base_model="全部", existing_issues=None, batch_task_id="",
-    generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=True,
+    generation_count=8, topic_pool="", base_prompt="", lock_known=True, sample_static=False,
 ):
     if destination not in {"cache", "queue"}:
         raise ValueError("请选择生成到缓存或生成并加入生图队列")
@@ -3047,6 +3119,17 @@ def _auto_index_wildcards():
 def _search_wildcards(query, category="全部"):
     matches = DB.wildcard_matches(query, category=None if category == "全部" else category)
     return gr.update(choices=matches, value=[])
+
+
+def _refresh_wildcard_view():
+    """Load the index created at app startup into the page controls."""
+    categories = DB.wildcard_categories()
+    matches = DB.wildcard_matches("")
+    return (
+        "静态词库已自动索引并加载。修改文件后点击“索引静态词库”更新。",
+        gr.update(choices=matches, value=[]),
+        gr.update(choices=["全部"] + categories, value="全部"),
+    )
 
 
 def _apply_wildcard_selection(current_prompt, selected):
@@ -3240,7 +3323,9 @@ _TECHNICAL_TOKEN_RES = (
 def _immutable_technical_tokens(prompt: str) -> list[str]:
     """Extract LoRA tags and standalone trigger tokens without interpreting them."""
     text = str(prompt or "")
-    tags = [match for pattern in _TECHNICAL_TOKEN_RES for match in pattern.findall(text)]
+    matches = []
+    for pattern in _TECHNICAL_TOKEN_RES:
+        matches.extend((match.start(), match.group(0)) for match in pattern.finditer(text))
     # Natural-language words remain ordinary fixed prompt context. Compact
     # activation tokens are conventionally marked by an underscore, digit, or
     # technical separator; preserve those verbatim without semantic expansion.
@@ -3251,7 +3336,42 @@ def _immutable_technical_tokens(prompt: str) -> list[str]:
     for pattern in _TECHNICAL_TOKEN_RES:
         stripped = pattern.sub(" ", stripped)
     words = re.findall(r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", stripped)
-    return list(dict.fromkeys([*tags, *words]))
+    matches.extend((match.start(), match.group(1)) for match in re.finditer(
+        r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", stripped
+    ))
+    return list(dict.fromkeys(token for _position, token in sorted(matches, key=lambda item: item[0])))
+
+
+def _strip_immutable_technical_tokens(prompt: str, tokens: list[str] | None = None) -> str:
+    """Remove loader instructions from semantic conversion input, without losing them."""
+    value = str(prompt or "")
+    for pattern in _TECHNICAL_TOKEN_RES:
+        value = pattern.sub(" ", value)
+    for token in tokens or _immutable_technical_tokens(value):
+        value = re.sub(r"(?<![\w<])" + re.escape(str(token)) + r"(?![\w>])", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*,\s*", ", ", value)
+    value = re.sub(r"(?:,\s*){2,}", ", ", value)
+    return value.strip(" ,")
+
+
+def _restore_immutable_technical_tokens(prompt: str, tokens: list[str]) -> str:
+    """Append missing loader instructions exactly once, preserving source spelling."""
+    value = str(prompt or "").strip().rstrip(" ,")
+    missing = []
+    for raw_token in tokens:
+        token = str(raw_token).strip()
+        if not token:
+            continue
+        token_pattern = r"(?<![\w<])" + re.escape(token) + r"(?![\w>])"
+        if re.search(token_pattern, value):
+            continue
+        value = re.sub(token_pattern, " ", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s*,\s*", ", ", value)
+        value = re.sub(r"(?:,\s*){2,}", ", ", value).strip(" ,")
+        missing.append(token)
+    if not missing:
+        return value
+    return ", ".join(item for item in (value, *missing) if item)
 
 
 def _finalize_generated_prompt(
@@ -3275,7 +3395,7 @@ def _finalize_generated_prompt(
         raise ValueError("Prompt 包含室内与室外冲突。")
     if str(safety or "").strip().upper() == "SFW" and not is_sfw_output(result):
         raise ValueError("SFW 校验拦截了成人内容。请修改要求，或明确切换为 NSFW 模式。")
-    if output_contract != "layered" and preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags"}:
+    if preset in {"Danbooru Tags", "Pony / Illustrious Tags", "NoobAI Tags", "Anima Tags"}:
         tag_error = None
         if result.endswith(",") or ";" in result:
             tag_error = "纯标签输出包含尾随逗号或分号。"
@@ -3320,36 +3440,25 @@ def _finalize_generated_prompt(
 
 def _processed_kind_for_preset(preset: str) -> str:
     preset = _canonical_preset(preset)
-    if preset in {"Natural Language", "Krea 2 Natural"}:
+    if preset in {"Natural Language", "Flux Natural", "Krea 2 Natural"}:
         return "natural"
     if preset == "Danbooru + Natural":
         return "mixed"
     return "tags"
 
 
-def _recommended_base_model_for_preset(preset: str):
-    return PRESET_BASE_MODEL_DEFAULTS.get(_canonical_preset(preset), "Auto / checkpoint default")
-
-
-def _preset_text(preset: str):
-    """Return the selected output preset text for the UI editor."""
-    resolved, _ = _resolve_preset_model(_canonical_preset(preset), "Auto / checkpoint default")
-    return PRESETS.get(resolved, "")
-
-
-def _system_prompt_editor_value(preset, override="", base_model="Auto / checkpoint default"):
+def _system_prompt_editor_value(preset, override="", base_model="Pony / Illustrious"):
     """The editable supplement starts empty; the model preset remains in core."""
     return str(override or "").strip()
 
 
-def _system_prompt_override_value(preset, text, base_model="Auto / checkpoint default"):
+def _system_prompt_override_value(preset, text, base_model="Pony / Illustrious"):
     return str(text or "").strip()
 
 
 def _system_prompt_profile_key(preset, base_model):
     resolved, model = _resolve_preset_model(preset, base_model)
-    aligned, _ = _aligned_preset(resolved, model)
-    return f"{aligned}\x1f{model}"
+    return f"{resolved}\x1f{model}"
 
 
 def _system_prompt_profiles():
@@ -3358,12 +3467,10 @@ def _system_prompt_profiles():
 
 
 def _stored_system_prompt_profile(preset, base_model):
-    """Read aligned profiles, with read-only compatibility for pre-alignment keys."""
+    """Read the supplement saved for the selected model preset."""
     profiles = _system_prompt_profiles()
     key = _system_prompt_profile_key(preset, base_model)
-    resolved, model = _resolve_preset_model(preset, base_model)
-    legacy_key = f"{resolved}\x1f{model}"
-    candidates = [key, legacy_key]
+    candidates = [key]
     for stored_key in sorted(profiles):
         parts = stored_key.split("\x1f")
         if len(parts) == 2 and _system_prompt_profile_key(*parts) == key:
@@ -3399,7 +3506,7 @@ def _save_system_prompt_profile(preset, base_model, text):
     DB.set_setting(_SYSTEM_PROMPT_PROFILES_SETTING, profiles)
     _save_workflow_values({"preset": _canonical_preset(preset),
                            "base_model": _canonical_base_model(base_model), "system_override": value})
-    return value, "已保存当前输出预设与模型对应的补充要求。" if value else "已清空当前预设的补充要求。"
+    return value, "已保存当前模型预设的补充要求。" if value else "已清空当前预设的补充要求。"
 
 
 def _reset_system_prompt_profile(preset, base_model):
@@ -3407,41 +3514,23 @@ def _reset_system_prompt_profile(preset, base_model):
     return override, "", status
 
 
-def _prompt_profile_change(preset, base_model):
-    override, editor = _load_system_prompt_profile(preset, base_model)
-    return override, editor, preset, base_model, override, editor
-
-
-def _prompt_profile_save(preset, base_model, text):
-    override, status = _save_system_prompt_profile(preset, base_model, text)
-    return override, status, preset, base_model, override, text
-
-
-def _prompt_profile_reset(preset, base_model):
-    override, editor, status = _reset_system_prompt_profile(preset, base_model)
-    return override, editor, status, preset, base_model, override, editor
-
-
-def _load_system_prompt_editor():
-    values = _workflow_settings()
-    preset, model = values["preset"], values["base_model"]
+def _prompt_profile_change(selection):
+    preset, model = _model_preset_components(selection)
     override, editor = _load_system_prompt_profile(preset, model)
-    return preset, model, override, editor
+    selected = _model_preset_value(preset, model)
+    return preset, model, override, editor, override, editor, selected
 
 
-def _aligned_preset(preset: str, base_model: str) -> tuple[str, bool]:
-    """Keep an explicit checkpoint and output profile on the same prompt protocol."""
-    current = _canonical_preset(preset or "Danbooru Tags")
-    combined = PRESET_MODEL_OVERRIDES.get(current)
-    if combined:
-        current = combined[0]
-        if not base_model or _canonical_base_model(base_model) in {"", "Auto / checkpoint default", combined[1]}:
-            base_model = combined[1]
-    model = _canonical_base_model(base_model or "Auto / checkpoint default")
-    expected = MODEL_PRESET_ALIGNMENT.get(model)
-    if expected and current != expected:
-        return expected, True
-    return current, False
+def _prompt_profile_save(selection, text):
+    preset, model = _model_preset_components(selection)
+    override, status = _save_system_prompt_profile(preset, model, text)
+    return override, status, text, override, text
+
+
+def _prompt_profile_reset(selection):
+    preset, model = _model_preset_components(selection)
+    override, editor, status = _reset_system_prompt_profile(preset, model)
+    return override, editor, status, override, editor
 
 
 # Count and group tags describe how many subjects the picture has, so offering them
@@ -3488,7 +3577,7 @@ def _run_llm_generation(
     finalize_result, runtime_connection, request_temperature, timeout, max_tokens,
     send_temperature, cancel_event=None, preserve_inference_settings=False,
     gate_context=None, retry_limit=0, similarity_limit=_MAX_CONTENT_SIMILARITY,
-    retry_empty_result=False, candidate_quality=None,
+    retry_empty_result=False, candidate_quality=None, user_requirements="",
 ):
     """Compatibility wrapper around the standalone generation kernel."""
     return _run_llm_generation_impl(
@@ -3496,7 +3585,8 @@ def _run_llm_generation(
         finalize_result, runtime_connection, request_temperature, timeout, max_tokens,
         send_temperature, cancel_event, preserve_inference_settings, gate_context,
         retry_limit, similarity_limit, retry_empty_result,
-        credentials=CREDENTIALS, call_llm=call_llm, build_user_message=build_user_message,
+        credentials=CREDENTIALS, call_llm=call_llm,
+        build_user_message=lambda request: build_user_message(request, user_requirements),
         coerce_bool=_coerce_bool, fallback_request_kwargs=_fallback_request_kwargs,
         worst_content_similarity=_worst_content_similarity,
         max_response_retries=_MAX_RESPONSE_RETRIES,
@@ -3510,29 +3600,36 @@ def _prompt_quality_score(
 ) -> float:
     """Reject contract violations and weakly rank tag normalization, not image quality."""
     text = str(candidate or "").strip()
-    layered = output_contract == "layered"
-    if not text or (not layered and ("\n" in text or "\r" in text)):
+    if not text or "\n" in text or "\r" in text:
         return float("-inf")
-    if layered:
-        # These are output delimiters, not tag syntax. Only this explicit
-        # operation contract permits prose and line breaks.
-        sections = re.split(
-            r"(?m)^(PART ONE: TAG ANCHORS|BREAK|PART TWO: EXTREME LAYERED DETAIL|"
-            r"PART THREE: REFINED \+ MASTER)[ \t]*\r?$", text,
-        )
-        if (sections[0].strip() or sections[1::2] != [
-            "PART ONE: TAG ANCHORS", "BREAK", "PART TWO: EXTREME LAYERED DETAIL",
-            "PART THREE: REFINED + MASTER",
-        ] or any(not section.strip() for section in sections[2::2])):
-            return float("-inf")
     lowered = text.casefold()
     if any(marker in lowered for marker in ("let me ", "here is", "as an ai", "corrected prompt")):
         return float("-inf")
 
+    # Deterministic constraints are checked before softer format signals. This
+    # keeps an attractive-looking candidate from silently changing count,
+    # scene, negation, spatial intent, or a loader token. Inline delta output is
+    # intentionally exempt: its fixed prefix is composed by the caller and is
+    # checked after composition rather than requiring the delta to repeat it.
+    constraint_conflict_checker = globals().get("prompt_constraint_conflicts")
+    constraint_violation_checker = globals().get("prompt_constraint_violations")
+    if callable(constraint_conflict_checker):
+        try:
+            if constraint_conflict_checker(text):
+                return float("-inf")
+        except Exception:
+            LOGGER.exception("Prompt constraint conflict check failed")
+    if output_contract != "delta" and callable(constraint_violation_checker) and str(source or "").strip():
+        try:
+            if constraint_violation_checker(str(source), text):
+                return float("-inf")
+        except Exception:
+            LOGGER.exception("Prompt constraint violation check failed")
+
     score = 0.0
     preset = _canonical_preset(preset)
-    tag_mode = preset in {"Danbooru Tags", "NoobAI Tags", "Anima Tags", "Danbooru + Natural"}
-    if tag_mode and not layered:
+    tag_mode = preset in {"Danbooru Tags", "Pony / Illustrious Tags", "NoobAI Tags", "Anima Tags", "Danbooru + Natural"}
+    if tag_mode:
         canonicalizer = globals().get("canonicalize_booru_tags")
         if callable(canonicalizer):
             canonical = canonicalizer(text)
@@ -3609,7 +3706,6 @@ def _generate(
     provider = _canonical_provider(provider)
     preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)
-    preset, preset_aligned = _aligned_preset(preset, base_model)
     request_text = str(request or "").strip()
     source_tags_text = str(source_tags or "").strip()
     if source_tags_text and request_text:
@@ -3628,39 +3724,29 @@ def _generate(
         recent_outputs = _recent_diverse_outputs(source)
         context_outputs = [*recent_outputs, *batch_history]
         exclusion_terms = _diversity_exclusion_terms_from_outputs(context_outputs, source)
-        # Batch items need a fresh random vocabulary slice, not deterministic
-        # source-related matches that can keep surfacing the same prop.
-        static_tags = _static_prompt_reference(source, related_limit=0)
+        # A coverage map is useful only when there is existing batch context.
+        # Keep it local to the diversity gate; explicit static references are
+        # already embedded in the batch source when the user enabled them.
+        static_tags = []
         if exclusion_terms:
             effective_batch_directive += (
-                "\nCOVERAGE SO FAR: this batch has already spent these content concepts: "
+                "\nOptional coverage context already used in this batch: "
                 + ", ".join(exclusion_terms)
-                + ". Treat the list as a coverage map: the next item should land on a different "
-                  "combination of action, place, prop and light rather than renaming one of them."
-            )
-        static_hints = [
-            str(term).strip() for term in static_tags if str(term).strip()
-        ]
-        if static_hints:
-            effective_batch_directive += (
-                "\nRANDOM LOCAL DIRECTIONS for this item (sampled independently from the local lexicon; "
-                "pick from them when they fit the fixed subject and ignore the rest): "
-                + ", ".join(static_hints[:6])
-            )
-        if context_outputs:
-            latest = context_outputs[-3:]
-            summary = "\n".join(f"- {item[:320]}" for item in latest)
-            effective_batch_directive += (
-                "\nThe most recent items of this batch, listed only so you can judge coverage. "
-                "Never echo their wording, scene structure or prop combination:\n" + summary
+                + ". Avoid repeating these concepts only where the request allows variation."
             )
     else:
-        static_tags = _static_prompt_reference(source)
+        # Ordinary generation is deterministic with respect to the user input.
+        # Static lexicon sampling is opt-in in the batch source builder; doing a
+        # hidden DB lookup here can add unrelated props, settings and backgrounds.
+        static_tags = []
     operation_instruction = build_operation_instruction("Generate", base_model)
-    system = build_system_prompt(
-        preset, base_model, safety, nsfw_injection, user_instruction, examples,
-        static_tags, system_override, effective_batch_directive, operation_instruction,
-    )
+    try:
+        system = build_system_prompt(
+            preset, base_model, safety, nsfw_injection, user_instruction, examples,
+            static_tags, system_override, effective_batch_directive, operation_instruction,
+        )
+    except ValueError as error:
+        return "", "", f"生成失败：{_safe_error(error)}"
     runtime_connection = dict(connection_settings or _connection_settings(provider))
     diversity = _diversity_settings()
     gate_context = list(context_outputs) if effective_batch_directive else []
@@ -3668,17 +3754,15 @@ def _generate(
     similarity_limit = float(diversity["similarity_threshold"])
     try:
         request_temperature = float(1.0 if temperature is None else temperature)
-        if effective_batch_directive and (
-            not preserve_inference_settings or diversity["batch_temperature_floor"]
-        ):
+        if effective_batch_directive and diversity["batch_temperature_floor"] and not preserve_inference_settings:
             request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
         def build_retry_system(reason, attempt):
             if reason == "diversity":
                 retry_directive = (
                     "DIVERSITY RETRY: the previous candidate repeated content that an earlier item of "
                       "this batch already used. Keep the subject, identity and every explicit constraint, "
-                      "and make a meaningful, source-compatible change in action, setting or composition. "
-                      "Recipe hints and variation lenses remain optional; do not add clutter to satisfy them."
+                      "and vary only dimensions the request explicitly leaves open. "
+                      "Recipe hints and variation lenses remain optional; do not invent unrelated details or change fixed facts for variety."
                 )
             elif reason == "quality":
                 retry_directive = (
@@ -3709,7 +3793,7 @@ def _generate(
             ), runtime_connection, request_temperature, timeout, max_tokens,
             send_temperature, cancel_event, preserve_inference_settings,
             gate_context, retry_limit, similarity_limit,
-            candidate_quality=candidate_quality,
+            candidate_quality=candidate_quality, user_requirements=user_instruction,
         )
     except LLMRequestError as error:
         if str(error) == "LLM request cancelled":
@@ -3734,7 +3818,7 @@ def _generate(
             source_kind=source_kind or None, source_ref=source_ref or None,
             dedupe=False,
         )
-    status = "生成完成" + ("（预设已按底模对齐）" if preset_aligned else "")
+    status = "生成完成"
     if diversity_retries_used:
         status += f"（内容重复，已重试 {diversity_retries_used} 次）"
     return result, system, status
@@ -3750,7 +3834,6 @@ def _generate_auto_loop(
     provider = _canonical_provider(provider)
     preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)
-    preset, _preset_aligned = _aligned_preset(preset, base_model)
     if cache_result:
         identity = {
             "request": str(request or "").strip(), "preset": preset, "system_override": system_override,
@@ -3794,19 +3877,23 @@ def _expand_or_polish(
     provider = _canonical_provider(provider)
     preset, base_model = _resolve_preset_model(preset, base_model)
     structured_mode = _canonical_output_mode(structured_mode)
-    preset, _preset_aligned = _aligned_preset(preset, base_model)
-    output_contract = "layered" if uses_layered_polish(action_name, base_model) else "complete"
+    faithful_edit = action_name in {"Convert", "Polish"}
+    output_contract = "complete"
     instruction = build_operation_instruction(action_name, base_model)
-    static_tags = _static_prompt_reference(source)
-    directive = str(batch_directive or "").strip()
-    previous = [str(item).strip() for item in (previous_outputs or []) if str(item).strip()]
+    # Prompt transformations must be driven by the source and operation
+    # contract. Random lexicon terms are too likely to become unrelated props,
+    # backgrounds, or conflicting scene facts; batch source generation already
+    # embeds any explicitly requested static references in its input.
+    static_tags = []
+    directive = "" if faithful_edit else str(batch_directive or "").strip()
+    previous = [] if faithful_edit else [str(item).strip() for item in (previous_outputs or []) if str(item).strip()]
     if directive:
         exclusion_terms = _diversity_exclusion_terms_from_outputs(previous, source)
         if exclusion_terms:
             directive += (
                 "\nCOVERAGE SO FAR in this batch: " + ", ".join(exclusion_terms)
-                + ". Use it as a coverage map and land on a different combination of action, place, "
-                  "prop and light rather than renaming one of them."
+                + ". Use it only as context; vary only dimensions explicitly left open by the user. "
+                  "Do not change fixed facts or add unrelated details to avoid repetition."
             )
         fresh = [
             str(term).strip() for term in static_tags
@@ -3816,12 +3903,6 @@ def _expand_or_polish(
             directive += (
                 "\nUNUSED DIRECTIONS for this item (local-lexicon terms this batch has not used yet): "
                 + ", ".join(fresh[:6])
-            )
-        if previous:
-            previous_summary = "\n".join(f"- {item[:320]}" for item in previous[-3:])
-            directive += (
-                "\nThe most recent items of this batch, listed only so you can judge coverage. "
-                "Never echo their wording, scene structure or prop combination:\n" + previous_summary
             )
     if directive:
         instruction += (
@@ -3836,14 +3917,17 @@ def _expand_or_polish(
             operation_instruction=instruction, retry_instruction=retry_instruction, operation=action_name,
         )
 
-    system = build_transform_system()
     try:
-        request_temperature = float(temperature if preserve_inference_settings else (temperature or 1.0))
+        system = build_transform_system()
+    except ValueError as error:
+        return "", f"处理失败：{_safe_error(error)}"
+    try:
+        request_temperature = float(1.0 if temperature is None else temperature)
     except (TypeError, ValueError):
         request_temperature = 1.0
     diversity_settings = _diversity_settings() if directive else {}
-    if directive and (
-        not preserve_inference_settings or diversity_settings.get("batch_temperature_floor")
+    if directive and not preserve_inference_settings and (
+        diversity_settings.get("batch_temperature_floor")
     ):
         request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
     retry_limit = int(diversity_settings.get("retry_limit") or 0) if directive else 0
@@ -3855,9 +3939,9 @@ def _expand_or_polish(
             if reason == "diversity":
                 retry_directive = (
                     f"DIVERSITY RETRY {attempt}: the earlier candidate repeated content that "
-                    "an item of this batch already used. Favor a different compatible combination of "
-                    "setting, action, prop relationship, spatial layout, camera angle, time/weather and "
-                    "visible daily-life context, follow the required output contract and return exactly one result."
+                    "an item of this batch already used. Vary only dimensions the request explicitly "
+                    "leaves open; preserve all fixed facts and do not add unrelated objects, settings or weather. "
+                    "Follow the required output contract and return exactly one result."
                 )
             elif reason == "quality":
                 retry_directive = (
@@ -3882,9 +3966,9 @@ def _expand_or_polish(
                 raw, preset, safety, remove_bad, remove_terms, shuffle, spaces,
                 max_tags, structured_mode, region_count, output_contract=output_contract,
             ), runtime_connection, request_temperature, timeout, max_tokens,
-            send_temperature, cancel_event, preserve_inference_settings,
+            send_temperature, cancel_event, preserve_inference_settings or faithful_edit,
             gate_context, retry_limit, similarity_limit, retry_empty_result=True,
-            candidate_quality=candidate_quality,
+            candidate_quality=candidate_quality, user_requirements=user_instruction,
         )
         if result and directive:
             try:
@@ -4223,8 +4307,7 @@ def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="
     preset = _canonical_preset(preset)
     base_model = _canonical_base_model(base_model)
     selected_preset = preset if preset in PRESETS else workflow["preset"]
-    selected_base_model = base_model if base_model in BASE_MODEL_GUIDANCE else workflow["base_model"]
-    selected_preset, _preset_aligned = _aligned_preset(selected_preset, selected_base_model)
+    selected_base_model = base_model if base_model in MODEL_PRESET_GUIDANCE else workflow["base_model"]
     for update in _png_batch_run(
         payload, action,
         selected_preset, workflow["system_override"], selected_base_model, workflow["safety"],
@@ -4233,7 +4316,7 @@ def _inline_json_batch_run(payload, action, preset, base_model, variation_mode="
         connection["temperature"], connection["timeout"], connection["max_tokens"], connection["send_temperature"],
         workflow["remove_bad"], workflow["remove_terms"], workflow["shuffle"], workflow["spaces"],
         workflow["max_tags"], workflow["structured_mode"], workflow["region_count"],
-        variation_mode, cancel_id,
+        variation_mode, cancel_id, connection_settings=connection,
     ):
         # The compact inline panel predates the optional selection control.
         yield tuple(update[:5])
@@ -4290,6 +4373,45 @@ def _cancel_inline_generation(slot, request_id=""):
     return "已请求停止；LLM 等待已中断，迟到响应不会写入 Prompt。"
 
 
+def _png_batch_connection_snapshot(
+    connection_settings, provider, endpoint, model, temperature, timeout, max_tokens,
+    send_temperature,
+):
+    """Freeze the transform connection before a PNG batch starts.
+
+    The visible controls belong to this invocation. Less visible inference
+    controls are retained from the saved transform profile so a batch cannot
+    silently fall back to provider defaults or later UI state.
+    """
+    if isinstance(connection_settings, dict):
+        snapshot = dict(connection_settings)
+    else:
+        saved = _transform_llm_settings()
+        snapshot = dict(saved) if isinstance(saved, dict) else {}
+    snapshot.update({
+        "provider": _canonical_provider(provider or snapshot.get("provider") or DEFAULT_LLM_SETTINGS["provider"]),
+        "endpoint": str(endpoint or "").strip(),
+        "model": str(model or "").strip(),
+        "temperature": _bounded_setting(temperature, 1.0, 0.0, 2.0, float),
+        "timeout": _bounded_setting(timeout, 90, 5, 600, int),
+        "max_tokens": _bounded_setting(max_tokens, 8096, 0, 262144, int),
+        "send_temperature": _coerce_bool(send_temperature, True),
+    })
+    snapshot["retry_count"] = _bounded_setting(snapshot.get("retry_count", 2), 2, 0, 5, int)
+    snapshot["thinking_enabled"] = _coerce_bool(snapshot.get("thinking_enabled"), False)
+    snapshot["thinking_budget"] = _bounded_setting(snapshot.get("thinking_budget", 0) or 0, 0, 0, 262144, int)
+    snapshot["reasoning_effort"] = str(snapshot.get("reasoning_effort") or "").strip()
+    try:
+        sampling = normalize_sampling(snapshot.get("top_p"), snapshot.get("top_k"))
+    except (TypeError, ValueError, OverflowError):
+        sampling = {}
+    snapshot["top_p"] = sampling.get("top_p")
+    snapshot["top_k"] = sampling.get("top_k")
+    for key in ("fallback_provider", "fallback_endpoint", "fallback_model"):
+        snapshot[key] = str(snapshot.get(key) or "").strip()
+    return snapshot
+
+
 def _png_batch_run(
     payload, action, preset, system_override, base_model, safety, nsfw_injection,
     user_instruction, provider, endpoint, model, api_key, temperature, timeout,
@@ -4297,6 +4419,7 @@ def _png_batch_run(
     spaces=False, max_tags=0, structured_mode="Plain Prompt", region_count=1,
     variation_mode="faithful",
     cancel_id="",
+    connection_settings=None,
 ):
     action = _canonical_action(action)
     preset = _canonical_preset(preset)
@@ -4310,6 +4433,10 @@ def _png_batch_run(
     if not data["records"]:
         yield _png_batch_json(data), [], 1, "", "批次为空，请先导入逐图 Prompt。", gr.update(choices=[], value=[])
         return
+    connection_snapshot = _png_batch_connection_snapshot(
+        connection_settings, provider, endpoint, model, temperature, timeout,
+        max_tokens, send_temperature,
+    )
     event_key, cancel_event = _png_batch_cancel_event(cancel_id)
     records = [dict(record) for record in data["records"]]
     independent = str(variation_mode or "faithful") == "independent"
@@ -4351,6 +4478,7 @@ def _png_batch_run(
                     api_key, temperature, timeout, max_tokens, send_temperature,
                     remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode, region_count,
                     cancel_event, batch_directive, previous_outputs,
+                    connection_settings=connection_snapshot, preserve_inference_settings=True,
                 )
                 if not independent and not cancel_event.is_set():
                     outcomes[outcome_key] = (processed, llm_status)
@@ -4438,14 +4566,13 @@ _INLINE_TEMPLATE_EDITORS: dict[str, Any] = {}
 
 def _template_record(value, fallback=None) -> dict[str, Any]:
     base = dict(fallback or {})
-    record = value if isinstance(value, dict) else {"content": value}
+    record = value if isinstance(value, dict) else {}
     dimensions = record.get("variation_dimensions", base.get("variation_dimensions", []))
-    if isinstance(dimensions, str):
-        dimensions = [item.strip() for item in dimensions.split(",") if item.strip()]
+    if not isinstance(dimensions, list):
+        dimensions = []
     return {
         "content": str(record.get("content", base.get("content", "")) or "").strip(),
         "preserve_fixed_prompt": _coerce_bool(record.get("preserve_fixed_prompt", base.get("preserve_fixed_prompt", True)), True),
-        "obey_user_prompt": _coerce_bool(record.get("obey_user_prompt", base.get("obey_user_prompt", True)), True),
         "variation_dimensions": [str(item).strip() for item in dimensions if str(item).strip()],
         "style_rules": str(record.get("style_rules", base.get("style_rules", "")) or "").strip(),
         "forbidden_content": str(record.get("forbidden_content", base.get("forbidden_content", "")) or "").strip(),
@@ -4470,21 +4597,6 @@ def _builtin_templates() -> dict[str, dict[str, Any]]:
     defaults = _builtin_template_defaults()
     stored = DB.get_setting(BUILTIN_TEMPLATES_SETTING, {}) or {}
     stored = stored if isinstance(stored, dict) else {}
-    custom = DB.get_setting(CUSTOM_TEMPLATES_SETTING, {}) or {}
-    custom = custom if isinstance(custom, dict) else {}
-    changed = False
-    if "kemonimimi" not in stored and "兽耳" in custom:
-        stored["kemonimimi"] = custom["兽耳"]
-        custom.pop("兽耳", None)
-        changed = True
-        if DB.get_setting(DEFAULT_TEMPLATE_SETTING, "general") == "custom:兽耳":
-            DB.set_setting(DEFAULT_TEMPLATE_SETTING, "kemonimimi")
-    elif "兽耳" in custom:
-        custom.pop("兽耳", None)
-        changed = True
-    if changed:
-        DB.set_setting(BUILTIN_TEMPLATES_SETTING, stored)
-        DB.set_setting(CUSTOM_TEMPLATES_SETTING, custom)
     return {
         key: _template_record(stored.get(key), fallback=default)
         for key, default in defaults.items()
@@ -4492,23 +4604,24 @@ def _builtin_templates() -> dict[str, dict[str, Any]]:
 
 
 def _custom_templates() -> dict[str, dict[str, Any]]:
-    """Return normalized structured templates, accepting legacy text-only values."""
+    """Return normalized structured templates."""
     stored = DB.get_setting(CUSTOM_TEMPLATES_SETTING, {}) or {}
     if not isinstance(stored, dict):
         return {}
     result = {}
     for name, value in stored.items():
         clean_name = str(name).strip()
-        record = value if isinstance(value, dict) else {"content": value}
+        if not isinstance(value, dict):
+            continue
+        record = value
         clean_value = str(record.get("content", "") or "").strip()
         if 1 <= len(clean_name) <= 64 and 1 <= len(clean_value) <= 12000:
             dimensions = record.get("variation_dimensions", [])
-            if isinstance(dimensions, str):
-                dimensions = [item.strip() for item in dimensions.split(",") if item.strip()]
+            if not isinstance(dimensions, list):
+                dimensions = []
             result[clean_name] = {
                 "content": clean_value,
                 "preserve_fixed_prompt": _coerce_bool(record.get("preserve_fixed_prompt"), True),
-                "obey_user_prompt": _coerce_bool(record.get("obey_user_prompt"), True),
                 "variation_dimensions": [str(item) for item in dimensions if str(item).strip()],
                 "style_rules": str(record.get("style_rules", "") or "").strip(),
                 "forbidden_content": str(record.get("forbidden_content", "") or "").strip(),
@@ -4535,14 +4648,13 @@ def _template_request(template_name):
         f"Style rules: {record.get('style_rules') }.",
         f"Forbidden content: {record.get('forbidden_content') }.",
         "Preserve the fixed Prompt verbatim." if record.get("preserve_fixed_prompt", True) else "",
-        "Follow the user's prompt as a semantic hard constraint." if record.get("obey_user_prompt", True) else "",
         f"Conflict policy: {record.get('conflict_policy', 'reject_and_retry')}; duplicate policy: {record.get('duplicate_policy', 'skip_and_continue') }.",
     ]
     rendered = [item for item in rules if item and not item.endswith(": .")]
     defaults = {"action", "environment_detail", "camera", "composition", "lighting", "atmosphere"}
     if (set(record.get("variation_dimensions", [])) == defaults
             and not record.get("style_rules") and not record.get("forbidden_content")
-            and record.get("preserve_fixed_prompt", True) and record.get("obey_user_prompt", True)
+            and record.get("preserve_fixed_prompt", True)
             and record.get("conflict_policy") == "reject_and_retry"
             and record.get("duplicate_policy") == "skip_and_continue"):
         return content
@@ -4625,8 +4737,11 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     source = str(payload.get("source") or "").strip()
     database = _native_cache_database(source)
     slot = _native_cache_slot(str(payload.get("slot") or "txt2img"))
-    if str(payload.get("selected_script") or "None").strip().lower() not in {"none", "", "0"}:
-        raise ValueError("缓存注入暂不支持可选 Script；请将 Forge Script 设为 None")
+    selected_script = str(payload.get("selected_script") or "None").strip()
+    if selected_script.lower() not in {"none", "", "0"} and not (
+        slot == "txt2img" and selected_script in {"Krea2 构图 → Anima 生成", "Krea2 + Anima 双阶段生成"}
+    ):
+        raise ValueError("缓存注入仅支持 Script None 或 txt2img 的 Krea2 + Anima 双阶段生成")
     try:
         total_images = int(payload.get("total_images") or 1)
         cache_state = _native_cache_state(slot)
@@ -4749,7 +4864,15 @@ def apply_native_cache_context(processing) -> str | None:
             raise ValueError("Forge 批次数量已变化，缓存注入已取消，请重新生成")
         script_args = getattr(processing, "script_args", ())
         if script_args and script_args[0] not in (None, 0):
-            raise ValueError("缓存注入暂不支持可选 Script；请将 Forge Script 设为 None")
+            index = script_args[0]
+            selectable = getattr(getattr(processing, "scripts", None), "selectable_scripts", ())
+            selected = selectable[index - 1] if type(index) is int and 1 <= index <= len(selectable) else None
+            if not (
+                slot == "txt2img" and selected is not None
+                and selected.title() in {"Krea2 构图 → Anima 生成", "Krea2 + Anima 双阶段生成"}
+                and getattr(selected, "supports_native_cache_injection", False) is True
+            ):
+                raise ValueError("缓存注入仅支持 Script None 或已接通缓存桥接的 Krea2 + Anima 双阶段生成")
     processing.prompt = original_prompt
     records = context["records"]
     prompts = [
@@ -4762,6 +4885,31 @@ def apply_native_cache_context(processing) -> str | None:
         from modules import shared
     except ImportError:
         shared = None
+    if getattr(processing, "_llm_prompt_studio_convert_krea", False):
+        converted_prompts = []
+        for record in records:
+            if shared is not None and (shared.state.interrupted or shared.state.skipped or getattr(shared.state, "stopping_generation", False)):
+                raise ValueError("生成已中断，缓存未提交")
+            original = str(record["prompt"] or "")
+            technical_tokens = _immutable_technical_tokens(original)
+            source = _strip_immutable_technical_tokens(original, technical_tokens)
+            if source:
+                result, status = _inline_cache_transform(
+                    source, "Convert", "Krea 2 Natural", "Krea 2",
+                    "Preserve all character names, identities, appearance and explicit details. Convert tags to a natural image prompt. Do not add or alter technical tokens.", None,
+                )
+            else:
+                result, status = "", "源提示词仅包含技术标记"
+            if shared is not None and (shared.state.interrupted or shared.state.skipped or getattr(shared.state, "stopping_generation", False)):
+                raise ValueError("生成已中断，缓存未提交")
+            if source and not str(result or "").strip():
+                raise ValueError(f"Krea2 提示词转换失败：{status}")
+            result = _restore_immutable_technical_tokens(result, technical_tokens)
+            merged = _native_cache_merge_prompt(
+                context["base_prompt"], result, context["write_mode"], context["marker"],
+            )
+            converted_prompts.append(_restore_immutable_technical_tokens(merged, technical_tokens))
+        processing._llm_prompt_studio_krea_prompts = converted_prompts
     if shared is not None and getattr(processing, "styles", []):
         prompts = [shared.prompt_styles.apply_styles_to_prompt(prompt, processing.styles) for prompt in prompts]
     raw_prompts = None
@@ -4829,7 +4977,7 @@ def _default_template_choice():
     return key if key in valid else "general"
 
 
-def _save_custom_template(name, content, preserve_fixed_prompt=True, obey_user_prompt=True,
+def _save_custom_template(name, content, preserve_fixed_prompt=True,
                           variation_dimensions="", style_rules="", forbidden_content="",
                           conflict_policy="reject_and_retry", duplicate_policy="skip_and_continue"):
     name = str(name or "").strip()
@@ -4843,7 +4991,6 @@ def _save_custom_template(name, content, preserve_fixed_prompt=True, obey_user_p
         builtins[name] = _template_record({
             "content": content,
             "preserve_fixed_prompt": preserve_fixed_prompt,
-            "obey_user_prompt": obey_user_prompt,
             "variation_dimensions": variation_dimensions,
             "style_rules": style_rules,
             "forbidden_content": forbidden_content,
@@ -4862,7 +5009,6 @@ def _save_custom_template(name, content, preserve_fixed_prompt=True, obey_user_p
     templates[name] = {
         "content": content,
         "preserve_fixed_prompt": _coerce_bool(preserve_fixed_prompt, True),
-        "obey_user_prompt": _coerce_bool(obey_user_prompt, True),
         "variation_dimensions": dimensions or ["action", "environment_detail", "camera", "composition", "lighting", "atmosphere"],
         "style_rules": str(style_rules or "").strip(),
         "forbidden_content": str(forbidden_content or "").strip(),
@@ -4900,15 +5046,15 @@ def _load_custom_template_editor(template_name):
     if key in _builtin_templates():
         record = _builtin_templates()[key]
         return (key, record.get("content", ""), record.get("preserve_fixed_prompt", True),
-                record.get("obey_user_prompt", True), ", ".join(record.get("variation_dimensions", [])),
+                ", ".join(record.get("variation_dimensions", [])),
                 record.get("style_rules", ""), record.get("forbidden_content", ""),
                 record.get("conflict_policy", "reject_and_retry"), record.get("duplicate_policy", "skip_and_continue"))
     if not key.startswith("custom:"):
-        return "", _template_request(key), True, True, "action, environment_detail, camera, composition, lighting, atmosphere", "", "", "reject_and_retry", "skip_and_continue"
+        return "", _template_request(key), True, "action, environment_detail, camera, composition, lighting, atmosphere", "", "", "reject_and_retry", "skip_and_continue"
     name = key[7:]
     record = _custom_templates().get(name, {})
     return (name, record.get("content", ""), record.get("preserve_fixed_prompt", True),
-            record.get("obey_user_prompt", True), ", ".join(record.get("variation_dimensions", [])),
+            ", ".join(record.get("variation_dimensions", [])),
             record.get("style_rules", ""), record.get("forbidden_content", ""),
             record.get("conflict_policy", "reject_and_retry"), record.get("duplicate_policy", "skip_and_continue"))
 
@@ -4918,27 +5064,25 @@ def _create_template_editor(prefix, choice):
     with gr.Accordion("编辑模板", open=False, elem_classes=["lps-template-editor"]):
         name = gr.Textbox(label="模板标识", value=initial[0], max_lines=1, placeholder="内置模板不可改名；自定义模板填写名称", elem_id=f"{prefix}_template_name")
         content = gr.Textbox(label="模板内容", value=initial[1], lines=3, max_lines=12, elem_id=f"{prefix}_template_content")
+        preserve = gr.Checkbox(label="固定 Prompt 完全保留", value=initial[2])
+        dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=initial[3], lines=2, elem_id=f"{prefix}_template_variation_dimensions")
+        style = gr.Textbox(label="风格规则（可选）", value=initial[4], lines=2)
+        forbidden = gr.Textbox(label="禁止内容（可选）", value=initial[5], lines=2)
         with gr.Row():
-            preserve = gr.Checkbox(label="固定 Prompt 完全保留", value=initial[2])
-            obey = gr.Checkbox(label="严格遵从用户提示词", value=initial[3])
-        dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=initial[4], lines=2, elem_id=f"{prefix}_template_variation_dimensions")
-        style = gr.Textbox(label="风格规则（可选）", value=initial[5], lines=2)
-        forbidden = gr.Textbox(label="禁止内容（可选）", value=initial[6], lines=2)
-        with gr.Row():
-            conflict = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=initial[7])
-            duplicate = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=initial[8])
+            conflict = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=initial[6])
+            duplicate = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=initial[7])
         with gr.Row():
             save = gr.Button("保存模板", variant="primary", elem_id=f"{prefix}_template_save")
             default = gr.Button("设为默认模板", elem_id=f"{prefix}_template_default")
             delete = gr.Button("删除所选自定义模板", variant="stop", elem_id=f"{prefix}_template_delete")
         status = gr.Markdown(elem_id=f"{prefix}_template_status")
-    return dict(choice=choice, fields=[name, content, preserve, obey, dimensions, style, forbidden, conflict, duplicate],
+    return dict(choice=choice, fields=[name, content, preserve, dimensions, style, forbidden, conflict, duplicate],
                 save=save, default=default, delete=delete, status=status)
 
 
 def _template_sync_values(status, update, panel_count):
     """Return explicit editor updates even when the selected template did not change."""
-    values = _load_custom_template_editor(update["value"]) if "value" in update else [gr.update() for _ in range(9)]
+    values = _load_custom_template_editor(update["value"]) if "value" in update else [gr.update() for _ in range(8)]
     # Gradio consumes update dictionaries during postprocessing. Each output
     # needs its own object or the second dropdown loses its new selection.
     return tuple(dict(value) if isinstance(value, dict) else value
@@ -5070,7 +5214,6 @@ def _inline_generate(
 ):
     preset_key = _canonical_preset(preset)
     preset, base_model = _resolve_preset_model(preset_key, base_model)
-    preset, _preset_aligned = _aligned_preset(preset, base_model)
     saved_workflow = _workflow_settings()
     shared_updates = {"preset": preset_key, "base_model": base_model, "safety": safety,
                       "system_override": system_override}
@@ -5154,11 +5297,14 @@ def inject_inline_before_negative(component, **kwargs):
         LOGGER.exception("内嵌面板创建失败：%s", error)
 
 
-def _inline_cache_transform(source, action, preset, base_model, instruction, cancel_event):
-    workflow, connection = _workflow_settings(), _transform_llm_settings()
+def _inline_cache_transform(source, action, preset, base_model, instruction, cancel_event,
+                            workflow_settings=None, connection_settings=None, system_override=None):
+    workflow = dict(_workflow_settings() if workflow_settings is None else workflow_settings)
+    connection = dict(_transform_llm_settings() if connection_settings is None else connection_settings)
     preset, base_model = _resolve_preset_model(preset, base_model)
-    preset, _ = _aligned_preset(preset, base_model)
-    supplement, _ = _load_system_prompt_profile(preset, base_model)
+    supplement = system_override
+    if supplement is None:
+        supplement, _ = _load_system_prompt_profile(preset, base_model)
     return _expand_or_polish(
         source, _canonical_action(action), preset, supplement,
         base_model, workflow["safety"], workflow["nsfw_injection"], instruction,
@@ -5212,8 +5358,8 @@ def _save_inline_processed_result(stage, record, result):
     return int(result_id)
 
 
-def _processed_result_records(query=""):
-    return RESULT_DB.list_prompts(str(query or ""), limit=None, output_mode="", base_model="")
+def _processed_result_records(query="", limit=None):
+    return RESULT_DB.list_prompts(str(query or ""), limit=limit, output_mode="", base_model="")
 
 
 def _processed_result_choices(records):
@@ -5235,11 +5381,12 @@ def _processed_result_rows(records):
 
 
 def _processed_result_view(query=""):
-    records = _processed_result_records(query)
+    records = _processed_result_records(query, limit=1000)
+    total = RESULT_DB.count_prompts(str(query or ""))
     return (
         gr.update(value=_processed_result_rows(records)),
         gr.update(choices=_processed_result_choices(records), value=[]),
-        f"处理结果 {len(records)} 条",
+        f"处理结果 {total} 条" + (" · 显示前 1000 条，请筛选查看其余结果" if total > 1000 else ""),
     )
 
 
@@ -5266,11 +5413,9 @@ def _processed_result_manage(action, operation, find, value, selected_ids, query
             message = f"已批量修改 {changed} 条处理结果。"
     except (TypeError, ValueError) as error:
         return gr.update(), gr.update(), f"处理结果批量管理失败：{_safe_error(error)}"
-    refreshed = _processed_result_records(query)
+    refreshed = _processed_result_view(query)
     return (
-        gr.update(value=_processed_result_rows(refreshed)),
-        gr.update(choices=_processed_result_choices(refreshed), value=[]),
-        message + f" 当前筛选结果 {len(refreshed)} 条。",
+        refreshed[0], refreshed[1], message + " " + refreshed[2],
     )
 
 
@@ -5341,41 +5486,62 @@ def _inline_cache_process_stage(stage, cancel_id):
     if not stage or not stage.get("tasks") or not stage.get("config"):
         yield stage or {}, _inline_cache_result_rows(stage), "", "没有可继续的缓存处理任务。"
         return
-    config = stage["config"]
-    completed_ids = {str(item["record"]["id"]) for item in stage.get("items", [])}
-    pending = [task for task in stage["tasks"] if str(task["record"]["id"]) not in completed_ids]
-    event_key, event = _png_batch_cancel_event(cancel_id)
-    interval = max(1, (len(pending) + 99) // 100)
+    if not _INLINE_CACHE_PROCESS_LOCK.acquire(blocking=False):
+        rows = _inline_cache_result_rows(stage)
+        yield stage, rows, rows[0][2] if rows else "", "已有缓存处理任务正在运行；当前结果未启动，可稍后继续。"
+        return
+    event_key = ""
+    event = None
     stopped_by_error = False
     try:
+        config = stage["config"]
+        completed_ids = {str(item["record"]["id"]) for item in stage.get("items", [])}
+        pending = [task for task in stage["tasks"] if str(task["record"]["id"]) not in completed_ids]
+        interval = max(1, (len(pending) + 9) // 10)
+        event_key, event = _png_batch_cancel_event(cancel_id)
+        if pending and not event.is_set():
+            # Freeze one invocation; an explicit resume may load corrected settings.
+            workflow = dict(_workflow_settings())
+            connection = dict(_transform_llm_settings())
+            preset, resolved_model = _resolve_preset_model(
+                config["preset"], config.get("resolved_model") or config["base_model"],
+            )
+            supplement, _ = _load_system_prompt_profile(preset, resolved_model)
+            config.update(preset=preset, resolved_model=resolved_model)
         for index, task in enumerate(pending, 1):
+            if event.is_set():
+                break
+            if index == 1 or index % interval == 0 or index == len(pending):
+                rows = _inline_cache_result_rows(stage)
+                yield stage, rows, rows[0][2] if rows else "", _inline_cache_stage_message(
+                    stage, f"处理中 {index}/{len(pending)} · 即将请求 LLM",
+                )
             if event.is_set():
                 break
             record = task["record"]
             ident = str(record["id"])
             try:
                 result, transform_status = _inline_cache_transform(
-                    task["source"], config["action"], config["preset"], config["base_model"],
+                    task["source"], config["action"], config["preset"], config["resolved_model"],
                     config["instruction"], event,
+                    workflow_settings=workflow, connection_settings=connection,
+                    system_override=supplement,
                 )
                 if event.is_set():
                     break
                 if not str(result or "").strip():
                     raise ValueError(transform_status or "LLM 未返回结果")
+                result_db_id = _save_inline_processed_result(stage, record, result)
             except Exception as error:
                 stage.setdefault("errors", {})[ident] = _safe_error(error)
                 stopped_by_error = True
                 break
             stage.setdefault("errors", {}).pop(ident, None)
-            result_db_id = _save_inline_processed_result(stage, record, result)
             stage.setdefault("items", []).append({
                 "record": dict(record), "result": str(result).strip(),
                 "preset": config["preset"], "base_model": config["resolved_model"],
                 "result_db_id": result_db_id,
             })
-            if index % interval == 0 and index < len(pending):
-                rows = _inline_cache_result_rows(stage)
-                yield stage, rows, rows[0][2] if rows else "", _inline_cache_stage_message(stage, "处理中")
         total, processed, remaining, _failed = _inline_cache_stage_counts(stage)
         stage["complete"] = bool(total) and remaining == 0
         if stage["complete"]:
@@ -5387,10 +5553,14 @@ def _inline_cache_process_stage(stage, cancel_id):
         else:
             prefix = "处理尚未完成，可继续处理未完成"
         message = _inline_cache_stage_message(stage, prefix)
+    except Exception as error:
+        message = _inline_cache_stage_message(stage, f"处理启动失败：{_safe_error(error)}；可修正设置后继续")
     finally:
-        with _PNG_BATCH_CANCEL_LOCK:
-            if _PNG_BATCH_CANCEL_EVENTS.get(event_key) is event:
-                _PNG_BATCH_CANCEL_EVENTS.pop(event_key, None)
+        if event is not None:
+            with _PNG_BATCH_CANCEL_LOCK:
+                if _PNG_BATCH_CANCEL_EVENTS.get(event_key) is event:
+                    _PNG_BATCH_CANCEL_EVENTS.pop(event_key, None)
+        _INLINE_CACHE_PROCESS_LOCK.release()
     rows = _inline_cache_result_rows(stage)
     yield stage, rows, rows[0][2] if rows else "", message
 
@@ -5398,7 +5568,11 @@ def _inline_cache_process_stage(stage, cancel_id):
 def _inline_cache_run(scope, record, source, query, output_mode, base_model_filter,
                       action, preset, base_model, instruction, cancel_id):
     records = [record] if scope == "当前记录" and record else (
-        _cache_records(query, 0, output_mode, base_model_filter) if scope == "全部筛选结果" else [])
+        _cache_records(query, 0, output_mode, base_model_filter, limit=MAX_CACHE_TRANSFORM_RECORDS + 1)
+        if scope == "全部筛选结果" else [])
+    if len(records) > MAX_CACHE_TRANSFORM_RECORDS:
+        yield {}, [], "", f"单批缓存处理最多 {MAX_CACHE_TRANSFORM_RECORDS} 条，本次未启动；请缩小筛选范围后重试。"
+        return
     canonical_preset = _canonical_preset(preset)
     _, resolved_model = _resolve_preset_model(canonical_preset, base_model)
     stage = {
@@ -5587,8 +5761,13 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
         with gr.Accordion("查看 / 编辑本次输入", open=False):
             source = gr.Textbox(label="原始 Prompt", lines=4, max_lines=24, elem_id=f"{prefix}_source")
         with gr.Row(elem_classes=["lps-form-row"]):
-            preset = gr.Dropdown(label="输出预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id=f"{prefix}_preset")
-            model = gr.Dropdown(label="目标模型", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id=f"{prefix}_model")
+            model_preset = gr.Dropdown(
+                label="模型预设", choices=MODEL_PRESET_UI_CHOICES,
+                value=_model_preset_value(workflow["preset"], workflow["base_model"]),
+                elem_id=f"{prefix}_model_preset",
+            )
+            preset = gr.State(workflow["preset"])
+            model = gr.State(workflow["base_model"])
             action = gr.Radio(label="操作", choices=ACTION_UI_CHOICES, value="Polish", elem_id=f"{prefix}_action")
         instruction = gr.Textbox(label="处理要求（可选）", lines=1, max_lines=6, elem_id=f"{prefix}_instruction")
         with gr.Accordion("处理结果库独立 LLM 参数", open=False, visible=False, elem_classes=["lps-settings-section"]):
@@ -5691,7 +5870,7 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
         following.click(lambda q, f, m, p: _cache_picker_view(q, f, m, int(p or 1) + 1), inputs=browse_inputs, outputs=browse_outputs)
         page.submit(_cache_picker_view, inputs=browse_inputs, outputs=browse_outputs)
         picker.input(_cache_picker_select, inputs=picker, outputs=[selected, source])
-        preset.change(_recommended_base_model_for_preset, inputs=preset, outputs=model)
+        model_preset.change(_model_preset_state, inputs=model_preset, outputs=[preset, model], queue=False)
         run.click(process, inputs=[scope, selected, source, query, fmt, model_filter, action, preset, model, instruction, cancel_id],
                   outputs=[stage, results, result, status, result_id, result_page, result_panel])
         resume.click(
@@ -6057,7 +6236,7 @@ def _wd14_native_batch_components():
 def _api_generate(payload: dict[str, Any]):
     saved_connection = _connection_settings()
     defaults = {
-        "preset": "Danbooru Tags", "system_override": "", "base_model": "Auto / checkpoint default", "safety": "SFW",
+        "preset": "Danbooru Tags", "system_override": "", "base_model": "Pony / Illustrious", "safety": "SFW",
         "provider": saved_connection["provider"], "endpoint": saved_connection["endpoint"], "model": saved_connection["model"], "api_key": "",
         "temperature": saved_connection["temperature"], "timeout": saved_connection["timeout"],
         "max_tokens": saved_connection["max_tokens"], "send_temperature": saved_connection["send_temperature"],
@@ -6085,7 +6264,7 @@ def _api_generate(payload: dict[str, Any]):
             raise ValueError(f"Unsupported {label}: {value}")
 
     require_choice("preset", PRESETS, "prompt preset")
-    require_choice("base_model", BASE_MODEL_GUIDANCE, "base model profile")
+    require_choice("base_model", {"", *MODEL_PRESET_GUIDANCE}, "base model profile")
     require_choice("safety", {"SFW", "NSFW"}, "safety mode")
     require_choice("structured_mode", {"Plain Prompt", "Regional JSON", "Regional Markdown"}, "structured output mode")
     for field in ("send_temperature", "remove_bad", "shuffle", "spaces", "cache_result"):
@@ -6148,7 +6327,7 @@ def _api_inline_generate(payload: dict[str, Any]):
     safety = payload.get("safety", workflow["safety"])
     if preset not in PRESETS:
         raise ValueError(f"Unsupported prompt preset: {preset}")
-    if base_model not in BASE_MODEL_GUIDANCE:
+    if base_model and base_model not in MODEL_PRESET_GUIDANCE:
         raise ValueError(f"Unsupported base model profile: {base_model}")
     if safety not in {"SFW", "NSFW"}:
         raise ValueError(f"Unsupported safety mode: {safety}")
@@ -6219,7 +6398,7 @@ def _api_auto_loop_generate(payload: dict[str, Any]):
     safety = payload.get("safety", workflow["safety"])
     if preset not in PRESETS:
         raise ValueError(f"Unsupported prompt preset: {preset}")
-    if base_model not in BASE_MODEL_GUIDANCE:
+    if base_model and base_model not in MODEL_PRESET_GUIDANCE:
         raise ValueError(f"Unsupported base model profile: {base_model}")
     if safety not in {"SFW", "NSFW"}:
         raise ValueError(f"Unsupported safety mode: {safety}")
@@ -6833,8 +7012,10 @@ def on_ui_tabs():
     handoff_settings = _handoff_inference_settings()
     workflow = _workflow_settings()
     ranbooru_link = _ranbooru_link_settings()
-    initial_records = DB.list_prompts(limit=None)
-    initial_processed_records = _processed_result_records()
+    initial_records = DB.list_prompts(limit=CACHE_PAGE_SIZE)
+    initial_cache_count = DB.count_prompts()
+    initial_processed_records = _processed_result_records(limit=1000)
+    initial_processed_count = RESULT_DB.count_prompts()
     initial_handoff_table, initial_handoff_choices, initial_handoff_status = _handoff_views()
     with gr.Blocks(analytics_enabled=False, css=UI_CSS, elem_id="llm_prompt_studio", elem_classes=["lps-app-shell"]) as ui:
         gr.Markdown("## LLM 提示词工作室", elem_classes=["lps-heading", "lps-brand-heading"])
@@ -6869,13 +7050,12 @@ def on_ui_tabs():
                             template_content = gr.Textbox(label="模板内容", value=template_initial[1], lines=2, max_lines=10)
                             with gr.Row():
                                 template_preserve_fixed = gr.Checkbox(label="固定 Prompt 完全保留", value=template_initial[2])
-                                template_obey_user = gr.Checkbox(label="严格遵从用户提示词", value=template_initial[3])
-                            template_variation_dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=template_initial[4], lines=2)
-                            template_style_rules = gr.Textbox(label="风格规则（可选）", value=template_initial[5], lines=2)
-                            template_forbidden_content = gr.Textbox(label="禁止内容（可选）", value=template_initial[6], lines=2)
+                                template_variation_dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=template_initial[3], lines=2)
+                            template_style_rules = gr.Textbox(label="风格规则（可选）", value=template_initial[4], lines=2)
+                            template_forbidden_content = gr.Textbox(label="禁止内容（可选）", value=template_initial[5], lines=2)
                             with gr.Row():
-                                template_conflict_policy = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=template_initial[7])
-                                template_duplicate_policy = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=template_initial[8])
+                                template_conflict_policy = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=template_initial[6])
+                                template_duplicate_policy = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=template_initial[7])
                             with gr.Row():
                                 template_save = gr.Button("保存模板", variant="primary")
                                 template_default = gr.Button("设为默认模板")
@@ -6883,8 +7063,13 @@ def on_ui_tabs():
                             template_status = gr.Markdown()
                     with gr.Column(scale=2, elem_classes=["lps-rules-column", "lps-panel"]):
                         with gr.Row():
-                            preset = gr.Dropdown(label="输出预设", choices=PRESET_UI_CHOICES, value=workflow["preset"], elem_id="llm_prompt_studio_preset")
-                            base_model = gr.Dropdown(label="模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"], elem_id="llm_prompt_studio_base_model")
+                            model_preset_selector = gr.Dropdown(
+                                label="模型预设", choices=MODEL_PRESET_UI_CHOICES,
+                                value=_model_preset_value(workflow["preset"], workflow["base_model"]),
+                                elem_id="llm_prompt_studio_model_preset",
+                            )
+                            preset = gr.State(workflow["preset"])
+                            base_model = gr.State(workflow["base_model"])
                         with gr.Accordion("System Prompt 补充要求", open=False, elem_classes=["lps-preset-editor"]):
                             system_override = gr.State(_system_prompt_override_value(workflow["preset"], workflow["system_override"], workflow["base_model"]))
                             system_editor = gr.Textbox(label="补充要求（不能替代模型预设）", lines=5, max_lines=20,
@@ -6930,7 +7115,7 @@ def on_ui_tabs():
                     batch_base_prompt = source_tags
                     with gr.Row():
                         batch_lock_known = gr.Checkbox(label="保留固定主体、LoRA 和权重", value=True, elem_id="llm_prompt_studio_batch_lock_known")
-                        batch_sample_static = gr.Checkbox(label="静态词库抽样", value=True, elem_id="llm_prompt_studio_batch_sample_static")
+                        batch_sample_static = gr.Checkbox(label="静态词库抽样", value=False, elem_id="llm_prompt_studio_batch_sample_static")
                     with gr.Row():
                         batch_skip_existing = gr.Checkbox(label="跳过已有缓存的要求", value=workflow["batch_skip_existing"])
                         batch_skip_failed = gr.Checkbox(label="失败后继续", value=workflow["batch_skip_failed"])
@@ -6969,7 +7154,6 @@ def on_ui_tabs():
             generation_template_name = template_name
             generation_template_content = template_content
             generation_template_preserve_fixed = template_preserve_fixed
-            generation_template_obey_user = template_obey_user
             generation_template_variation_dimensions = template_variation_dimensions
             generation_template_style_rules = template_style_rules
             generation_template_forbidden_content = template_forbidden_content
@@ -7101,7 +7285,7 @@ def on_ui_tabs():
                     cache_previous = gr.Button("上一页")
                     cache_next = gr.Button("下一页")
                     cache_page = gr.Number(label="页码", value=1, minimum=1, precision=0, scale=0, min_width=100)
-                cache_status = gr.Markdown(f"缓存 {len(initial_records)} 条", elem_id="llm_prompt_studio_cache_status", elem_classes=["lps-status"])
+                cache_status = gr.Markdown(f"缓存 {initial_cache_count} 条", elem_id="llm_prompt_studio_cache_status", elem_classes=["lps-status"])
                 selected_records = gr.Dropdown(label="选择缓存记录（支持多选）", choices=_cache_choices(initial_records), value=[], multiselect=True, visible=False)
                 table = gr.Dataframe(
                     value=_as_rows(initial_records), label="已缓存 Prompt",
@@ -7178,7 +7362,7 @@ def on_ui_tabs():
                     processed_result_query = gr.Textbox(label="搜索处理结果", scale=4)
                     processed_result_refresh = gr.Button("刷新结果库", variant="primary")
                 processed_result_status = gr.Markdown(
-                    f"处理结果 {len(initial_processed_records)} 条",
+                    f"处理结果 {initial_processed_count} 条" + (" · 显示前 1000 条，请筛选查看其余结果" if initial_processed_count > 1000 else ""),
                     elem_id="llm_prompt_studio_processed_result_status", elem_classes=["lps-status"],
                 )
                 processed_result_selection = gr.Dropdown(
@@ -7341,13 +7525,12 @@ def on_ui_tabs():
                                                   placeholder="这里写反复使用的创作要求、固定风格和输出约束")
                     with gr.Row():
                         template_preserve_fixed = gr.Checkbox(label="保留固定 Prompt", value=template_initial[2])
-                        template_obey_user = gr.Checkbox(label="遵从用户要求", value=template_initial[3])
-                    template_variation_dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=template_initial[4], lines=2)
-                    template_style_rules = gr.Textbox(label="风格规则", value=template_initial[5], lines=2)
-                    template_forbidden_content = gr.Textbox(label="禁止内容", value=template_initial[6], lines=2)
+                    template_variation_dimensions = gr.Textbox(label="变化维度（逗号分隔）", value=template_initial[3], lines=2)
+                    template_style_rules = gr.Textbox(label="风格规则", value=template_initial[4], lines=2)
+                    template_forbidden_content = gr.Textbox(label="禁止内容", value=template_initial[5], lines=2)
                     with gr.Row():
-                        template_conflict_policy = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=template_initial[7])
-                        template_duplicate_policy = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=template_initial[8])
+                        template_conflict_policy = gr.Dropdown(label="冲突处理", choices=[("拒绝并重试", "reject_and_retry"), ("允许", "allow")], value=template_initial[6])
+                        template_duplicate_policy = gr.Dropdown(label="重复处理", choices=[("跳过并继续", "skip_and_continue"), ("接受", "accept")], value=template_initial[7])
                     with gr.Row(elem_classes=["lps-primary-actions"]):
                         template_save = gr.Button("保存模板", variant="primary")
                         template_default = gr.Button("设为默认模板")
@@ -7355,8 +7538,11 @@ def on_ui_tabs():
                     template_status = gr.Markdown(elem_classes=["lps-status"])
                 with gr.Accordion("模型预设与 System Prompt 补充要求", open=True, elem_classes=["lps-preset-editor"]):
                     with gr.Row():
-                        preset = gr.Dropdown(label="输出预设", choices=PRESET_UI_CHOICES, value=workflow["preset"])
-                        base_model = gr.Dropdown(label="对应模型预设", choices=MODEL_UI_CHOICES, value=workflow["base_model"])
+                        prompt_model_preset = gr.Dropdown(
+                            label="模型预设", choices=MODEL_PRESET_UI_CHOICES,
+                            value=_model_preset_value(workflow["preset"], workflow["base_model"]),
+                            elem_id="llm_prompt_studio_prompt_model_preset",
+                        )
                     system_override = gr.State(_system_prompt_override_value(workflow["preset"], workflow["system_override"], workflow["base_model"]))
                     system_editor = gr.Textbox(
                         label="补充要求（不能替代模型预设）", lines=16, max_lines=50,
@@ -7372,7 +7558,6 @@ def on_ui_tabs():
                 prompt_template_name = template_name
                 prompt_template_content = template_content
                 prompt_template_preserve_fixed = template_preserve_fixed
-                prompt_template_obey_user = template_obey_user
                 prompt_template_variation_dimensions = template_variation_dimensions
                 prompt_template_style_rules = template_style_rules
                 prompt_template_forbidden_content = template_forbidden_content
@@ -7382,8 +7567,7 @@ def on_ui_tabs():
                 prompt_template_default = template_default
                 prompt_template_delete = template_delete
                 prompt_template_status = template_status
-                prompt_preset = preset
-                prompt_base_model = base_model
+                prompt_preset = prompt_model_preset
                 prompt_system_override = system_override
                 prompt_system_editor = system_editor
                 prompt_profile_save = system_profile_save
@@ -7394,7 +7578,6 @@ def on_ui_tabs():
                 template_name = generation_template_name
                 template_content = generation_template_content
                 template_preserve_fixed = generation_template_preserve_fixed
-                template_obey_user = generation_template_obey_user
                 template_variation_dimensions = generation_template_variation_dimensions
                 template_style_rules = generation_template_style_rules
                 template_forbidden_content = generation_template_forbidden_content
@@ -7427,7 +7610,7 @@ def on_ui_tabs():
                         wildcard_path = gr.Textbox(label="静态词库目录", value=workflow["wildcard_path"], elem_id="llm_prompt_studio_wildcard_path")
                         wildcard_index = gr.Button("索引静态词库", elem_id="llm_prompt_studio_wildcard_index")
                         wildcard_status = gr.Markdown(
-                            "按文件夹／文件名保留分类，支持 TXT、CSV、JSON、YAML。修改文件后点击索引更新。",
+                            "打开页面时自动索引。按文件夹／文件名保留分类，支持 TXT、CSV、JSON、YAML。修改文件后点击“索引静态词库”更新。",
                             elem_id="llm_prompt_studio_wildcard_status",
                             elem_classes=["lps-status"],
                         )
@@ -7508,41 +7691,46 @@ def on_ui_tabs():
         prompt_template_button.click(_template_request, inputs=prompt_template_choice, outputs=request)
         _bind_template_editors([
             dict(choice=template_choice,
-                 fields=[template_name, template_content, template_preserve_fixed, template_obey_user,
+                 fields=[template_name, template_content, template_preserve_fixed,
                          template_variation_dimensions, template_style_rules, template_forbidden_content,
                          template_conflict_policy, template_duplicate_policy],
                  save=template_save, default=template_default, delete=template_delete, status=template_status),
             dict(choice=prompt_template_choice,
-                 fields=[prompt_template_name, prompt_template_content, prompt_template_preserve_fixed, prompt_template_obey_user,
+                 fields=[prompt_template_name, prompt_template_content, prompt_template_preserve_fixed,
                          prompt_template_variation_dimensions, prompt_template_style_rules, prompt_template_forbidden_content,
                          prompt_template_conflict_policy, prompt_template_duplicate_policy],
                  save=prompt_template_save, default=prompt_template_default, delete=prompt_template_delete, status=prompt_template_status),
             *_INLINE_TEMPLATE_EDITORS.values(),
         ], interface=ui)
         structured_mode.change(lambda mode: gr.update(visible=_canonical_output_mode(mode) != "Plain Prompt"), inputs=structured_mode, outputs=region_count, queue=False)
-        preset.input(_load_system_prompt_profile, inputs=[preset, base_model], outputs=[system_override, system_editor], queue=False)
-        base_model.input(_load_system_prompt_profile, inputs=[preset, base_model], outputs=[system_override, system_editor], queue=False)
+        model_preset_selector.input(
+            _prompt_profile_change, inputs=model_preset_selector,
+            outputs=[preset, base_model, system_override, system_editor, prompt_system_override, prompt_system_editor, prompt_model_preset], queue=False,
+        )
+        prompt_model_preset.input(
+            _prompt_profile_change, inputs=prompt_model_preset,
+            outputs=[preset, base_model, system_override, system_editor, prompt_system_override, prompt_system_editor, model_preset_selector], queue=False,
+        )
         system_editor.input(lambda text: str(text or "").strip(), inputs=system_editor, outputs=system_override, queue=False)
-        prompt_preset.input(_prompt_profile_change, inputs=[prompt_preset, prompt_base_model], outputs=[prompt_system_override, prompt_system_editor, preset, base_model, system_override, system_editor], queue=False)
-        prompt_base_model.input(_prompt_profile_change, inputs=[prompt_preset, prompt_base_model], outputs=[prompt_system_override, prompt_system_editor, preset, base_model, system_override, system_editor], queue=False)
-        prompt_system_editor.input(lambda text: str(text or "").strip(), inputs=prompt_system_editor, outputs=prompt_system_override, queue=False)
         prompt_profile_save.click(
             _prompt_profile_save,
-            inputs=[prompt_preset, prompt_base_model, prompt_system_editor],
-            outputs=[prompt_system_override, prompt_profile_status, preset, base_model, system_override, system_editor],
+            inputs=[prompt_preset, prompt_system_editor],
+            outputs=[prompt_system_override, prompt_profile_status, prompt_system_editor, system_override, system_editor],
         )
         generation_restore_preset.click(
-            _reset_system_prompt_profile,
-            inputs=[preset, base_model],
-            outputs=[system_override, system_editor, prompt_profile_status],
+            _prompt_profile_reset,
+            inputs=model_preset_selector,
+            outputs=[system_override, system_editor, prompt_profile_status, prompt_system_override, prompt_system_editor],
         )
         prompt_restore_preset.click(
             _prompt_profile_reset,
-            inputs=[prompt_preset, prompt_base_model],
-            outputs=[prompt_system_override, prompt_system_editor, prompt_profile_status, preset, base_model, system_override, system_editor],
+            inputs=prompt_preset,
+            outputs=[prompt_system_override, prompt_system_editor, prompt_profile_status, system_override, system_editor],
         )
-        ui.load(_load_system_prompt_editor, outputs=[preset, base_model, system_override, system_editor])
-        ui.load(_load_system_prompt_profile, inputs=[prompt_preset, prompt_base_model], outputs=[prompt_system_override, prompt_system_editor])
+        ui.load(
+            _load_system_prompt_profile, inputs=[preset, base_model],
+            outputs=[system_override, system_editor],
+        )
         provider.change(
             _load_provider_settings, inputs=provider,
             outputs=[endpoint, model, fallback_provider, fallback_endpoint, fallback_model, weights_path, model_version, temperature, timeout, max_tokens, send_temperature, retry_count, thinking_enabled, thinking_budget, reasoning_effort, test_status, top_p, top_k],
@@ -7660,6 +7848,11 @@ def on_ui_tabs():
             _index_wildcards,
             inputs=wildcard_path,
             outputs=[wildcard_status, wildcard_results, wildcard_category],
+        )
+        ui.load(
+            _refresh_wildcard_view,
+            outputs=[wildcard_status, wildcard_results, wildcard_category],
+            queue=False,
         )
         wildcard_query.submit(_search_wildcards, inputs=[wildcard_query, wildcard_category], outputs=wildcard_results)
         wildcard_query.blur(_search_wildcards, inputs=[wildcard_query, wildcard_category], outputs=wildcard_results)

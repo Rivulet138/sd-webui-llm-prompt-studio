@@ -41,7 +41,7 @@ def run_llm_generation(
         if retry_reason:
             attempt_system = build_retry_system(retry_reason, attempt)
         attempt_temperature = request_temperature
-        if attempt and (retry_reason == "diversity" or not preserve_inference_settings):
+        if attempt and retry_reason == "diversity" and not preserve_inference_settings:
             attempt_temperature = min(2.0, request_temperature + 0.15 * attempt)
         try:
             raw_result = call_llm(

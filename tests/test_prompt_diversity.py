@@ -155,6 +155,9 @@ class DiversityLayerTests(unittest.TestCase):
             path.write_text("\n".join(terms) + "\n", encoding="utf-8")
         self.db.index_wildcards(self.root / "lexicon")
 
+    def enable_recipe(self):
+        self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": True})
+
     # -- duplicate rule -------------------------------------------------
     def test_shared_subject_skeleton_is_not_content(self):
         same_scene = self.api._content_similarity(KITCHEN_A, KITCHEN_B, FIXED_SOURCE)
@@ -182,6 +185,7 @@ class DiversityLayerTests(unittest.TestCase):
     # -- lexicon recipe -------------------------------------------------
     def test_recipe_uses_visual_dimensions_only_and_never_repeats(self):
         self.make_lexicon()
+        self.enable_recipe()
         used = set()
         first = self.api._lexicon_recipe(used, 3)
         second = self.api._lexicon_recipe(used, 3)
@@ -198,11 +202,18 @@ class DiversityLayerTests(unittest.TestCase):
 
     def test_recipe_can_be_disabled_and_bounded(self):
         self.make_lexicon()
+        self.enable_recipe()
         self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": False})
         self.assertEqual(self.api._lexicon_recipe(set(), 3), [])
+        self.enable_recipe()
         self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_dimensions": 2})
         picks = self.api._lexicon_recipe(set())
         self.assertLessEqual(len(picks), 2)
+
+    def test_recipe_is_disabled_by_default(self):
+        self.make_lexicon()
+        self.assertFalse(self.api._diversity_settings()["recipe_enabled"])
+        self.assertEqual(self.api._lexicon_recipe(set()), [])
 
     def test_recipe_block_states_fixed_content_wins(self):
         block = self.api._recipe_directive_block([("action", "动作/基础动作", "crouching")])
@@ -223,6 +234,7 @@ class DiversityLayerTests(unittest.TestCase):
 
     def test_recipe_honours_the_planned_dimensions(self):
         self.make_lexicon()
+        self.enable_recipe()
         picks = self.api._lexicon_recipe(set(), dimensions=("action", "setting"))
         self.assertEqual([dimension for dimension, _name, _term in picks], ["action", "setting"])
 
@@ -371,7 +383,11 @@ class GenerateGateTests(unittest.TestCase):
         self.assertNotIn("DIVERSITY RETRY", self.calls[0].system)
         self.assertIn("DIVERSITY RETRY", self.calls[1].system)
         self.assertIn("重试 1 次", status)
-        # The retry also escalates sampling, so the second call cannot repeat the first.
+        self.assertEqual(self.calls[1].temperature, self.calls[0].temperature)
+
+    def test_diversity_retry_changes_temperature_only_without_preservation(self):
+        api = self.build([KITCHEN_B, STREET_C])
+        self.generate(api, history=[KITCHEN_A], preserve=False)
         self.assertGreater(self.calls[1].temperature, self.calls[0].temperature)
 
     def test_exhausted_retries_still_return_the_best_candidate(self):
@@ -389,7 +405,7 @@ class GenerateGateTests(unittest.TestCase):
         self.assertEqual(len(stored), 1)
         self.assertEqual(list(stored.values())[0], [STREET_C])
 
-    def test_user_temperature_is_preserved_unless_the_floor_is_enabled(self):
+    def test_temperature_floor_respects_preservation_setting(self):
         api = self.build([STREET_C])
         self.generate(api, history=[KITCHEN_A], preserve=True)
         self.assertAlmostEqual(self.calls[0].temperature, 1.1)
@@ -397,18 +413,17 @@ class GenerateGateTests(unittest.TestCase):
         self.calls.clear()
         api = self.build([STREET_C])
         self.generate(api, history=[KITCHEN_A], preserve=True)
+        self.assertAlmostEqual(self.calls[0].temperature, 1.1)
+        self.calls.clear()
+        api = self.build([STREET_C])
+        self.generate(api, history=[KITCHEN_A], preserve=False)
         self.assertAlmostEqual(self.calls[0].temperature, api._MIN_INDEPENDENT_BATCH_TEMPERATURE)
 
     def test_gate_prompt_maps_coverage_instead_of_only_prohibiting(self):
         api = self.build([STREET_C])
-        # The extracted real ``_static_prompt_reference`` would query the (empty)
-        # test lexicon, so inject the fresh-vocabulary branch explicitly.
-        api._generate.__globals__["_static_prompt_reference"] = (
-            lambda *args, **kwargs: ["[动作] crouching", "[颜色] teal"])
         _prompt, _system, _status = self.generate(api, history=[KITCHEN_A, KITCHEN_B])
         system = self.calls[0].system
         self.assertIn("COVERAGE SO FAR", system)
-        self.assertIn("RANDOM LOCAL DIRECTIONS", system)
         self.assertNotIn("DIVERSITY LEDGER", system)
         self.assertNotIn("Do not reuse their scene structure", system)
 

@@ -3,11 +3,12 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock
 
 from test_queue_regressions import ROOT, StudioDB, ui_functions
-from prompt_studio_core import normalize_sampling, uses_layered_polish
+from prompt_studio_core import normalize_sampling
 from prompt_studio_generation import run_llm_generation
 
 GR = SimpleNamespace(update=lambda **kwargs: kwargs)
@@ -98,7 +99,6 @@ class CacheInferenceTests(unittest.TestCase):
             _canonical_provider=lambda x: x, _canonical_output_mode=lambda x: x,
             _resolve_preset_model=lambda p, b: (p, b), _aligned_preset=lambda p, b: (p, False),
             build_operation_instruction=lambda *args: "Keep source", _static_prompt_reference=lambda x: [],
-            uses_layered_polish=uses_layered_polish,
             build_system_prompt=lambda *args, **kwargs: "system", build_user_message=lambda x: x,
             CREDENTIALS=SimpleNamespace(resolve=Mock(return_value="fake-test-key"), save=Mock(return_value=False), has_matching=Mock(return_value=False)), call_llm=self.llm,
             _MAX_DIVERSITY_RETRIES=1, _MAX_RESPONSE_RETRIES=1,
@@ -175,6 +175,135 @@ class CacheInferenceTests(unittest.TestCase):
         self.api._inline_cache_transform("one cat", "Polish", "Danbooru Tags", "Auto", "", None)
         self.assertEqual(len(self.llm.call_args_list), 2)
         self.assertEqual([call.args[6] for call in self.llm.call_args_list], [0.0, 0.0])
+
+
+class CacheResourceTests(unittest.TestCase):
+    def setUp(self):
+        self.lock = threading.Lock()
+        self.event = threading.Event()
+        self.events = {"run": self.event}
+        self.workflow = {"safety": "SFW"}
+        self.connection = {"model": "first"}
+        self.transform = Mock(return_value=("processed prompt", "ok"))
+        self.save = Mock(return_value=10)
+        self.load_workflow = Mock(side_effect=lambda: dict(self.workflow))
+        self.load_connection = Mock(side_effect=lambda: dict(self.connection))
+        self.load_profile = Mock(return_value=("supplement", "ok"))
+        self.api = ui_functions(
+            "_inline_cache_run", "_inline_cache_resume", "_inline_cache_process_stage",
+            "_inline_cache_result_rows", "_inline_cache_stage_counts", "_inline_cache_stage_message",
+            constants=("MAX_CACHE_TRANSFORM_RECORDS",), CACHE_PAGE_SIZE=50,
+            _INLINE_CACHE_PROCESS_LOCK=self.lock, _PNG_BATCH_CANCEL_LOCK=threading.Lock(),
+            _PNG_BATCH_CANCEL_EVENTS=self.events, _png_batch_cancel_event=lambda key: (key, self.event),
+            _workflow_settings=self.load_workflow, _transform_llm_settings=self.load_connection,
+            _load_system_prompt_profile=self.load_profile, _inline_cache_transform=self.transform,
+            _save_inline_processed_result=self.save, _safe_error=str,
+            _canonical_action=lambda value: value, _canonical_preset=lambda value: value,
+            _canonical_base_model=lambda value: value,
+            _resolve_preset_model=lambda p, b: (p, "resolved-model"),
+            _aligned_preset=lambda p, b: (p, False),
+        )
+        self.stage = {
+            "tasks": [{"record": {"id": ident}, "source": f"source {ident}"} for ident in (1, 2)],
+            "items": [], "errors": {}, "config": dict(action="Polish", preset="Tags", base_model="Auto",
+                                                        resolved_model="resolved-model", instruction="keep scene"),
+        }
+
+    def test_processing_freezes_settings_once_and_resume_refreshes_once(self):
+        stream = self.api._inline_cache_process_stage(self.stage, "run")
+        next(stream)
+        self.workflow["safety"] = "changed"
+        self.connection["model"] = "changed"
+        result = list(stream)[-1]
+        self.assertTrue(result[0]["complete"])
+        self.assertEqual(self.load_workflow.call_count, 1)
+        self.assertEqual(self.load_connection.call_count, 1)
+        self.load_profile.assert_called_once_with("Tags", "resolved-model")
+        for call in self.transform.call_args_list:
+            self.assertEqual(call.args[3], "resolved-model")
+            self.assertEqual(call.kwargs["workflow_settings"]["safety"], "SFW")
+            self.assertEqual(call.kwargs["connection_settings"]["model"], "first")
+            self.assertEqual(call.kwargs["system_override"], "supplement")
+        self.stage["items"].pop()
+        list(self.api._inline_cache_resume(self.stage, "run"))
+        self.assertEqual(self.load_connection.call_count, 2)
+        self.assertEqual(self.transform.call_args.kwargs["connection_settings"]["model"], "changed")
+
+    def test_busy_processor_is_nonblocking_and_does_not_call_llm(self):
+        self.lock.acquire()
+        try:
+            result = list(self.api._inline_cache_process_stage(self.stage, "run"))
+        finally:
+            self.lock.release()
+        self.assertEqual(len(result), 1)
+        self.transform.assert_not_called()
+
+    def test_cancel_during_progress_keeps_completed_results_and_releases_lock(self):
+        stream = self.api._inline_cache_process_stage(self.stage, "run")
+        next(stream)
+        self.event.set()
+        result = list(stream)[-1]
+        self.assertFalse(result[0]["complete"])
+        self.transform.assert_not_called()
+        self.assertNotIn("run", self.events)
+        self.assertFalse(self.lock.locked())
+
+    def test_persistence_failure_pauses_and_resume_skips_successful_items(self):
+        self.save.side_effect = [10, RuntimeError("disk full")]
+        result = list(self.api._inline_cache_process_stage(self.stage, "run"))[-1]
+        self.assertEqual(len(result[0]["items"]), 1)
+        self.assertIn("disk full", result[0]["errors"]["2"])
+        self.assertFalse(self.lock.locked())
+        self.save.side_effect = None
+        self.transform.reset_mock()
+        resumed = list(self.api._inline_cache_resume(self.stage, "run"))[-1]
+        self.assertTrue(resumed[0]["complete"])
+        self.transform.assert_called_once()
+        self.assertEqual(self.transform.call_args.args[0], "source 2")
+        self.assertEqual(self.stage["errors"], {})
+
+    def test_closing_progress_stream_releases_lock_and_cancel_handle(self):
+        stream = self.api._inline_cache_process_stage(self.stage, "run")
+        next(stream)
+        self.assertTrue(self.lock.locked())
+        stream.close()
+        self.assertFalse(self.lock.locked())
+        self.assertEqual(self.events, {})
+
+    def test_filtered_transform_is_bounded_without_silent_truncation(self):
+        records = Mock(return_value=[{"id": ident, "prompt": "one cat"} for ident in range(501)])
+        self.api._inline_cache_run.__globals__["_cache_records"] = records
+        result = list(self.api._inline_cache_run("全部筛选结果", None, "", "", "全部", "全部",
+            "Polish", "Tags", "Auto", "", "run"))[-1]
+        self.assertEqual(records.call_args.kwargs["limit"], 501)
+        self.assertIn("500", result[-1])
+        self.transform.assert_not_called()
+        self.assertFalse(result[0].get("tasks"))
+
+
+class CachePagingTests(unittest.TestCase):
+    def test_page_reads_only_visible_rows_but_count_matches_full_filter(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = StudioDB(Path(folder) / "cache.db")
+            for ident in range(105):
+                db.save_prompt(f"cat {ident}", output_mode="Tags", base_model="test", score=5)
+            db.save_prompt("dog", output_mode="Tags", base_model="test", score=1)
+            self.assertEqual(db.count_prompts("cat", 4, "Tags", "test"), 105)
+            api = ui_functions("_cache_records", "_cache_page_update", DB=db, gr=GR,
+                CACHE_PAGE_SIZE=50, _canonical_preset=lambda value: value,
+                _canonical_base_model=lambda value: value, _as_rows=lambda rows: rows,
+                _cache_choices=lambda rows: [row["id"] for row in rows])
+            list_records = Mock(wraps=db.list_prompts)
+            db.list_prompts = list_records
+            result = api._cache_page_update("cat", 4, "Tags", "test", 2)
+            self.assertEqual(len(result[0]["value"]), 50)
+            self.assertEqual(result[0]["value"][0]["visible_position"], 51)
+            self.assertIn("105", result[2])
+            self.assertEqual(list_records.call_args.kwargs["limit"], 50)
+            self.assertEqual(list_records.call_args.kwargs["offset"], 50)
+            last = api._cache_page_update("cat", 4, "Tags", "test", 999)
+            self.assertEqual(last[-1], 3)
+            self.assertEqual(len(last[0]["value"]), 5)
 
 
 class UIEventContractTests(unittest.TestCase):

@@ -108,6 +108,7 @@ class KemonomimiPromptTests(unittest.TestCase):
 
     def test_recipe_is_small_for_characters_and_respects_a_smaller_user_limit(self):
         self.make_lexicon()
+        self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": True})
         recipe = self.api._lexicon_recipe(set(), source="fox ears")
         self.assertTrue(recipe)
         self.assertLessEqual(len(recipe), 2)
@@ -117,6 +118,7 @@ class KemonomimiPromptTests(unittest.TestCase):
 
     def test_character_schedule_and_planned_recipe_are_bounded(self):
         self.make_lexicon()
+        self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": True})
         for index in range(1, 15):
             planned = self.api._recipe_schedule(index, 123, source="fox ears")
             self.assertEqual(len(planned), 2)
@@ -180,7 +182,7 @@ class KemonomimiPromptTests(unittest.TestCase):
             _resolve_preset_model=lambda preset, model: (preset, model),
             _aligned_preset=lambda preset, model: (preset, False),
             _independent_creative_directive=lambda recipe: self.api._recipe_directive_block(recipe),
-            _independent_batch_directive=lambda index, lenses, recipe: self.api._recipe_directive_block(recipe),
+            _independent_batch_directive=lambda index, lenses, recipe=None: self.api._recipe_directive_block(recipe),
             _connection_settings=lambda: options,
             _workflow_settings=lambda: options,
             _save_workflow_values=Mock(), _immutable_technical_tokens=lambda source: [],
@@ -198,6 +200,7 @@ class KemonomimiPromptTests(unittest.TestCase):
 
     def test_auto_loop_passes_source_to_the_recipe_with_and_without_caching(self):
         api, options, generated, recipe, _schedule = self.caller_api()
+        self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": True})
         for cache in (False, True):
             with self.subTest(cache=cache):
                 api._generate_auto_loop(request="fox ears", cache_result=cache, **options)
@@ -206,6 +209,7 @@ class KemonomimiPromptTests(unittest.TestCase):
 
     def test_inline_generation_passes_the_fixed_prompt_to_the_recipe(self):
         api, options, generated, recipe, _schedule = self.caller_api()
+        self.db.set_setting(self.api._DIVERSITY_SETTINGS_KEY, {"recipe_enabled": True})
         for key in ("provider", "endpoint", "model", "api_key", "temperature", "timeout", "max_tokens", "send_temperature"):
             options.pop(key)
         api._inline_generate(
@@ -215,7 +219,7 @@ class KemonomimiPromptTests(unittest.TestCase):
         self.assertIn("fox ears, white hair", recipe.call_args.kwargs["source"])
         self.assertIn("OPTIONAL LOCAL RECIPE", generated.call_args.args[-1])
 
-    def test_batch_generation_passes_source_to_schedule_and_recipe(self):
+    def test_batch_generation_keeps_random_lexicon_recipe_disabled(self):
         api, options, generated, recipe, schedule = self.caller_api()
         results = list(api._batch_generate(
             source_text="", skip_existing=False, skip_failed=False,
@@ -224,8 +228,9 @@ class KemonomimiPromptTests(unittest.TestCase):
         ))
         generated.assert_called_once()
         source = generated.call_args.args[0]
-        self.assertEqual(schedule.call_args.kwargs["source"], source)
-        self.assertEqual(recipe.call_args.kwargs["source"], source)
+        self.assertEqual(source, "已有固定主体/角色 Tag：fox ears, white hair。保留其中的身份、LoRA、权重、明确属性和安全限制；在此基础上完成本条创作要求：" + self.inspiration_api().KEMONOMIMI_TEMPLATE)
+        recipe.assert_not_called()
+        schedule.assert_not_called()
         self.assertIn("失败 0", results[-1])
         self.assertIn("新增 1", results[-1])
 

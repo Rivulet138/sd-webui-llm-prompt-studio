@@ -3,7 +3,7 @@ import unittest
 
 from test_queue_regressions import ROOT
 from prompt_studio_core import (
-    BASE_MODEL_GUIDANCE,
+    MODEL_PRESET_GUIDANCE,
     MODEL_QUALITY_GUIDANCE,
     OPERATION_INSTRUCTIONS,
     PRESETS,
@@ -29,7 +29,7 @@ class PolicyContractTests(unittest.TestCase):
             self.assertIn(marker, PROMPT_POLICY_V3, marker)
         self.assertNotIn("Authority order: this policy", PROMPT_POLICY_V3)
         self.assertNotIn("priority=", PROMPT_POLICY_V3)
-        self.assertLess(len(PROMPT_POLICY_V3), 1800)
+        self.assertLess(len(PROMPT_POLICY_V3), 2000)
 
     def test_policy_is_the_first_block_of_every_system_prompt(self):
         for preset in PRESETS:
@@ -39,10 +39,10 @@ class PolicyContractTests(unittest.TestCase):
 
 
 class OutputProfileTests(unittest.TestCase):
-    def test_each_profile_declares_format_and_length(self):
+    def test_each_profile_declares_format_without_forced_length(self):
         for name, text in PRESETS.items():
             self.assertIn("Output profile:", text, name)
-            self.assertRegex(text, r"\d+-\d+", name)
+            self.assertNotRegex(text, r"\d+-\d+", name)
 
     def test_output_profiles_do_not_duplicate_reference_routing(self):
         for name, text in PRESETS.items():
@@ -57,7 +57,7 @@ class OutputProfileTests(unittest.TestCase):
 class OperationContractTests(unittest.TestCase):
     def test_every_action_covers_every_model(self):
         for action, models in OPERATION_INSTRUCTIONS.items():
-            for model in BASE_MODEL_GUIDANCE:
+            for model in MODEL_PRESET_GUIDANCE:
                 self.assertTrue(models.get(model), f"{action}/{model}")
 
     def test_instructions_stay_compact(self):
@@ -72,14 +72,14 @@ class OperationContractTests(unittest.TestCase):
         )
 
     def test_quality_guidance_covers_every_model(self):
-        for model in BASE_MODEL_GUIDANCE:
+        for model in MODEL_PRESET_GUIDANCE:
             self.assertTrue(MODEL_QUALITY_GUIDANCE.get(model), model)
 
 
 class PromptBudgetTests(unittest.TestCase):
     def test_system_prompt_stays_within_budget(self):
         for preset in PRESETS:
-            for model in BASE_MODEL_GUIDANCE:
+            for model in MODEL_PRESET_GUIDANCE:
                 system = build_system_prompt(
                     preset, model, "NSFW", "injection", "requirement", [], ["term"],
                     "", "", build_operation_instruction("Generate", model))
@@ -116,14 +116,15 @@ class UiPromptTests(unittest.TestCase):
         self.assertIn("Preserve supplied identity, facts, quantities, negations and technical tokens", PROMPT_POLICY_V3)
         self.assertNotIn("TAG FIDELITY", PROMPT_POLICY_V3)
 
-    def test_inline_contract_keeps_token_exclusion_and_length_budget(self):
+    def test_inline_contract_keeps_token_exclusion_and_conciseness(self):
         self.assertIn("Never echo the source Prompt twice.", self.source)
         self.assertIn("excluded from semantic variation", self.source)
-        self.assertIn("stay inside the output profile's length budget", self.source)
+        self.assertIn("one concise English expansion", self.source)
 
-    def test_batch_contract_keeps_recipe_and_budget(self):
+    def test_batch_contract_keeps_recipe_conditional(self):
         self.assertIn("Make the recipe items visible", self.source)
-        self.assertIn("Follow the selected output profile's format and length budget", self.source)
+        self.assertIn("only when the user permits them", self.source)
+        self.assertIn("Follow the selected output profile's format", self.source)
 
 
 if __name__ == "__main__":

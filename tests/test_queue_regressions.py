@@ -17,7 +17,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from prompt_studio_core import StudioDB
+from prompt_studio_core import MODEL_PRESET_FORMATS, StudioDB
+from prompt_studio_core import normalize_sampling
 from prompt_studio_native_cache import extract_claim, merge_prompt, validate_slot
 
 
@@ -40,7 +41,7 @@ def ui_functions(*names, constants=(), **context):
             if any(getattr(target, "id", None) in wanted_constants for target in targets):
                 selected.append(node)
     selected.sort(key=lambda node: (node.lineno, node.col_offset))
-    namespace = dict(Any=Any, StudioDB=StudioDB, threading=threading, time=time, json=json, re=re,
+    namespace = dict(Any=Any, StudioDB=StudioDB, MODEL_PRESET_FORMATS=MODEL_PRESET_FORMATS, threading=threading, time=time, json=json, re=re,
                      hashlib=hashlib, uuid=uuid, LOGGER=logging.getLogger("queue-test"), MAX_SERVER_QUEUE_REQUESTS=5000)
     namespace.update(context)
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(ROOT / "scripts/prompt_studio_ui.py"), "exec"), namespace)
@@ -115,6 +116,56 @@ class QueueDatabaseTests(unittest.TestCase):
         self.assertTrue(snapshot["jobs_truncated"])
         self.assertIn("等待", snapshot["status"])
 
+    def test_queue_capacity_counts_all_batches_and_rolls_back_overflow(self):
+        with patch.object(StudioDB, "MAX_SERVER_QUEUE_JOBS", 3, create=True):
+            self.enqueue(2)
+            self.db.claim_server_queue_job()
+            with self.assertRaisesRegex(ValueError, "3"):
+                self.db.enqueue_server_queue("overflow", [
+                    {"id": "extra-1", "request": "one"}, {"id": "extra-2", "request": "two"},
+                ])
+            self.assertEqual(self.db.list_server_queue("overflow"), [])
+            self.assertEqual(self.db.count_server_queue("batch"), {"pending": 1, "running": 1})
+            self.db.cancel_server_queue("batch")
+            self.assertEqual(self.db.enqueue_server_queue("next", [{"request": "new"}]), 1)
+
+    def test_duplicate_jobs_report_actual_insert_count_at_capacity(self):
+        with patch.object(StudioDB, "MAX_SERVER_QUEUE_JOBS", 1, create=True):
+            job = {"id": "same", "request": "one"}
+            self.assertEqual(self.db.enqueue_server_queue("batch", [job, job]), 1)
+            self.assertEqual(self.db.enqueue_server_queue("batch", [job]), 0)
+
+    def test_expired_pending_jobs_free_capacity_before_enqueue(self):
+        self.enqueue()
+        with self.db._connection() as conn:
+            conn.execute("UPDATE server_queue_jobs SET created_at=0")
+        with patch.object(StudioDB, "MAX_SERVER_QUEUE_JOBS", 1, create=True):
+            self.assertEqual(self.db.enqueue_server_queue("fresh", [{"request": "fresh"}]), 1)
+        self.assertEqual(self.db.count_server_queue("batch"), {"expired": 1})
+
+    def test_independent_database_instances_share_atomic_queue_capacity(self):
+        other = StudioDB(self.db.path)
+        barrier = threading.Barrier(2)
+        results = []
+
+        def submit(db, batch):
+            barrier.wait(timeout=5)
+            try:
+                results.append(db.enqueue_server_queue(batch, [{"request": "a"}, {"request": "b"}]))
+            except ValueError:
+                results.append("full")
+
+        with patch.object(StudioDB, "MAX_SERVER_QUEUE_JOBS", 3, create=True):
+            threads = [threading.Thread(target=submit, args=(db, batch))
+                       for db, batch in ((self.db, "one"), (other, "two"))]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+        self.assertCountEqual(results, [2, "full"])
+        self.assertEqual(sum(len(self.db.list_server_queue(batch)) for batch in ("one", "two")), 2)
+
     def test_active_cancel_event_not_released_early(self):
         self.enqueue()
         event = threading.Event()
@@ -159,6 +210,216 @@ class InputBoundaryTests(unittest.TestCase):
         config = db.enqueue_server_queue.call_args.args[1][0]["config"]
         self.assertIs(config["direct_prompt"], False)
         self.assertIs(config["cache_result"], False)
+
+    def test_failed_enqueue_does_not_leak_cancel_event_or_start_worker(self):
+        workflow = dict(preset="Danbooru Tags", base_model="Auto", safety="SFW", system_override="", nsfw_injection="", user_instruction="",
+                        remove_bad=True, remove_terms="", shuffle=False, spaces=False, max_tags=0, structured_mode="Plain Prompt", region_count=1, save_score=0)
+        connection = dict(temperature=1, timeout=90, max_tokens=0, send_temperature=True, provider="OpenAI Compatible", endpoint="", model="")
+        db, worker = Mock(), Mock()
+        db.enqueue_server_queue.side_effect = ValueError("queue full")
+        events = {}
+        api = ui_functions("_coerce_bool", "_enqueue_server_queue", DB=db,
+            _workflow_settings=lambda: workflow, _connection_settings=lambda: connection,
+            _aligned_preset=lambda p, b: (p, False), _ensure_server_queue_worker=worker,
+            _SERVER_QUEUE_CANCEL_LOCK=threading.Lock(), _SERVER_QUEUE_CANCEL_EVENTS=events)
+        with self.assertRaisesRegex(ValueError, "queue full"):
+            api._enqueue_server_queue({"requests": ["prompt"]}, threading.Event())
+        self.assertEqual(events, {})
+        worker.assert_not_called()
+
+
+class PngBatchConnectionTests(unittest.TestCase):
+    def snapshot_api(self, transform_settings=None):
+        return ui_functions(
+            "_bounded_setting", "_coerce_bool",
+            "_png_batch_connection_snapshot",
+            constants=("DEFAULT_LLM_SETTINGS",),
+            DEFAULT_LLM_SETTINGS={
+                "provider": "OpenAI Compatible", "temperature": 1.0,
+                "timeout": 90, "max_tokens": 8096,
+            },
+            _transform_llm_settings=lambda: dict(transform_settings or {}),
+            _canonical_provider=lambda value: str(value or "").strip(),
+            normalize_sampling=normalize_sampling,
+        )
+
+    def test_snapshot_overrides_visible_fields_and_preserves_hidden_transform_options(self):
+        api = self.snapshot_api({
+            "retry_count": 4, "top_p": 0.65, "top_k": 18,
+            "thinking_enabled": True, "thinking_budget": 4096,
+            "reasoning_effort": "high",
+            "fallback_provider": "Other", "fallback_endpoint": "http://fallback",
+            "fallback_model": "fallback-model",
+        })
+        source = {
+            "retry_count": 4, "top_p": 0.65, "top_k": 18,
+            "thinking_enabled": True, "thinking_budget": 4096,
+            "reasoning_effort": "high",
+            "fallback_provider": "Other", "fallback_endpoint": "http://fallback",
+            "fallback_model": "fallback-model",
+        }
+        snapshot = api._png_batch_connection_snapshot(
+            source, "OpenAI Compatible", "http://batch", "batch-model",
+            0, 0, 0, False,
+        )
+        self.assertEqual(snapshot["provider"], "OpenAI Compatible")
+        self.assertEqual(snapshot["endpoint"], "http://batch")
+        self.assertEqual(snapshot["model"], "batch-model")
+        self.assertEqual(snapshot["temperature"], 0.0)
+        self.assertEqual(snapshot["timeout"], 5)
+        self.assertEqual(snapshot["max_tokens"], 0)
+        self.assertFalse(snapshot["send_temperature"])
+        self.assertEqual(
+            {key: snapshot[key] for key in (
+                "retry_count", "top_p", "top_k", "thinking_enabled", "thinking_budget",
+                "reasoning_effort", "fallback_provider", "fallback_endpoint", "fallback_model",
+            )},
+            {key: source[key] for key in (
+                "retry_count", "top_p", "top_k", "thinking_enabled", "thinking_budget",
+                "reasoning_effort", "fallback_provider", "fallback_endpoint", "fallback_model",
+            )},
+        )
+        source["retry_count"] = 0
+        source["top_p"] = 0.1
+        self.assertEqual(snapshot["retry_count"], 4)
+        self.assertEqual(snapshot["top_p"], 0.65)
+
+    def test_snapshot_reads_saved_transform_profile_when_explicit_settings_are_absent(self):
+        api = self.snapshot_api({"retry_count": 3, "top_p": 0.8, "top_k": 25})
+        snapshot = api._png_batch_connection_snapshot(
+            None, "OpenAI Compatible", "http://saved", "saved-model",
+            0.2, 90, 0, True,
+        )
+        self.assertEqual(snapshot["retry_count"], 3)
+        self.assertEqual(snapshot["top_p"], 0.8)
+        self.assertEqual(snapshot["top_k"], 25)
+        self.assertEqual(snapshot["max_tokens"], 0)
+
+    def test_inline_json_batch_forwards_complete_transform_connection(self):
+        calls = []
+
+        def fake_png_batch(*args, **kwargs):
+            calls.append((args, kwargs))
+            yield ("payload", [], 1, "", "ok", None)
+
+        workflow = {
+            "preset": "Danbooru Tags", "base_model": "Auto / checkpoint default",
+            "system_override": "", "safety": "SFW", "nsfw_injection": "",
+            "user_instruction": "", "remove_bad": True, "remove_terms": "",
+            "shuffle": False, "spaces": False, "max_tags": 0,
+            "structured_mode": "Plain Prompt", "region_count": 1,
+        }
+        connection = {
+            "provider": "OpenAI Compatible", "endpoint": "http://transform",
+            "model": "transform-model", "temperature": 0.2, "timeout": 90,
+            "max_tokens": 0, "send_temperature": True, "retry_count": 4,
+            "top_p": 0.65, "top_k": 18, "thinking_enabled": True,
+            "thinking_budget": 4096, "reasoning_effort": "high",
+        }
+        api = ui_functions(
+            "_inline_json_batch_run", _workflow_settings=lambda: workflow,
+            _transform_llm_settings=lambda: connection,
+            _png_batch_run=fake_png_batch,
+            _canonical_action=lambda value: value,
+            _canonical_variation_mode=lambda value: value,
+            _canonical_preset=lambda value: value,
+            _canonical_base_model=lambda value: value,
+            PRESETS={"Danbooru Tags"},
+            MODEL_PRESET_GUIDANCE={"Auto / checkpoint default": ""},
+            _aligned_preset=lambda preset, base_model: (preset, False),
+        )
+        list(api._inline_json_batch_run("{}", "Convert", "Danbooru Tags", "Auto / checkpoint default"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["connection_settings"], connection)
+        self.assertEqual(calls[0][0][23], "independent")
+
+    def test_png_batch_passes_frozen_snapshot_to_transform(self):
+        calls = []
+
+        def fake_transform(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "processed", "ok"
+
+        class FakeGr:
+            @staticmethod
+            def update(**kwargs):
+                return kwargs
+
+        payload = {"records": [{"record_id": "one", "image": {"filename": "one.png"},
+                                "prompt": {"positive": "1girl, reading"}}]}
+        connection = {
+            "retry_count": 4, "top_p": 0.65, "top_k": 18,
+            "thinking_enabled": True, "thinking_budget": 4096,
+            "reasoning_effort": "high",
+        }
+        api = ui_functions(
+            "_bounded_setting", "_coerce_bool", "_png_batch_connection_snapshot", "_png_batch_run",
+            constants=("DEFAULT_LLM_SETTINGS", "_PNG_BATCH_CANCEL_EVENTS", "_PNG_BATCH_CANCEL_LOCK"),
+            DEFAULT_LLM_SETTINGS={"provider": "OpenAI Compatible", "temperature": 1.0,
+                                  "timeout": 90, "max_tokens": 8096},
+            _canonical_provider=lambda value: str(value or "").strip(),
+            _canonical_action=lambda value: value,
+            _canonical_preset=lambda value: value,
+            _canonical_base_model=lambda value: value,
+            _canonical_variation_mode=lambda value: value,
+            _normalize_png_batch_payload=lambda value: payload,
+            _png_batch_cancel_event=lambda value: ("event", threading.Event()),
+            _png_batch_json=lambda value: value,
+            _png_batch_current=lambda value, selection: (selection, "current"),
+            _png_batch_selection_choices=lambda value: ([], []),
+            _png_batch_table=lambda value: [],
+            _processed_kind_for_preset=lambda value: "text",
+            _independent_batch_directive=lambda position: "",
+            _expand_or_polish=fake_transform,
+            _transform_llm_settings=lambda: {},
+            normalize_sampling=normalize_sampling,
+            PNG_BATCH_SCHEMA="prompt_batch.v1",
+            gr=FakeGr,
+        )
+        updates = list(api._png_batch_run(
+            payload, "Convert", "Danbooru Tags", "", "Auto / checkpoint default", "SFW", "", "",
+            "OpenAI Compatible", "http://batch", "batch-model", "", 0, 90, 0, False,
+            variation_mode="faithful", connection_settings=connection,
+        ))
+        self.assertTrue(updates)
+        self.assertEqual(len(calls), 1)
+        forwarded = calls[0][1]["connection_settings"]
+        self.assertIsNot(forwarded, connection)
+        self.assertEqual(forwarded["max_tokens"], 0)
+        self.assertEqual(forwarded["retry_count"], 4)
+        self.assertEqual(forwarded["top_p"], 0.65)
+        self.assertEqual(forwarded["top_k"], 18)
+        self.assertTrue(forwarded["thinking_enabled"])
+        connection["retry_count"] = 0
+        self.assertEqual(forwarded["retry_count"], 4)
+
+
+class ServerQueueSettingsTests(unittest.TestCase):
+    def test_malformed_numeric_config_is_bounded_without_losing_zero_tokens(self):
+        generate = Mock(return_value=("generated", "system", "ok"))
+        api = ui_functions(
+            "_bounded_setting", "_coerce_bool", "_server_queue_prepare_prompt",
+            _generate=generate,
+            normalize_sampling=normalize_sampling,
+            _independent_batch_directive=lambda position, lenses: "batch",
+        )
+        config = {
+            "temperature": "not-a-number", "timeout": "invalid", "max_tokens": 0,
+            "max_tags": "bad", "region_count": "bad", "save_score": "NaN",
+            "retry_count": "bad", "thinking_budget": "bad",
+            "top_p": "invalid", "top_k": "invalid",
+        }
+        job = {"request": "make an image", "batch_id": "batch", "position": 1}
+        result = api._server_queue_prepare_prompt(job, config, [], set(), threading.Event())
+        self.assertEqual(result, ("generated", "ok", False))
+        call = generate.call_args
+        self.assertEqual(call.args[12:15], (1.0, 90, 0))
+        self.assertEqual(call.args[20:24], (0, "Plain Prompt", 1, 0.0))
+        snapshot = call.kwargs["connection_settings"]
+        self.assertEqual(snapshot["retry_count"], 2)
+        self.assertIsNone(snapshot["top_p"])
+        self.assertIsNone(snapshot["top_k"])
+        self.assertEqual(snapshot["thinking_budget"], 0)
 
     def handoff_api(self):
         db = Mock()
@@ -646,6 +907,55 @@ class NativeCacheContextTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.api.apply_native_cache_context(p)
         self.assertNotEqual(self.db.get_native_cache_job(prepared["token"])["state"], "active")
+
+    def test_compatible_script_bridge_injects_once_with_actual_selection(self):
+        title = "Krea2 + Anima 双阶段生成"
+        prepared = self.prepare(selected_script=title, total_images=2)
+        p = self.StableDiffusionProcessingTxt2Img()
+        p.prompt = "base" + self.marker(prepared["token"])
+        p.batch_size, p.n_iter = 2, 1
+        p.script_args = (2,)
+        p.scripts = SimpleNamespace(selectable_scripts=[
+            SimpleNamespace(title=lambda: "Other"),
+            SimpleNamespace(title=lambda: title, supports_native_cache_injection=True),
+        ])
+        shared = SimpleNamespace(state=SimpleNamespace(interrupt=Mock()))
+        bridge = self.native_script(shared)
+        modules = ModuleType("modules")
+        modules.shared = shared
+        with patch.dict(sys.modules, {"modules": modules}):
+            for _ in range(2):
+                self.assertEqual(bridge.apply_native_cache_for_script(p), prepared["token"])
+        self.assertEqual(p.prompt, "base")
+        self.assertEqual(p.all_prompts, ["base, cached one", "base, cached two"])
+        self.assertEqual(self.db.get_native_cache_cursor("txt2img", "cache"), 2)
+        shared.state.interrupt.assert_not_called()
+
+    def test_script_title_capability_index_and_slot_are_checked_at_injection(self):
+        title = "Krea2 + Anima 双阶段生成"
+        for slot, selected_title, capability, index in (
+            ("txt2img", title, False, 1),
+            ("txt2img", "Other", True, 1),
+            ("txt2img", title, True, 2),
+            ("txt2img", title, True, "1"),
+            ("img2img", title, True, 1),
+        ):
+            with self.subTest(slot=slot, title=selected_title, capability=capability, index=index):
+                prepared = self.prepare(slot=slot)
+                kind = self.StableDiffusionProcessingTxt2Img if slot == "txt2img" else self.StableDiffusionProcessingImg2Img
+                p = kind()
+                p.prompt = "base" + self.marker(prepared["token"])
+                p.script_args = (index,)
+                p.scripts = SimpleNamespace(selectable_scripts=[
+                    SimpleNamespace(title=lambda: selected_title, supports_native_cache_injection=capability)])
+                shared = SimpleNamespace(state=SimpleNamespace(interrupt=Mock()))
+                with self.assertRaises(ValueError):
+                    self.native_script(shared).apply_native_cache_for_script(p)
+                shared.state.interrupt.assert_called_once_with()
+                self.assertEqual(self.db.get_native_cache_job(prepared["token"])["state"], "failed")
+                self.assertIsNone(self.db.get_native_cache_cursor(slot, "cache"))
+        with self.assertRaises(ValueError):
+            self.prepare(slot="img2img", selected_script=title)
 
 
 class RenderCancellationTests(unittest.TestCase):

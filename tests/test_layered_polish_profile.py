@@ -1,101 +1,110 @@
-"""The Krea/Anima layered format is a model-specific Polish operation preset."""
+"""Polish uses the selected model format and a faithful editing contract."""
 import json
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import prompt_studio_core as core
 from prompt_studio_core import (
-    PRESETS, build_operation_instruction, build_system_prompt,
+    MODEL_PRESET_FORMATS, MODEL_PRESET_GUIDANCE, PRESETS, build_operation_instruction, build_system_prompt,
 )
 
 
-class LayeredPolishProfileTests(unittest.TestCase):
+MODEL_PRESETS = tuple(MODEL_PRESET_FORMATS.items())
+
+
+class FaithfulPolishProfileTests(unittest.TestCase):
     def system(self, model="Krea 2", **changes):
-        values = dict(preset="Krea 2 Natural" if model == "Krea 2" else "Anima Tags",
-            base_model=model, safety="SFW", nsfw_injection="", user_instruction="", examples=[],
-            operation="Polish", operation_instruction=build_operation_instruction("Polish", model))
+        values = dict(
+            preset=dict(MODEL_PRESETS)[model], base_model=model, safety="SFW", nsfw_injection="",
+            user_instruction="", examples=[], operation="Polish",
+            operation_instruction=build_operation_instruction("Polish", model),
+        )
         values.update(changes)
         return build_system_prompt(**values)
 
-    def test_polish_restores_all_three_parts_and_detailed_subsections(self):
-        for model in ("Krea 2", "Anima"):
+    def test_obsolete_layered_profile_symbols_are_removed(self):
+        for name in ("KREA_ANIMA_POLISH_PROFILE", "LAYERED_POLISH_MODEL_GUIDANCE", "uses_layered_polish"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(core, name))
+
+    def test_every_model_and_operation_uses_its_normal_output_profile(self):
+        for model, preset in MODEL_PRESETS:
+            for operation in ("", "Generate", "Convert", "Expand", "Polish"):
+                with self.subTest(model=model, operation=operation):
+                    system = self.system(
+                        model, operation=operation,
+                        operation_instruction=build_operation_instruction(operation or "Generate", model),
+                    )
+                    guidance = system.split("<model_preset>\n", 1)[1].split("</model_preset>", 1)[0]
+                    self.assertEqual(guidance.strip(), PRESETS[preset])
+                    self.assertEqual(guidance.strip(), MODEL_PRESET_GUIDANCE[model])
+                    for marker in ("PART ONE:", "PART TWO:", "PART THREE:", "MASTER DESCRIPTION"):
+                        self.assertNotIn(marker, system)
+                    self.assertNotIn("three-part", system.lower())
+                    self.assertEqual(system.count("Output profile:"), 1)
+
+    def test_convert_and_polish_explicitly_constrain_content_and_sparse_sources(self):
+        for model, _preset in MODEL_PRESETS:
+            for operation in ("Convert", "Polish"):
+                with self.subTest(model=model, operation=operation):
+                    system = self.system(
+                        model, operation=operation,
+                        operation_instruction=build_operation_instruction(operation, model),
+                    ).lower()
+                    faithful = system.split("<faithful_edit_contract>\n", 1)[1].split(
+                        "\n</faithful_edit_contract>", 1)[0]
+                    for fact in ("background", "props", "weather", "materials", "extra subjects", "new setting"):
+                        self.assertIn(fact, faithful)
+                    self.assertIn("sparse sources may produce shorter outputs", faithful)
+                    self.assertIn("never add details to meet a minimum length", faithful)
+                    self.assertNotIn("<faithful_edit_contract>", faithful)
+
+    def test_saved_normal_profile_keeps_only_additive_notes_and_user_requirements(self):
+        for model, preset in MODEL_PRESETS:
             with self.subTest(model=model):
-                system = self.system(model)
-                for marker in ("PART ONE: TAG ANCHORS", "BREAK", "PART TWO: EXTREME LAYERED DETAIL",
-                    "Composition & Pose:", "Hair & Head Accessories:", "Face & Expression:",
-                    "Clothing & Details:", "Props & Floating Elements:", "Lighting & Color:",
-                    "Background:", "PART THREE: REFINED + MASTER", "SUBJECT", "MASTER DESCRIPTION"):
-                    self.assertIn(marker, system)
+                system = self.system(
+                    model, system_override=PRESETS[preset] + "\n\nKeep the kettle visibly dented.",
+                    user_instruction="Keep the supplied blue book and plain background.",
+                )
+                self.assertIn(PRESETS[preset], system)
                 self.assertEqual(system.count("Output profile:"), 1)
-
-    def test_polish_does_not_receive_the_normal_format_or_budget(self):
-        for model in ("Krea 2", "Anima"):
-            with self.subTest(model=model):
-                system = self.system(model)
-                self.assertNotIn("70-160 words", system)
-                self.assertNotIn("Return one comma-separated Danbooru-first prompt, 6-50 tags", system)
-                self.assertNotIn("One compact natural-language description in profile order", system)
-                self.assertIn(model, system.split("<model_profile>\n", 1)[1].split("</model_profile>", 1)[0])
-
-    def test_saved_normal_profile_cannot_override_polish_structure(self):
-        for model in ("Krea 2", "Anima"):
-            with self.subTest(model=model):
-                system = self.system(model, system_override=PRESETS["Krea 2 Natural"] +
-                    "\n\nKeep the kettle visibly dented.", user_instruction="Use a blue cover on the book.")
-                self.assertIn("PART TWO: EXTREME LAYERED DETAIL", system)
-                self.assertNotIn("70-160 words", system)
                 self.assertIn("Keep the kettle visibly dented.", system)
-                self.assertIn("Use a blue cover on the book.", system)
+                self.assertIn("Keep the supplied blue book and plain background.", system)
                 self.assertNotIn('priority="low"', system)
 
     def test_shared_safety_and_nsfw_injection_are_preserved(self):
-        for model in ("Krea 2", "Anima"):
+        for model, _preset in MODEL_PRESETS:
             for mode in ("SFW", "NSFW"):
                 with self.subTest(model=model, mode=mode):
                     system = self.system(model, safety=mode, nsfw_injection="LOCAL_MODE_MARKER")
                     self.assertIn("Safety mode: " + mode, system)
                     self.assertEqual("LOCAL_MODE_MARKER" in system, mode == "NSFW")
 
-    def test_retries_keep_the_operation_profile_and_independent_correction(self):
-        for model in ("Krea 2", "Anima"):
-            for reason in ("QUALITY", "DIVERSITY", "RESPONSE"):
+    def test_response_and_quality_retries_keep_normal_profiles_and_correction(self):
+        for model, preset in MODEL_PRESETS:
+            for reason in ("QUALITY", "RESPONSE"):
                 with self.subTest(model=model, reason=reason):
-                    system = self.system(model, batch_directive="BATCH_CONTEXT " + "x" * 4500,
-                                         retry_instruction=reason + " RETRY: preserve all three parts.")
-                    self.assertIn("BATCH_CONTEXT", system)
-                    self.assertIn(reason + " RETRY", system)
-                    self.assertIn("PART THREE: REFINED + MASTER", system)
-                    self.assertNotIn("70-160 words", system)
-
-    def test_other_operations_and_models_keep_their_normal_output_profile(self):
-        for model, preset in (("Krea 2", "Krea 2 Natural"), ("Anima", "Anima Tags"),
-                              ("Flux", "Natural Language")):
-            for operation in ("", "Generate", "Convert", "Expand", "Polish"):
-                if operation == "Polish" and model in {"Krea 2", "Anima"}:
-                    continue
-                with self.subTest(model=model, operation=operation):
-                    system = self.system(model, preset=preset, operation=operation,
-                        operation_instruction=build_operation_instruction(operation or "Generate", model))
+                    correction = reason + " RETRY: preserve the source and return one valid prompt."
+                    system = self.system(model, retry_instruction=correction)
                     self.assertIn(PRESETS[preset], system)
-                    self.assertNotIn("PART ONE: TAG ANCHORS", system)
+                    self.assertIn(MODEL_PRESET_GUIDANCE[model], system)
+                    payload = system.split('<retry_instruction encoding="json">\n', 1)[1].split(
+                        "\n</retry_instruction>", 1)[0]
+                    self.assertEqual(json.loads(payload)["instruction"], correction)
+                    self.assertNotIn("PART THREE:", system)
 
-    def test_polish_does_not_force_english_or_discard_supplied_weights_and_style(self):
-        system = self.system(user_instruction="Write in Chinese and keep the supplied watercolor style.")
-        self.assertNotIn("Use long but clear English sentences", system)
-        self.assertNotIn("Never name a style, medium, studio, artist or quality level", system)
-        self.assertNotIn("Do not use weight syntax", system)
-        self.assertIn("Preserve supplied weights and technical tokens", system)
-
-    def test_lowercase_tags_rule_exempts_supplied_case_sensitive_anchors(self):
+    def test_supplied_case_sensitive_anchors_and_style_requirements_are_not_rewritten(self):
         anchors = "<lora:MyStyleXL:0.8>, TriggerABC, (RedHair:1.35)"
-        for model in ("Krea 2", "Anima"):
+        requirement = "Keep the supplied watercolor style and preserve exactly: " + anchors
+        for model, _preset in MODEL_PRESETS:
             with self.subTest(model=model):
-                system = self.system(model, user_instruction="Preserve exactly: " + anchors)
-                self.assertNotIn("Tags must be lowercase.", system)
-                self.assertIn("with their original spelling and case", system)
-                payload = system.split('<user_requirement encoding="json">\n', 1)[1].split('\n</user_requirement>', 1)[0]
-                self.assertEqual(json.loads(payload)["requirement"], "Preserve exactly: " + anchors)
+                system = self.system(model, user_instruction=requirement)
+                payload = system.split('<user_requirement encoding="json">\n', 1)[1].split(
+                    "\n</user_requirement>", 1)[0]
+                self.assertEqual(json.loads(payload)["requirement"], requirement)
+                self.assertIn("technical tokens", system.lower())
 
 
 if __name__ == "__main__":

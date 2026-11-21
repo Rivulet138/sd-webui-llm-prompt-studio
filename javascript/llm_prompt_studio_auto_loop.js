@@ -1,6 +1,10 @@
 (function () {
     "use strict";
 
+    // Forge/Gradio can execute extension scripts again after the initial load.
+    // Reuse the instance that owns the button listeners and active cache runs.
+    if (window.llmPromptStudioAutoLoop) return;
+
     const FAILURE_PATTERN = /fail|error|timeout|refused|interrupted|失败|错误|超时|拒绝|中断/i;
     const SUCCESS_PATTERN = /completed|finished|done|success|生成完成|已完成/i;
     const CONTENT_BLOCK_PATTERN = /(SFW|NSFW|安全|成人|内容).*(拦截|拒绝|阻止|blocked|safety)|blocked.*(SFW|safety)/i;
@@ -92,8 +96,7 @@
         "NoobAI 标签": "NoobAI Tags",
         "Anima 标签": "Anima Tags",
         "Krea 2 自然语言": "Krea 2 Natural",
-        "自动 / 使用底模默认规则": "Auto / checkpoint default",
-        "LLM 自动生成": "llm",
+                "LLM 自动生成": "llm",
         "缓存顺序读取": "cache",
         "原始缓存顺序读取": "cache",
         "原始缓存库": "cache",
@@ -741,7 +744,7 @@
         const sharedConfig = {
             ...config,
             preset: sharedWorkflowValue("preset", config.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags")),
-            baseModel: sharedWorkflowValue("base_model", config.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default")),
+            baseModel: sharedWorkflowValue("base_model", config.baseModel || componentValue(inlineId(slot, "base_model"), "Pony / Illustrious")),
             safety: sharedWorkflowValue("safety", config.safety || componentValue(inlineId(slot, "safety"), "SFW")),
         };
         const data = await requestPromptApi(run, "inline-generate", {
@@ -762,7 +765,7 @@
         const data = await requestPromptApi(run, "auto-loop-generate", {
             request: String(config.request || ""),
             preset: normalizeChoiceValue(config.preset, "Danbooru Tags"),
-            base_model: normalizeChoiceValue(config.baseModel, "Auto / checkpoint default"),
+            base_model: normalizeChoiceValue(config.baseModel, "Pony / Illustrious"),
             safety: normalizeChoiceValue(config.safety, "SFW"),
             cache_result: Boolean(config.cacheResult),
         });
@@ -807,10 +810,16 @@
             // Generate calls; otherwise the next Generate forever round can
             // observe the previous task ID and be rejected as task ownership
             // changing when that ID is replaced.
-            const launchBudget = createTimeoutBudget(10000);
+            // Gradio collects all component values (including file uploads)
+            // before calling submit. Large Forge forms can exceed ten seconds
+            // here even though their Generate event is still being processed.
+            const launchTimeoutMs = run.native ? 120000 : 10000;
+            const launchBudget = createTimeoutBudget(launchTimeoutMs);
             await wait(0);
             taskId = currentForgeTaskId(tab);
             while (run.native ? !run.nativeSubmitCaptured : (!taskId || taskId === previousTaskId)) {
+                assertActive(run);
+                if (run.nativeSubmitError) throw run.nativeSubmitError;
                 const launchEvidence = !run.native && ((!wasGenerateDisabled && Boolean(generate.disabled))
                     || String(find(`${tab}_status`)?.textContent || "") !== beforeStatus
                     || currentForgeLog(tab) !== beforeLog);
@@ -822,10 +831,15 @@
                     taskId = "";
                     break;
                 }
-                if (launchBudget.expired()) throw new Error(`${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
-                await wait(25);
+                if (launchBudget.expired()) {
+                    throw new Error(run.native
+                        ? `${tab} Forge 提交等待超时（${launchTimeoutMs / 1000} 秒），缓存注入未执行；请检查 Forge 队列或输入处理错误`
+                        : `${tab} Forge 未启动生图任务，请检查 Forge 队列或页面状态`);
+                }
+                await wait(run.native ? 250 : 25);
                 taskId = currentForgeTaskId(tab);
             }
+            if (run.nativeSubmitError) throw run.nativeSubmitError;
             if (run.native) taskId = run.nativeSubmittedTaskId;
             run.forgeStarted = true;
             run.forgeTaskId = taskId;
@@ -963,7 +977,7 @@
             source: normalizeChoiceValue(overrides.source, "llm"),
             cacheCursor: overrides.cacheCursor == null || overrides.cacheCursor === "" ? null : normalizeCacheCursor(overrides.cacheCursor, 0),
             preset: normalizeChoiceValue(sharedWorkflowValue("preset", overrides.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags"))),
-            baseModel: normalizeChoiceValue(sharedWorkflowValue("base_model", overrides.baseModel || componentValue(inlineId(slot, "base_model"), "Auto / checkpoint default"))),
+            baseModel: normalizeChoiceValue(sharedWorkflowValue("base_model", overrides.baseModel || componentValue(inlineId(slot, "base_model"), "Pony / Illustrious"))),
             safety: normalizeChoiceValue(sharedWorkflowValue("safety", overrides.safety || componentValue(inlineId(slot, "safety"), "SFW"))),
             template: normalizeChoiceValue(overrides.template || componentValue(inlineId(slot, "template_choice"), "general")),
         };
@@ -1181,8 +1195,9 @@
 
     function validateNativeForgeScript(slot) {
         const script = selectedForgeScript(slot);
-        if (script.toLowerCase() !== "none") {
-            throw new Error('缓存注入不支持 Forge Script 多任务扩展：' + script + '；请将 Script 设为 None 后再生成');
+        if (script.toLowerCase() !== "none"
+            && !(slot === "txt2img" && ["Krea2 构图 → Anima 生成", "Krea2 + Anima 双阶段生成"].includes(script))) {
+            throw new Error('缓存注入不支持此 Forge Script：' + script + '；请选择 None 或 txt2img 的 Krea2 + Anima 双阶段生成');
         }
         return script;
     }
@@ -1272,6 +1287,7 @@
         run.nativeClaimSuffix = claimSuffix;
         run.nativeClaimPrompt = basePrompt + claimSuffix;
         run.nativeSubmitCaptured = false;
+        run.nativeSubmitError = null;
         run.nativeSubmittedTaskId = "";
         run.nativeImageCount = count;
         run.pendingCacheCursor = nextCursor;
@@ -1360,6 +1376,14 @@
     }
 
     async function handleNativeGenerate(slot, generate) {
+        const activeRun = linkedRuns[slot];
+        if (activeRun?.busy && !activeRun.cancelled) {
+            if (!activeRun.pendingNativeClick) {
+                activeRun.pendingNativeClick = true;
+                renderInline(slot, "warning", "当前 Forge 生图完成后继续读取缓存", "已记住下一次原生 Generate");
+            }
+            return;
+        }
         let config;
         try {
             config = nativeCacheConfig(slot);
@@ -1370,11 +1394,6 @@
         }
         if (!config) return;
         const run = startLinkedRun(config);
-        if (run.busy) {
-            run.pendingNativeClick = true;
-            renderInline(slot, "warning", "当前 Forge 生图完成后继续读取缓存", "已记住下一次原生 Generate");
-            return;
-        }
         if (isForgeBusy(slot, run)) {
             run.pendingNativeClick = true;
             scheduleNativeRetry(slot, generate, run);
@@ -1397,9 +1416,10 @@
             assertActive(run);
             run.activeCacheCursor = run.pendingCacheCursor;
             run.activeCacheSource = run.pendingCacheSource;
-            injected = true;
             validateNativeForgeScript(slot);
+            renderInline(slot, "warning", "缓存已准备，等待 Forge 提交", "Forge 正在收集输入，提交后才推进插件游标");
             await runForgeGeneration(slot, run, generate, () => {
+                injected = true;
                 commitInlineCacheCursor(run);
                 restoreNativeCacheClaim(run);
                 renderInline(slot, "success", "缓存 Prompt 已注入", "插件游标已推进，Forge 正在处理");
@@ -1463,24 +1483,31 @@
                     }
                     return original.apply(this, args);
                 }
-                assertActive(run);
-                if (run.nativeSubmitCaptured) throw new Error("缓存生图请求不可重复提交");
-                const index = slot === "txt2img" ? 1 : 2;
-                if (!run.nativeClaimSuffix || typeof args[index] !== "string"
-                    || stripStaleNativeClaim(args[index]) !== stripStaleNativeClaim(run.nativeClaimPrompt)
-                    || run.promptEdited) {
-                    throw new Error("正面 Prompt 在准备缓存时发生变化，请重新生成");
+                try {
+                    assertActive(run);
+                    if (run.nativeSubmitCaptured) throw new Error("缓存生图请求不可重复提交");
+                    const index = slot === "txt2img" ? 1 : 2;
+                    if (!run.nativeClaimSuffix || typeof args[index] !== "string"
+                        || stripStaleNativeClaim(args[index]) !== stripStaleNativeClaim(run.nativeClaimPrompt)
+                        || run.promptEdited) {
+                        throw new Error("正面 Prompt 在准备缓存时发生变化，请重新生成");
+                    }
+                    const result = original.apply(this, args);
+                    if (!Array.isArray(result) || typeof result[index] !== "string") {
+                        throw new Error("Forge submit 返回格式不兼容，缓存注入未提交");
+                    }
+                    // Reattach after other wrappers have produced their final
+                    // arguments, even if an inner bridge already captured them.
+                    result[index] = stripStaleNativeClaim(result[index]) + run.nativeClaimSuffix;
+                    run.nativeSubmitCaptured = true;
+                    run.nativeSubmittedTaskId = String(result[0] || "");
+                    return result;
+                } catch (error) {
+                    // Gradio catches frontend exceptions before our async
+                    // launch wait can see them. Preserve the original cause.
+                    run.nativeSubmitError = error;
+                    throw error;
                 }
-                const result = original.apply(this, args);
-                if (!Array.isArray(result) || typeof result[index] !== "string") {
-                    throw new Error("Forge submit 返回格式不兼容，缓存注入未提交");
-                }
-                // Reattach after other wrappers have produced their final
-                // arguments, even if an inner bridge already captured them.
-                result[index] = stripStaleNativeClaim(result[index]) + run.nativeClaimSuffix;
-                run.nativeSubmitCaptured = true;
-                run.nativeSubmittedTaskId = String(result[0] || "");
-                return result;
             };
             nativeSubmitBridges.add(bridge);
             window[name] = bridge;

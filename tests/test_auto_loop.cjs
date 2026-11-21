@@ -30,6 +30,7 @@ function harness(options = {}) {
             removeItem(key) { storage.delete(key); },
         },
         addEventListener() {},
+        performance: options.manualTimers ? { now: () => clock } : undefined,
         submit: options.submit || ((...args) => args),
         submit_img2img: options.submitImg2img || ((...args) => args),
         setTimeout: nativeTimer,
@@ -84,7 +85,7 @@ function harness(options = {}) {
         clock = target;
         await flush();
     };
-    return { window, document, nodes, queries, afterUiUpdateCallbacks, storage, timers, scheduledTimers, advanceTime, workerMessages, originals, test: window.__probe };
+    return { reload: () => vm.runInContext(instrumented, context), window, document, nodes, queries, afterUiUpdateCallbacks, storage, timers, scheduledTimers, advanceTime, workerMessages, originals, test: window.__probe };
 }
 
 class Control {
@@ -389,7 +390,7 @@ test("native launch waits for serialized submission despite earlier UI activity"
     await h.advanceTime(50);
     assert.equal(captured, undefined);
     assert.equal(afterClicks, 0, "control changes do not prove that the claim was submitted");
-    await h.advanceTime(75);
+    await h.advanceTime(250);
     assert.equal(captured[1], "base prompt" + run.nativeClaimSuffix);
     assert.equal(afterClicks, 1);
     h.storage.delete("txt2img_task_id");
@@ -625,12 +626,68 @@ test("native browser failure never claims backend work was uncommitted", async (
     cacheForm(h);
     h.test.installNativeCacheState();
     await h.test.restoreNativeCacheState("txt2img");
-    h.test.setForgeRunner(async () => { throw new Error("browser timeout"); });
+    h.test.setForgeRunner(async (slot, run, generate, afterClick) => { afterClick(); throw new Error("browser timeout"); });
     await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
     const status = h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML;
     assert.match(status, /browser timeout/);
     assert.doesNotMatch(status, /未提交|可重试/);
     assert.match(status, /Forge|未完成/);
+});
+
+test("dual-model native rounds prepare once per batch and retain the fixed base prompt", async () => {
+    const prepares = [];
+    let forgeRuns = 0;
+    const h = harness({ fetch: async (url, options) => {
+        if (!url.includes("/prepare")) return response(snapshot());
+        const body = JSON.parse(options.body);
+        prepares.push(body);
+        return response({ cache_state: snapshot(), token: String(prepares.length).repeat(32),
+            count: body.total_images, after_id: prepares.length === 1 ? 41 : 47, next_cursor: prepares.length === 1 ? 47 : 6 });
+    } });
+    const form = cacheForm(h);
+    h.test.installNativeCacheState();
+    await h.test.restoreNativeCacheState("txt2img");
+    form.script.value = "Krea2 + Anima 双阶段生成";
+    h.nodes.set("txt2img_batch_size", new Control("DIV").append(new Control("INPUT", "2")));
+    h.nodes.set("txt2img_batch_count", new Control("DIV").append(new Control("INPUT", "3")));
+    h.test.setForgeRunner(async (slot, run, generate, afterClick) => {
+        forgeRuns++;
+        assert.equal(slot, "txt2img");
+        assert.ok(run.nativeClaimSuffix);
+        afterClick();
+    });
+    for (let round = 0; round < 2; round++) {
+        await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
+        assert.equal(prepares.length, round + 1);
+        assert.equal(h.nodes.get("txt2img_prompt").children[0].value, "base prompt");
+    }
+    assert.equal(forgeRuns, 2);
+    for (const body of prepares) {
+        assert.equal(body.selected_script, "Krea2 + Anima 双阶段生成");
+        assert.equal(body.total_images, 6);
+        assert.equal(body.allow_wrap, true);
+        assert.equal(body.after_id, null);
+        assert.equal(body.base_prompt, "base prompt");
+    }
+    assert.equal(form.cache_cursor.value, "6");
+});
+
+test("dual-model script is not accepted for native img2img cache injection", async () => {
+    let prepares = 0;
+    let forgeRuns = 0;
+    const h = harness({ fetch: async url => {
+        if (url.includes("/prepare")) prepares++;
+        return response(snapshot());
+    } });
+    const form = cacheForm(h, "img2img");
+    h.test.installNativeCacheState();
+    await h.test.restoreNativeCacheState("img2img");
+    form.script.value = "Krea2 + Anima 双阶段生成";
+    h.test.setForgeRunner(async () => { forgeRuns++; });
+    await h.test.handleNativeGenerate("img2img", h.nodes.get("img2img_generate"));
+    assert.equal(prepares, 0);
+    assert.equal(forgeRuns, 0);
+    assert.match(h.nodes.get("llm_prompt_studio_img2img_inline_loop_status").innerHTML, /Script|脚本/);
 });
 
 test("selected Forge script rejects before prepare or native click", async () => {
@@ -663,7 +720,7 @@ test("state read and save errors are visible and never trigger generation", asyn
 
 test("trusted Gradio dropdown selection persists, including during async restoration", async () => {
     const saves = [];
-    const h = harness({ fetch: async (url, options) => {
+    const h = harness({ manualTimers: true, fetch: async (url, options) => {
         if (options.method === "POST") saves.push(JSON.parse(options.body));
         return response(snapshot());
     } });
@@ -674,13 +731,14 @@ test("trusted Gradio dropdown selection persists, including during async restora
     const option = host.children.find(item => item.textContent === "替换当前 Prompt");
     assert.ok(option, "restoration opened real dropdown options");
     option.dispatchEvent({ type: "mousedown", bubbles: true, isTrusted: true });
+    await h.advanceTime(0);
     await h.test.restoreNativeCacheState("txt2img");
-    await new Promise(resolve => setTimeout(resolve, 15));
+    await h.advanceTime(300);
     assert.equal(form.selectedMode.textContent, "替换当前 Prompt");
     assert.equal(saves.at(-1).config.write_mode, "replace");
     const count = saves.length;
     for (let i = 0; i < 5; i++) h.test.installNativeCacheState();
-    await new Promise(resolve => setTimeout(resolve, 15));
+    await h.advanceTime(300);
     assert.equal(saves.length, count);
 });
 
@@ -1507,4 +1565,168 @@ test("a field mounted during dropdown restoration is restored after the in-fligh
     update();
     await flush();
     assert.deepEqual(h.queries, ["#llm_prompt_studio_img2img_inline_cache_enabled"], "only the unmounted panel sentinel is queried");
+});
+
+
+test("loading the script twice preserves a single interceptor and submit bridge", async () => {
+    const h = harness({ fetch: async () => response(snapshot()) });
+    cacheForm(h);
+    h.nodes.set("txt2img_interrupt", new Control("BUTTON"));
+    h.afterUiUpdateCallbacks[0]();
+    await flush();
+    const api = h.window.llmPromptStudioAutoLoop;
+    const submit = h.window.submit;
+    const generate = h.nodes.get("txt2img_generate");
+    const prompt = h.nodes.get("txt2img_prompt").children[0];
+    const run = h.test.startLinkedRun(h.test.nativeCacheConfig("txt2img"));
+    run.nativeClaimSuffix = "claim-fixture";
+    run.nativeClaimPrompt = "base prompt";
+    run.forgeLaunching = true;
+    h.reload();
+    assert.equal(h.window.llmPromptStudioAutoLoop, api, "reuse the active plugin instance");
+    assert.equal(h.window.submit, submit, "never nest bridges owned by independent instances");
+    assert.equal(h.afterUiUpdateCallbacks.length, 1);
+    assert.equal(generate.listeners.click.length, 1);
+    assert.equal(prompt.listeners.input.length, 1);
+    const args = h.window.submit("task(single-instance)", "base prompt", "negative");
+    assert.equal(args[1], "base promptclaim-fixture");
+});
+
+
+test("Gradio-swallowed submit exceptions reach the plugin immediately", async () => {
+    for (const failAfterCapture of [false, true]) {
+        const h = harness({ manualTimers: true, submit: (...args) => {
+            if (!failAfterCapture) throw new Error("t2i validation failed: fixture detail");
+            return args;
+        }, fetch: async url => response(url.includes("/prepare")
+            ? { cache_state: snapshot(), token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 90 } : snapshot()) });
+        cacheForm(h);
+        h.test.installNativeCacheState();
+        await h.test.restoreNativeCacheState("txt2img");
+        const config = h.test.nativeCacheConfig("txt2img");
+        const run = h.test.startLinkedRun(config);
+        await h.test.requestNativeCacheContext(config, run);
+        if (failAfterCapture) {
+            const inner = h.window.submit;
+            h.window.submit = (...args) => { inner(...args); throw new Error("t2i validation failed: fixture detail"); };
+        }
+        const generate = h.nodes.get("txt2img_generate");
+        generate.addEventListener("click", () => {
+            try { h.window.submit("task(failed)", "base prompt", "negative"); } catch { /* Gradio displays and consumes frontend exceptions. */ }
+        });
+        let error;
+        const pending = h.test.runForgeGeneration("txt2img", run, generate, () => {}).catch(value => { error = value; });
+        await h.advanceTime(0);
+        assert.match(error?.message || "still waiting", /t2i validation failed: fixture detail/);
+        await pending;
+    }
+});
+
+test("failed launch before submit capture does not report an injected or advanced batch", async () => {
+    const h = harness({ fetch: async url => response(url.includes("/prepare")
+        ? { cache_state: snapshot(), token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 90 } : snapshot()) });
+    const form = cacheForm(h);
+    h.test.installNativeCacheState();
+    await h.test.restoreNativeCacheState("txt2img");
+    h.test.setForgeRunner(async () => { throw new Error("t2i validation failed: fixture detail"); });
+    await h.test.handleNativeGenerate("txt2img", h.nodes.get("txt2img_generate"));
+    const message = h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status").innerHTML;
+    assert.match(message, /注入未执行/);
+    assert.doesNotMatch(message, /游标已推进/);
+    assert.match(message, /fixture detail/);
+    assert.equal(form.cache_cursor.value, "41");
+    assert.equal(h.storage.has("llm_prompt_studio_cache_cursors_v1"), false);
+});
+
+
+test("native launch keeps its claim while Gradio collects inputs for more than ten seconds", async () => {
+    for (const slot of ["txt2img", "img2img"]) {
+        const h = harness({ manualTimers: true, fetch: async url => response(url.includes("/prepare")
+            ? { cache_state: snapshot(), token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 90 } : snapshot()) });
+        cacheForm(h, slot);
+        h.test.installNativeCacheState();
+        await h.test.restoreNativeCacheState(slot);
+        const config = h.test.nativeCacheConfig(slot);
+        const run = h.test.startLinkedRun(config);
+        await h.test.requestNativeCacheContext(config, run);
+        const generate = h.nodes.get(slot + "_generate");
+        let payload;
+        let failure;
+        let afterClicks = 0;
+        generate.addEventListener("click", () => h.window.setTimeout(() => {
+            const args = slot === "txt2img" ? ["task(slow-inputs)", "base prompt", "negative"]
+                : ["task(slow-inputs)", 0, "base prompt", "negative"];
+            payload = h.window[slot === "txt2img" ? "submit" : "submit_img2img"](...args);
+            h.storage.set(slot + "_task_id", payload[0]);
+        }, 15000));
+        const pending = h.test.runForgeGeneration(slot, run, generate, () => afterClicks++)
+            .catch(error => { failure = error; });
+        await h.advanceTime(11000);
+        assert.equal(failure, undefined, "input collection is not a failed Forge launch");
+        assert.equal(afterClicks, 0);
+        assert.equal(run.forgeLaunching, true);
+        await h.advanceTime(4250);
+        assert.equal(afterClicks, 1);
+        assert.equal(payload[slot === "txt2img" ? 1 : 2], "base prompt" + run.nativeClaimSuffix);
+        assert.equal(generate.clicks, 1, "waiting never resubmits a generation");
+        h.storage.delete(slot + "_task_id");
+        await h.advanceTime(250);
+        await pending;
+        assert.equal(failure, undefined);
+    }
+});
+
+
+test("native submit waiting remains cancellable and has a finite deadline", async () => {
+    for (const cancel of [false, true]) {
+        const h = harness({ manualTimers: true, fetch: async url => response(url.includes("/prepare")
+            ? { cache_state: snapshot(), token: "a".repeat(32), count: 1, after_id: 41, next_cursor: 90 } : snapshot()) });
+        const form = cacheForm(h);
+        h.test.installNativeCacheState();
+        await h.test.restoreNativeCacheState("txt2img");
+        const config = h.test.nativeCacheConfig("txt2img");
+        const run = h.test.startLinkedRun(config);
+        run.busy = true;
+        await h.test.requestNativeCacheContext(config, run);
+        const generate = h.nodes.get("txt2img_generate");
+        let failure;
+        let afterClicks = 0;
+        const pending = h.test.runForgeGeneration("txt2img", run, generate, () => afterClicks++)
+            .catch(error => { failure = error; });
+        await h.advanceTime(cancel ? 5000 : 119999);
+        assert.equal(failure, undefined);
+        if (cancel) h.window.llmPromptStudioAutoLoop.cancelInline("txt2img");
+        await h.advanceTime(250);
+        await pending;
+        assert.match(failure?.message || "still waiting", cancel ? /已取消/ : /提交等待超时.*120/);
+        assert.equal(afterClicks, 0);
+        assert.equal(run.forgeLaunching, false);
+        assert.equal(form.cache_cursor.value, "41");
+        assert.equal(generate.clicks, 1);
+        assert.equal(h.timers.filter(ms => ms === 250).length > 0, true);
+        assert.equal(h.timers.includes(25), false, "waiting only checks in-memory state four times per second");
+        assert.equal(h.scheduledTimers.size, 0);
+    }
+});
+
+
+test("busy native Generate clicks coalesce before reading settings or replacing status", async () => {
+    const h = harness({ fetch: async () => response(snapshot()) });
+    cacheForm(h);
+    h.test.installNativeCacheState();
+    await h.test.restoreNativeCacheState("txt2img");
+    const run = h.test.startLinkedRun(h.test.nativeCacheConfig("txt2img"));
+    run.busy = true;
+    const status = h.nodes.get("llm_prompt_studio_txt2img_inline_loop_status");
+    let html = status.innerHTML;
+    let writes = 0;
+    Object.defineProperty(status, "innerHTML", { get: () => html, set: value => { html = value; writes++; } });
+    h.queries.length = 0;
+    const generate = h.nodes.get("txt2img_generate");
+    for (let i = 0; i < 100; i++) await h.test.handleNativeGenerate("txt2img", generate);
+    assert.equal(run.pendingNativeClick, true);
+    assert.equal(writes, 1);
+    assert.deepEqual(h.queries, ["#llm_prompt_studio_txt2img_inline_loop_status"]);
+    assert.equal(generate.clicks || 0, 0);
+    assert.match(html, /已记住下一次原生 Generate/);
 });
