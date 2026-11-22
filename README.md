@@ -40,7 +40,7 @@ git -C extensions clone https://github.com/Rivulet138/sd-webui-llm-prompt-studio
 
 ## 生成与输出预设
 
-批量生成可设置数量、变化维度、静态词库抽样、跳过已有缓存、失败后继续和任务预览。可在「提示词 → 批量多样性」配置词库配方、相似度重试和跨批次记忆。
+批量生成可设置数量、变化维度、静态词库抽样、跳过已有缓存、失败后继续和任务预览。可在「提示词」页的“批量多样性”中启用词库配方，并配置相似度重试和跨批次记忆。
 
 通用输出预设：Danbooru 标签、Danbooru + 自然语言、自然语言。模型预设：Pony / Illustrious、NoobAI、Flux、Anima、Krea 2。
 
