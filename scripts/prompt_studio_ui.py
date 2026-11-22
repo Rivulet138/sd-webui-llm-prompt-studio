@@ -19,7 +19,7 @@ from typing import Any, Iterable
 import gradio as gr
 from starlette.requests import Request
 from prompt_studio_wd14 import (
-    discover_local_models, interrogate_image_detailed, interrogate_local, unload_local_model,
+    discover_local_models, interrogate_image_detailed, unload_local_model,
 )
 from prompt_studio_tagger_models import MODEL_CATALOG, download_links, download_model, model_directory
 from prompt_studio_image_batch import ImageBatchJob
@@ -1125,13 +1125,14 @@ def _server_render_prompt(
 
     p = processing.StableDiffusionProcessingTxt2Img(
         sd_model=getattr(shared, "sd_model", None),
-        outpath_samples=getattr(shared.opts, "outdir_txt2img_samples", None),
-        outpath_grids=getattr(shared.opts, "outdir_txt2img_grids", None),
+        outpath_samples=(getattr(shared.opts, "outdir_samples", None) or getattr(shared.opts, "outdir_txt2img_samples", None)),
+        outpath_grids=(getattr(shared.opts, "outdir_grids", None) or getattr(shared.opts, "outdir_txt2img_grids", None)),
         prompt=str(prompt),
         negative_prompt=str(settings.get("negative_prompt") or ""),
         styles=(settings.get("styles") if isinstance(settings.get("styles"), list) else []),
         seed=_int("seed", -1, -1, 2**63 - 1),
         sampler_name=str(settings.get("sampler_name") or "Euler"),
+        scheduler=str(settings.get("scheduler") or "Automatic"),
         batch_size=_int("batch_size", 1, 1, 8),
         n_iter=_int("batch_count", _int("n_iter", 1, 1, 128), 1, 128),
         steps=_int("steps", 20, 1, 150),
@@ -1146,6 +1147,16 @@ def _server_render_prompt(
         hr_second_pass_steps=_int("hr_second_pass_steps", 0, 0, 150),
         hr_resize_x=_int("hr_resize_x", 0, 0, 4096),
         hr_resize_y=_int("hr_resize_y", 0, 0, 4096),
+        hr_checkpoint_name=(None if settings.get("hr_checkpoint_name") == "Use same checkpoint"
+                            else str(settings.get("hr_checkpoint_name") or "").strip() or None),
+        hr_additional_modules=(settings.get("hr_additional_modules")
+                               if isinstance(settings.get("hr_additional_modules"), list) else None),
+        hr_sampler_name=(None if settings.get("hr_sampler_name") == "Use same sampler"
+                         else str(settings.get("hr_sampler_name") or "").strip() or None),
+        hr_scheduler=(None if settings.get("hr_scheduler") == "Use same scheduler"
+                      else str(settings.get("hr_scheduler") or "").strip() or None),
+        hr_prompt=str(settings.get("hr_prompt") or ""),
+        hr_negative_prompt=str(settings.get("hr_negative_prompt") or ""),
         hr_cfg=_float("hr_cfg", 1, 0, 30),
         hr_distilled_cfg=_float("hr_distilled_cfg", 3.5, 0, 30),
         do_not_save_samples=False,
@@ -3119,9 +3130,11 @@ def _retry_batch_issues(
 
 def _index_wildcards(path):
     try:
-        files, terms = DB.index_wildcards(path or DEFAULT_WILDCARDS)
+        configured = path or DEFAULT_WILDCARDS
+        files, terms = DB.index_wildcards(configured)
         categories = DB.wildcard_categories()
         matches = DB.wildcard_matches("")
+        _save_workflow_values({"wildcard_path": str(configured)})
         return (f"索引完成：更新 {files} 个文件，{len(categories)} 个分类，共 {terms} 个词条",
                 gr.update(choices=matches, value=[]),
                 gr.update(choices=["全部"] + categories, value="全部"))
@@ -3346,57 +3359,41 @@ _TECHNICAL_TOKEN_RES = (
     re.compile(r"<hypernet:[^>]+>", re.IGNORECASE),
 )
 def _immutable_technical_tokens(prompt: str) -> list[str]:
-    """Extract LoRA tags and standalone trigger tokens without interpreting them."""
-    text = str(prompt or "")
-    matches = []
-    for pattern in _TECHNICAL_TOKEN_RES:
-        matches.extend((match.start(), match.group(0)) for match in pattern.finditer(text))
-    # Natural-language words remain ordinary fixed prompt context. Compact
-    # activation tokens are conventionally marked by an underscore, digit, or
-    # technical separator; preserve those verbatim without semantic expansion.
-    # Loader tags are blanked out first: otherwise the inside of
-    # ``<lora:myStyle:0.7>`` ("myStyle:0") would be listed as a word the model
-    # should keep verbatim.
-    stripped = text
-    for pattern in _TECHNICAL_TOKEN_RES:
-        stripped = pattern.sub(" ", stripped)
-    words = re.findall(r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", stripped)
-    matches.extend((match.start(), match.group(1)) for match in re.finditer(
-        r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])", stripped
-    ))
-    return list(dict.fromkeys(token for _position, token in sorted(matches, key=lambda item: item[0])))
+    """Keep loaders and explicitly declared triggers out of semantic conversion."""
+    from prompt_studio_core import extract_technical_tokens
+
+    return extract_technical_tokens(prompt)
 
 
 def _strip_immutable_technical_tokens(prompt: str, tokens: list[str] | None = None) -> str:
-    """Remove loader instructions from semantic conversion input, without losing them."""
+    """Remove technical tokens while keeping ordinary tags as conversion input."""
     value = str(prompt or "")
-    for pattern in _TECHNICAL_TOKEN_RES:
-        value = pattern.sub(" ", value)
-    for token in tokens or _immutable_technical_tokens(value):
-        value = re.sub(r"(?<![\w<])" + re.escape(str(token)) + r"(?![\w>])", " ", value, flags=re.IGNORECASE)
+    protected = _immutable_technical_tokens(value) if tokens is None else tokens
+    for token in dict.fromkeys(protected):
+        pattern = re.escape(token)
+        if not token.lower().startswith(("<lora:", "<lyco:", "<hypernet:")):
+            pattern = r"(?<![\w<])" + pattern + r"(?![\w>])"
+        value = re.sub(pattern, " ", value)
     value = re.sub(r"\s*,\s*", ", ", value)
     value = re.sub(r"(?:,\s*){2,}", ", ", value)
     return value.strip(" ,")
 
 
 def _restore_immutable_technical_tokens(prompt: str, tokens: list[str]) -> str:
-    """Append missing loader instructions exactly once, preserving source spelling."""
+    """Restore source spellings exactly once, including case-distinct loaders."""
     value = str(prompt or "").strip().rstrip(" ,")
-    missing = []
-    for raw_token in tokens:
-        token = str(raw_token).strip()
-        if not token:
+    for token in dict.fromkeys(str(token).strip() for token in tokens if str(token).strip()):
+        pattern = re.escape(token)
+        if not token.lower().startswith(("<lora:", "<lyco:", "<hypernet:")):
+            pattern = r"(?<![\w<])" + pattern + r"(?![\w>])"
+        matches = list(re.finditer(pattern, value))
+        if len(matches) == 1:
             continue
-        token_pattern = r"(?<![\w<])" + re.escape(token) + r"(?![\w>])"
-        if re.search(token_pattern, value):
-            continue
-        value = re.sub(token_pattern, " ", value, flags=re.IGNORECASE)
+        value = re.sub(pattern, " ", value)
         value = re.sub(r"\s*,\s*", ", ", value)
         value = re.sub(r"(?:,\s*){2,}", ", ", value).strip(" ,")
-        missing.append(token)
-    if not missing:
-        return value
-    return ", ".join(item for item in (value, *missing) if item)
+        value = ", ".join(part for part in (value, token) if part)
+    return value
 
 
 def _finalize_generated_prompt(
@@ -3407,6 +3404,9 @@ def _finalize_generated_prompt(
     preset = _canonical_preset(preset)
     structured_mode = _canonical_output_mode(structured_mode)
     result = str(result or "").strip()
+    from prompt_studio_core import extract_loader_tokens
+
+    original_loaders = extract_loader_tokens(result)
     lowered = result.casefold()
     meta_markers = (
         "let me ", "here is", "as an ai", "writing prompt", "i will ",
@@ -3428,7 +3428,7 @@ def _finalize_generated_prompt(
             if raw_tag.count("(") != raw_tag.count(")") or raw_tag.count("[") != raw_tag.count("]"):
                 tag_error = "纯标签输出包含未闭合的权重或强调括号。"
                 break
-            if ":" in raw_tag and not raw_tag.startswith(("<lora:", "<lyco:", "<hypernet:")):
+            if ":" in raw_tag and not raw_tag.lower().startswith(("<lora:", "<lyco:", "<hypernet:")):
                 weighted = re.fullmatch(
                     r"\(\s*[^(),:]+?\s*:\s*[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*\)",
                     raw_tag,
@@ -3455,6 +3455,9 @@ def _finalize_generated_prompt(
             _coerce_bool(spaces),
             int(max_tags or 0),
         )
+    if any(token not in extract_loader_tokens(result) for token in original_loaders):
+        candidate_quality_error = globals().get("CandidateQualityError", ValueError)
+        raise candidate_quality_error("标签清理改变或移除了 loader token。")
     if structured_mode != "Plain Prompt":
         result = regional_format(result, structured_mode, int(region_count or 1))
     result = str(result or "").strip()
@@ -3605,6 +3608,14 @@ def _run_llm_generation(
     retry_empty_result=False, candidate_quality=None, user_requirements="",
 ):
     """Compatibility wrapper around the standalone generation kernel."""
+    from prompt_studio_core import extract_technical_tokens
+
+    if candidate_quality is not None and str(user_requirements or "").strip():
+        quality_checker = candidate_quality
+
+        def candidate_quality(original, candidate):
+            return quality_checker(original + "\n\n" + user_requirements, candidate)
+
     return _run_llm_generation_impl(
         source, provider, endpoint, model, api_key, initial_system, build_retry_system,
         finalize_result, runtime_connection, request_temperature, timeout, max_tokens,
@@ -3616,6 +3627,7 @@ def _run_llm_generation(
         worst_content_similarity=_worst_content_similarity,
         max_response_retries=_MAX_RESPONSE_RETRIES,
         candidate_quality=candidate_quality,
+        protected_tokens=extract_technical_tokens(source + "\n\n" + str(user_requirements or "")),
     )
 
 
@@ -3655,12 +3667,16 @@ def _prompt_quality_score(
     preset = _canonical_preset(preset)
     tag_mode = preset in {"Danbooru Tags", "Pony / Illustrious Tags", "NoobAI Tags", "Anima Tags", "Danbooru + Natural"}
     if tag_mode:
+        from prompt_studio_core import extract_loader_tokens
+
+        loader_tokens = set(extract_loader_tokens(text))
         canonicalizer = globals().get("canonicalize_booru_tags")
         if callable(canonicalizer):
             canonical = canonicalizer(text)
             tags = canonical.get("tags") or []
             normalized_tags = [
-                re.sub(r"\s+", "_", str(tag).strip()).casefold()
+                str(tag).strip() if str(tag).strip() in loader_tokens
+                else re.sub(r"\s+", "_", str(tag).strip()).casefold()
                 for tag in tags if str(tag).strip()
             ]
             if len(normalized_tags) != len(set(normalized_tags)):
@@ -3685,14 +3701,15 @@ def _prompt_quality_score(
             weighted = weighted_tag_re.fullmatch(item)
             if weighted:
                 probe = weighted.group(1).strip()
-            elif ":" in item and not item.startswith(("<lora:", "<lyco:", "<hypernet:")):
+            elif ":" in item and not item.lower().startswith(("<lora:", "<lyco:", "<hypernet:")):
                 return float("-inf")
             probe = probe.strip("[]() ")
             if callable(canonicalizer):
                 canonical_probe = canonicalizer(probe)
                 canonical_values = canonical_probe.get("tags") or []
                 probe = canonical_values[0] if canonical_values else probe
-            quality_keys.append(re.sub(r"\s+", "_", probe).casefold())
+            quality_keys.append(probe if probe in loader_tokens
+                                else re.sub(r"\s+", "_", probe).casefold())
         if len(quality_keys) != len(set(quality_keys)):
             return float("-inf")
         if base_model in {"Pony / Illustrious", "NoobAI"}:
@@ -3779,7 +3796,7 @@ def _generate(
     similarity_limit = float(diversity["similarity_threshold"])
     try:
         request_temperature = float(1.0 if temperature is None else temperature)
-        if effective_batch_directive and diversity["batch_temperature_floor"] and not preserve_inference_settings:
+        if effective_batch_directive and not inline_delta and diversity["batch_temperature_floor"]:
             request_temperature = max(request_temperature, _MIN_INDEPENDENT_BATCH_TEMPERATURE)
         def build_retry_system(reason, attempt):
             if reason == "diversity":
@@ -3905,6 +3922,7 @@ def _expand_or_polish(
     }
     if action_name in chained_actions:
         first_action, second_action = chained_actions[action_name]
+        protected_tokens = _immutable_technical_tokens(source)
         converted, convert_status = _expand_or_polish(
             source, first_action, preset, system_override, base_model, safety, nsfw_injection,
             user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens,
@@ -3913,8 +3931,15 @@ def _expand_or_polish(
         )
         if not converted:
             return "", f"格式转换失败：{convert_status}"
+        follow_up_source = converted
+        if protected_tokens:
+            follow_up_source = (
+                f"{converted}\n\nTrigger words: "
+                + ", ".join(protected_tokens)
+                + "\nKeep every listed loader or trigger token verbatim."
+            )
         result, follow_up_status = _expand_or_polish(
-            converted, second_action, preset, system_override, base_model, safety, nsfw_injection,
+            follow_up_source, second_action, preset, system_override, base_model, safety, nsfw_injection,
             user_instruction, provider, endpoint, model, api_key, temperature, timeout, max_tokens,
             send_temperature, remove_bad, remove_terms, shuffle, spaces, max_tags, structured_mode,
             region_count, cancel_event, batch_directive, previous_outputs, connection_settings,
@@ -4617,6 +4642,8 @@ def _template_record(value, fallback=None) -> dict[str, Any]:
     base = dict(fallback or {})
     record = value if isinstance(value, dict) else {}
     dimensions = record.get("variation_dimensions", base.get("variation_dimensions", []))
+    if isinstance(dimensions, str):
+        dimensions = dimensions.split(",")
     if not isinstance(dimensions, list):
         dimensions = []
     return {
@@ -5035,12 +5062,13 @@ def _save_custom_template(name, content, preserve_fixed_prompt=True,
         return ("模板名称不能为空且不能超过 64 个字符。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
     if not content or len(content) > 12000:
         return ("模板内容不能为空且不能超过 12000 个字符。", *(_template_dropdown_update() for _ in range(1 + len(_INLINE_TEMPLATE_COMPONENTS))))
+    dimensions = _template_record({"variation_dimensions": variation_dimensions})["variation_dimensions"]
     if name in {"general", "kemonimimi"}:
         builtins = _builtin_templates()
         builtins[name] = _template_record({
             "content": content,
             "preserve_fixed_prompt": preserve_fixed_prompt,
-            "variation_dimensions": variation_dimensions,
+            "variation_dimensions": dimensions,
             "style_rules": style_rules,
             "forbidden_content": forbidden_content,
             "conflict_policy": conflict_policy,
@@ -5053,12 +5081,10 @@ def _save_custom_template(name, content, preserve_fixed_prompt=True,
     templates = _custom_templates()
     # Store a structured record so future editor fields can evolve without
     # breaking existing text-only templates or callers.
-    dimensions = variation_dimensions if isinstance(variation_dimensions, list) else str(variation_dimensions or "").split(",")
-    dimensions = [item.strip() for item in dimensions if str(item).strip()]
     templates[name] = {
         "content": content,
         "preserve_fixed_prompt": _coerce_bool(preserve_fixed_prompt, True),
-        "variation_dimensions": dimensions or ["action", "environment_detail", "camera", "composition", "lighting", "atmosphere"],
+        "variation_dimensions": dimensions,
         "style_rules": str(style_rules or "").strip(),
         "forbidden_content": str(forbidden_content or "").strip(),
         "conflict_policy": str(conflict_policy or "reject_and_retry"),
@@ -5861,6 +5887,9 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
             if prompt_target is None:
                 gr.Markdown("txt2img 尚未就绪，写入不可用。")
             enqueue_status = gr.Markdown(elem_id=f"{prefix}_queue_status")
+            with gr.Row():
+                queue_refresh = gr.Button("刷新生图进度", size="sm", elem_id=f"{prefix}_queue_refresh")
+                queue_cancel = gr.Button("取消等待中的生图", size="sm", elem_id=f"{prefix}_queue_cancel")
             with gr.Accordion("覆盖原始缓存", open=False):
                 with gr.Row(elem_classes=["lps-form-row"]):
                     save_one = gr.Button("用当前结果覆盖原始记录", size="sm", elem_id=f"{prefix}_save_one")
@@ -5945,6 +5974,8 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
                 refresh_saved, inputs=[*browse_inputs, selected], outputs=[picker, browse_status, page])
         if prompt_target is not None:
             write.click(_inline_cache_write, inputs=[prompt_target, result, write_mode], outputs=[prompt_target, status])
+        queue_refresh.click(_inline_cache_queue_status, inputs=queue_controls["ids"], outputs=enqueue_status)
+        queue_cancel.click(_inline_cache_cancel_queues, inputs=queue_controls["ids"], outputs=enqueue_status, queue=False)
         enqueue_event = enqueue_images.click(
             _inline_cache_enqueue_results,
             inputs=[stage, result_id, result, queue_controls["settings"], queue_controls["ids"]],
@@ -6111,7 +6142,20 @@ def _wd14_download_model(model_id, directory="", current=""):
 
 
 def _wd14_interrogate(image, model, threshold, character_threshold=0.85):
-    return interrogate_local(image, model, threshold, character_threshold)
+    try:
+        details = interrogate_image_detailed(image, model, threshold, character_threshold)
+        pixels = image.convert("RGBA")
+        digest = hashlib.sha256()
+        digest.update(str(pixels.size).encode("ascii"))
+        digest.update(pixels.tobytes())
+        tags = details["prompt"]
+        record = {"path": "image:" + digest.hexdigest(), "details": details, "status": "completed"}
+        family = "CL Tagger" if details.get("family") == "cl" else "WD14"
+        return tags, f"本地 {family} · {len(details.get('tags') or [])} 个标签", record
+    except ImportError as error:
+        return "", f"内置反推缺少本地运行依赖：{error}", {}
+    except Exception as error:
+        return "", f"本地反推识别失败：{_safe_error(error)}", {}
 
 
 def _wd14_release_after_batch():
@@ -6124,12 +6168,32 @@ def _wd14_release_after_batch():
         return ""
 
 
+def _wd14_transform(
+    source, action, preset, system_override, base_model, safety, nsfw_injection,
+    user_instruction, provider, endpoint, model, api_key, temperature, timeout,
+    max_tokens, send_temperature, top_p, top_k, retry_count, thinking_enabled,
+    thinking_budget, reasoning_effort,
+):
+    connection = _png_batch_connection_snapshot(
+        {**_transform_llm_settings(), "top_p": top_p, "top_k": top_k,
+         "retry_count": retry_count, "thinking_enabled": thinking_enabled,
+         "thinking_budget": thinking_budget, "reasoning_effort": reasoning_effort},
+        provider, endpoint, model, temperature, timeout, max_tokens, send_temperature,
+    )
+    return _expand_or_polish(
+        source, action, preset, system_override, base_model, safety, nsfw_injection,
+        user_instruction, provider, endpoint, model, api_key, temperature, timeout,
+        max_tokens, send_temperature, connection_settings=connection,
+        preserve_inference_settings=True,
+    )
+
+
 def _wd14_process(image, model, threshold, character_threshold, *llm_args):
-    tags, status = _wd14_interrogate(image, model, threshold, character_threshold)
+    tags, status, record = _wd14_interrogate(image, model, threshold, character_threshold)
     if not tags:
-        return tags, "", status
-    result, llm_status = _expand_or_polish(tags, *llm_args)
-    return tags, result, f"{status} · {llm_status}"
+        return tags, "", status, record
+    result, llm_status = _wd14_transform(tags, *llm_args)
+    return tags, result, f"{status} · {llm_status}", record
 
 
 
@@ -6230,6 +6294,10 @@ def _wd14_save_records(records, base_model, *filters, output_mode="Danbooru Tags
             "threshold": details.get("threshold"),
             "character_threshold": details.get("character_threshold"),
         }
+        if not identity["path"]:
+            identity["prompt"] = record["prompt"]
+            identity["output_mode"] = output_mode
+            identity["base_model"] = base_model
         source_ref = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         family = str(details.get("family") or "WD14/CL Tagger")
         model_name = Path(str(details.get("model_path") or "")).name or "unknown model"
@@ -6247,8 +6315,10 @@ def _wd14_save_records(records, base_model, *filters, output_mode="Danbooru Tags
     return (f"已保存到缓存：新增 {stats['inserted']} · 更新 {stats['updated']} · 已有 {stats['unchanged']}", *_filtered_cache_updates(*filters))
 
 
-def _wd14_save_single(prompt, base_model, output_mode="Danbooru Tags", *filters):
-    return _wd14_save_records([{"prompt": str(prompt or "").strip(), "status": "completed"}], base_model, *filters, output_mode=output_mode)
+def _wd14_save_single(prompt, record, base_model, output_mode="Danbooru Tags", *filters):
+    saved = dict(record or {})
+    saved.update(prompt=str(prompt or "").strip(), status="completed")
+    return _wd14_save_records([saved], base_model, *filters, output_mode=output_mode)
 
 
 def _wd14_write_single(prompt, current, mode, current_script=None):
@@ -6362,16 +6432,16 @@ def _api_inline_generate(payload: dict[str, Any]):
         payload["preset"] = _canonical_preset(payload["preset"])
     if "base_model" in payload:
         payload["base_model"] = _canonical_base_model(payload["base_model"])
-    allowed_fields = {"request", "source_tags", "variation", "template", "preset", "base_model", "safety", "slot", "request_id", "cache_result"}
+    allowed_fields = {"request", "source_tags", "variation", "template", "model_preset", "preset", "base_model", "safety", "slot", "request_id", "cache_result"}
     unknown_fields = sorted(set(payload) - allowed_fields)
     if unknown_fields:
         raise ValueError(f"Inline API request contains unsupported fields: {', '.join(unknown_fields)}")
     if "cache_result" in payload and not isinstance(payload["cache_result"], bool):
         raise ValueError("cache_result must be a boolean")
     workflow = _workflow_settings()
-    connection = _connection_settings()
     preset, base_model = _resolve_preset_model(
-        payload.get("preset", workflow["preset"]), payload.get("base_model", workflow["base_model"])
+        payload.get("model_preset", payload.get("preset", workflow["preset"])),
+        payload.get("base_model", workflow["base_model"]),
     )
     safety = payload.get("safety", workflow["safety"])
     if preset not in PRESETS:
@@ -6435,14 +6505,15 @@ def _api_inline_cancel(payload: dict[str, Any]):
 
 def _api_auto_loop_generate(payload: dict[str, Any]):
     payload = dict(payload or {})
-    allowed_fields = {"request", "preset", "base_model", "safety", "cache_result"}
+    allowed_fields = {"request", "model_preset", "preset", "base_model", "safety", "cache_result"}
     unknown_fields = sorted(set(payload) - allowed_fields)
     if unknown_fields:
         raise ValueError(f"Auto loop API request contains unsupported fields: {', '.join(unknown_fields)}")
     workflow = _workflow_settings()
     connection = _connection_settings()
     preset, base_model = _resolve_preset_model(
-        payload.get("preset", workflow["preset"]), payload.get("base_model", workflow["base_model"])
+        payload.get("model_preset", payload.get("preset", workflow["preset"])),
+        payload.get("base_model", workflow["base_model"]),
     )
     safety = payload.get("safety", workflow["safety"])
     if preset not in PRESETS:
@@ -7230,7 +7301,7 @@ def on_ui_tabs():
             generation_save_score = save_score
             generation_cache_result = cache_result
 
-            with gr.Tab("缓存", elem_id="llm_prompt_studio_library_tab"):
+            with gr.Tab("缓存", elem_id="llm_prompt_studio_library_tab") as cache_tab:
                 with gr.Accordion("导入与插件批次", open=False, elem_id="llm_prompt_studio_png_batch_tab", elem_classes=["lps-import-panel"]):
                     with gr.Row(elem_classes=["lps-plugin-source-actions"]):
                         png_collector_pull = gr.Button(
@@ -7435,6 +7506,9 @@ def on_ui_tabs():
                         elem_id="llm_prompt_studio_processed_result_append")
                     processed_result_enqueue = gr.Button("加入生图队列", variant="primary",
                         elem_id="llm_prompt_studio_processed_result_enqueue")
+                with gr.Row():
+                    processed_queue_refresh = gr.Button("刷新生图进度", elem_id="llm_prompt_studio_processed_queue_refresh")
+                    processed_queue_cancel = gr.Button("取消等待中的生图", elem_id="llm_prompt_studio_processed_queue_cancel")
                 with gr.Accordion("批量管理结果（编辑 / 删除）", open=False, elem_classes=["lps-settings-section"]):
                     with gr.Row(elem_classes=["lps-form-row"]):
                         processed_result_manage_action = gr.Radio(
@@ -7759,6 +7833,8 @@ def on_ui_tabs():
                                     wd_llm_status = gr.Markdown()
                                 wd_raw_tags = gr.State("")
                                 wd_output_mode = gr.State("Danbooru Tags")
+                                wd_single_record = gr.State({})
+                                image.change(lambda: {}, outputs=wd_single_record, queue=False)
                             with gr.Tab("文件夹批量"):
                                 wd_folder = gr.Textbox(label="图片文件夹", placeholder=r"E:\图片",
                                     elem_id="llm_prompt_studio_wd14_folder")
@@ -7982,18 +8058,25 @@ def on_ui_tabs():
             outputs=[wd_download_links, wd_download_directory, wd_download], queue=False)
         wd_download.click(_wd14_download_model, inputs=[wd_download_choice, wd_directory, wd_model], outputs=[*wd_model_outputs, wd_download], api_name=False)
         wd_unload.click(unload_local_model, outputs=wd_status)
-        interrogate.click(_wd14_interrogate, inputs=[image, wd_model, wd_threshold, wd_character_threshold], outputs=[wd_tags, wd_status]).then(
+        interrogate.click(_wd14_interrogate, inputs=[image, wd_model, wd_threshold, wd_character_threshold], outputs=[wd_tags, wd_status, wd_single_record]).then(
             lambda: "Danbooru Tags", outputs=wd_output_mode, queue=False,
         )
+        wd_transform_inputs = [
+            action, preset, system_override, base_model, safety, nsfw_injection, user_instruction,
+            transform_provider, transform_endpoint, transform_model, transform_api_key,
+            transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature,
+            transform_top_p, transform_top_k, transform_retry_count, transform_thinking_enabled,
+            transform_thinking_budget, transform_reasoning_effort,
+        ]
         wd_full_process.click(
             _wd14_process,
-            inputs=[image, wd_model, wd_threshold, wd_character_threshold, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, transform_provider, transform_endpoint, transform_model, transform_api_key, transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature],
-            outputs=[wd_raw_tags, wd_tags, wd_llm_status],
+            inputs=[image, wd_model, wd_threshold, wd_character_threshold, *wd_transform_inputs],
+            outputs=[wd_raw_tags, wd_tags, wd_llm_status, wd_single_record],
         ).then(lambda value: value, inputs=preset, outputs=wd_output_mode, queue=False)
-        transform.click(_expand_or_polish, inputs=[wd_tags, action, preset, system_override, base_model, safety, nsfw_injection, user_instruction, transform_provider, transform_endpoint, transform_model, transform_api_key, transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature], outputs=[wd_tags, wd_llm_status]).then(
+        transform.click(_wd14_transform, inputs=[wd_tags, *wd_transform_inputs], outputs=[wd_tags, wd_llm_status]).then(
             lambda value: value, inputs=preset, outputs=wd_output_mode, queue=False,
         )
-        wd_save.click(_wd14_save_single, inputs=[wd_tags, base_model, wd_output_mode, *cache_filter_inputs], outputs=[wd_status, table, selected_records])
+        wd_save.click(_wd14_save_single, inputs=[wd_tags, wd_single_record, base_model, wd_output_mode, *cache_filter_inputs], outputs=[wd_status, table, selected_records])
         wd_batch_inputs = [wd_folder, wd_recursive, wd_model, wd_threshold, wd_character_threshold, wd_batch_id]
         for button, mode in ((wd_batch_start, "start"), (wd_batch_resume, "resume"), (wd_batch_retry, "retry")):
             button.click(_wd14_run_batch, inputs=[*wd_batch_inputs, gr.State(mode)],
@@ -8062,6 +8145,7 @@ def on_ui_tabs():
             outputs=[handoff_status, handoff_table, handoff_selection],
         )
         page_outputs = [table, selected_records, cache_status, cache_page]
+        cache_tab.select(_cache_page_update, inputs=[*cache_filter_inputs, cache_page], outputs=page_outputs)
         refresh.click(_cache_page_update, inputs=cache_filter_inputs, outputs=page_outputs)
         cache_query.submit(_cache_page_update, inputs=cache_filter_inputs, outputs=page_outputs)
         clear_filters.click(_clear_cache_filters, outputs=[cache_query, cache_min_score, cache_output_filter, cache_model_filter, table, selected_records, cache_status]).then(lambda: 1, outputs=cache_page, queue=False)
@@ -8176,6 +8260,8 @@ def on_ui_tabs():
             }""",
             queue=False,
         )
+        processed_queue_refresh.click(_inline_cache_queue_status, inputs=processed_result_queue_ids, outputs=processed_result_status)
+        processed_queue_cancel.click(_inline_cache_cancel_queues, inputs=processed_result_queue_ids, outputs=processed_result_status, queue=False)
         processed_result_enqueue_event = processed_result_enqueue.click(
             _processed_result_enqueue,
             inputs=[processed_result_selection, processed_result_query, processed_result_queue_ids, processed_result_generation_settings, processed_result_scope],

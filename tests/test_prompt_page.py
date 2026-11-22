@@ -101,7 +101,7 @@ class PromptPageTests(unittest.TestCase):
     def test_preview_returns_the_assembled_policy_prompt(self):
         text = self.api._prompt_preview_text()
         self.assertTrue(text.startswith("PROMPT POLICY V3"), text[:60])
-        self.assertIn("<output_profile>", text)
+        self.assertIn("<model_preset>", text)
         self.assertIn("<operation_template>", text)
         self.assertNotIn("预演失败", text)
 

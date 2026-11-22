@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock
 
 from test_queue_regressions import ROOT, StudioDB, ui_functions
-from prompt_studio_core import normalize_sampling
+from prompt_studio_core import build_user_message, normalize_sampling
 from prompt_studio_generation import run_llm_generation
 
 GR = SimpleNamespace(update=lambda **kwargs: kwargs)
@@ -99,7 +99,7 @@ class CacheInferenceTests(unittest.TestCase):
             _canonical_provider=lambda x: x, _canonical_output_mode=lambda x: x,
             _resolve_preset_model=lambda p, b: (p, b), _aligned_preset=lambda p, b: (p, False),
             build_operation_instruction=lambda *args: "Keep source", _static_prompt_reference=lambda x: [],
-            build_system_prompt=lambda *args, **kwargs: "system", build_user_message=lambda x: x,
+            build_system_prompt=lambda *args, **kwargs: "system", build_user_message=build_user_message,
             CREDENTIALS=SimpleNamespace(resolve=Mock(return_value="fake-test-key"), save=Mock(return_value=False), has_matching=Mock(return_value=False)), call_llm=self.llm,
             _MAX_DIVERSITY_RETRIES=1, _MAX_RESPONSE_RETRIES=1,
             _MAX_CONTENT_SIMILARITY=0.55,

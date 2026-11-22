@@ -413,7 +413,7 @@ class GenerateGateTests(unittest.TestCase):
         self.calls.clear()
         api = self.build([STREET_C])
         self.generate(api, history=[KITCHEN_A], preserve=True)
-        self.assertAlmostEqual(self.calls[0].temperature, 1.1)
+        self.assertAlmostEqual(self.calls[0].temperature, api._MIN_INDEPENDENT_BATCH_TEMPERATURE)
         self.calls.clear()
         api = self.build([STREET_C])
         self.generate(api, history=[KITCHEN_A], preserve=False)

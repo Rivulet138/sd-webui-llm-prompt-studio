@@ -1,4 +1,5 @@
 """Regressions for faithful edits, inference settings, and shared validation."""
+import json
 import math
 import unittest
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from unittest.mock import Mock, patch
 from test_queue_regressions import ui_functions
 from test_prompt_generation_quality import quality_api
 from prompt_studio_core import (
-    PRESETS, build_operation_instruction, build_system_prompt, build_user_message,
+    MODEL_PRESET_FORMATS, PRESETS, build_operation_instruction, build_system_prompt, build_user_message,
     is_sfw_output, process_tags, regional_format,
 )
 from prompt_studio_generation import CandidateQualityError, run_llm_generation
@@ -45,7 +46,7 @@ her hands support a leather-bound book as warm light crosses the pale paper and 
 MODEL_OUTPUTS = (
     ("Krea 2", "Krea 2 Natural", "A girl reads beside a window."),
     ("Anima", "Anima Tags", "1girl, reading, by_window"),
-    ("Flux", "Natural Language", "A girl reads beside a window."),
+    ("Flux", "Flux Natural", "A girl reads beside a window."),
 )
 
 
@@ -63,9 +64,12 @@ class PromptReviewFixTests(unittest.TestCase):
             return candidate
 
         def generate(*args, **kwargs):
+            user_requirements = kwargs.pop("user_requirements", "")
             return run_llm_generation(
                 *args, **kwargs, credentials=SimpleNamespace(resolve=lambda *args: ""),
-                call_llm=provider, build_user_message=build_user_message, coerce_bool=bool,
+                call_llm=provider,
+                build_user_message=lambda request: build_user_message(request, user_requirements),
+                coerce_bool=bool,
                 fallback_request_kwargs=lambda connection: {},
                 worst_content_similarity=similarity, max_response_retries=1,
             )
@@ -114,6 +118,8 @@ class PromptReviewFixTests(unittest.TestCase):
             structured_mode="Plain Prompt", region_count=1,
         )
         values.update(changes)
+        if "base_model" in changes and "preset" not in changes:
+            values["preset"] = MODEL_PRESET_FORMATS.get(changes["base_model"], values["preset"])
         if action == "Inline":
             return api._inline_generate(
                 values.pop("request", "reading by a window"), values.pop("source", "1girl"),
@@ -182,7 +188,7 @@ class PromptReviewFixTests(unittest.TestCase):
                 with self.subTest(model=model, safety=safety):
                     api, calls = self.generation_api(candidate)
                     result, status = self.invoke(
-                        api, "Polish", preset="Natural Language", base_model=model, safety=safety,
+                        api, "Polish", preset=preset, base_model=model, safety=safety,
                         system_override=PRESETS[preset] + "\n\nKeep the supplied colors.",
                         nsfw_injection="LOCAL_NSFW_RULE", user_instruction="Keep the supplied book.",
                     )
@@ -194,7 +200,8 @@ class PromptReviewFixTests(unittest.TestCase):
                     self.assertIn("Safety mode: " + safety, system)
                     self.assertEqual("LOCAL_NSFW_RULE" in system, safety == "NSFW")
                     self.assertIn("Keep the supplied colors.", system)
-                    self.assertIn("Keep the supplied book.", system)
+                    payload = json.loads(calls[0][5].split("\n", 1)[1].rsplit("\n", 1)[0])
+                    self.assertEqual(payload["user_requirements"], "Keep the supplied book.")
                     self.assertNotIn("PART ONE:", system)
 
     def test_convert_and_polish_never_read_lexicon_or_use_batch_diversity(self):
@@ -315,7 +322,10 @@ class PromptReviewFixTests(unittest.TestCase):
                             batch_directive="Vary the scene.", preserve_inference_settings=preserve)
                         result = self.invoke(api, action, **changes)
                         self.assertEqual(result[0], "1girl, reading", result[-1])
-                        expected = 0.8 if floor and action in {"Generate", "Expand"} and not preserve else 0.0
+                        applies_floor = floor and (
+                            action == "Generate" or (action == "Expand" and not preserve)
+                        )
+                        expected = 0.8 if applies_floor else 0.0
                         self.assertEqual(calls[0][6], expected)
 
     def test_long_instruction_returns_status_without_calling_provider(self):
@@ -338,7 +348,7 @@ class PromptReviewFixTests(unittest.TestCase):
                     changes["previous_outputs"] = ["1girl, garden"]
                 result = self.invoke(api, action, **changes)
                 self.assertEqual(result[0], "1girl, reading", result[-1])
-                self.assertIn("Do not change fixed facts", calls[0][4])
+                self.assertIn("Preserve explicit facts, counts, negations, spatial relations", calls[0][4])
                 self.assertNotIn("different combination of action, place", calls[0][4])
 
     def test_zero_temperature_survives_response_and_quality_retries(self):
@@ -466,8 +476,10 @@ class PromptReviewFixTests(unittest.TestCase):
                             self.assertIn(PRESETS[preset], system)
                             self.assertIn(build_operation_instruction(action, model), system)
                             for marker in ("Safety mode: NSFW", "LOCAL_NSFW_RULE",
-                                           "Keep the supplied book.", "Keep the supplied colors."):
+                                           "Keep the supplied colors."):
                                 self.assertIn(marker, system)
+                            payload = json.loads(call[5].split("\n", 1)[1].rsplit("\n", 1)[0])
+                            self.assertEqual(payload["user_requirements"], "Keep the supplied book.")
                             self.assertEqual("CREATIVE_BATCH_MARKER" in system, action == "Expand")
 
     def test_creative_retries_keep_batch_and_pass_correction_separately(self):

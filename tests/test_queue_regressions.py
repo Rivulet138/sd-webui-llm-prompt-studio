@@ -472,10 +472,13 @@ class NativeCacheContextTests(unittest.TestCase):
             "apply_native_cache_context", "_native_cache_release", "_native_cache_get_context",
             "prepare_native_cache_processing", "_native_cache_fail",
             "_native_cache_state", "_native_cache_slot",
+            "_immutable_technical_tokens", "_strip_immutable_technical_tokens",
+            "_restore_immutable_technical_tokens",
             constants=(
                 "_NATIVE_CACHE_CONTEXTS", "_NATIVE_CACHE_CONTEXT_LOCK", "_NATIVE_CACHE_CONTEXT_TTL",
                 "_NATIVE_CACHE_MARKER_START", "_NATIVE_CACHE_MARKER_END",
                 "_NATIVE_CACHE_MARKER_ZERO", "_NATIVE_CACHE_MARKER_ONE",
+                "_LORA_TOKEN_RE", "_TECHNICAL_TOKEN_RES",
             ),
             DB=self.db, RESULT_DB=self.db,
             _native_cache_extract_claim_impl=extract_claim,

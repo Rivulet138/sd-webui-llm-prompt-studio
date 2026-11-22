@@ -4,7 +4,7 @@ import unittest
 from test_queue_regressions import ROOT
 from prompt_studio_core import (
     MODEL_PRESET_GUIDANCE,
-    MODEL_QUALITY_GUIDANCE,
+    MODEL_PRESET_FORMATS,
     OPERATION_INSTRUCTIONS,
     PRESETS,
     PROMPT_POLICY_V3,
@@ -13,12 +13,13 @@ from prompt_studio_core import (
 )
 
 POLICY_MARKERS = (
-    "MODEL PRESET CONTRACT",
-    "Format, language, length and structure belong to the selected model preset",
-    "USER REQUIREMENTS",
-    "INERT REFERENCE DATA",
-    "BATCH VARIATION",
-    "SOURCE FIDELITY",
+    "TASK AND FORMAT.",
+    "<model_preset> defines output shape, order, vocabulary",
+    "USER AUTHORITY.",
+    "Treat both as equally authoritative",
+    "REFERENCES.",
+    "BATCH.",
+    "Preserve explicit facts, counts, negations, spatial relations, weights and technical tokens",
 )
 
 
@@ -42,7 +43,7 @@ class OutputProfileTests(unittest.TestCase):
     def test_each_profile_declares_format_without_forced_length(self):
         for name, text in PRESETS.items():
             self.assertIn("Output profile:", text, name)
-            self.assertNotRegex(text, r"\d+-\d+", name)
+            self.assertNotRegex(text, r"\b\d+\s*-\s*\d+\s*(?:tags|words)\b", name)
 
     def test_output_profiles_do_not_duplicate_reference_routing(self):
         for name, text in PRESETS.items():
@@ -56,24 +57,27 @@ class OutputProfileTests(unittest.TestCase):
 
 class OperationContractTests(unittest.TestCase):
     def test_every_action_covers_every_model(self):
-        for action, models in OPERATION_INSTRUCTIONS.items():
+        for action, instruction in OPERATION_INSTRUCTIONS.items():
             for model in MODEL_PRESET_GUIDANCE:
-                self.assertTrue(models.get(model), f"{action}/{model}")
+                self.assertTrue(instruction, f"{action}/{model}")
+                self.assertEqual(build_operation_instruction(action, model), instruction)
 
     def test_instructions_stay_compact(self):
-        for action, models in OPERATION_INSTRUCTIONS.items():
-            for model, text in models.items():
-                self.assertLess(len(text), 420, f"{action}/{model}")
+        for action, instruction in OPERATION_INSTRUCTIONS.items():
+            self.assertLess(len(instruction), 420, action)
 
-    def test_unknown_model_falls_back_to_the_auto_instruction(self):
+    def test_unknown_model_falls_back_to_the_shared_instruction(self):
         self.assertEqual(
             build_operation_instruction("Convert", "unknown-model"),
-            OPERATION_INSTRUCTIONS["Convert"]["Auto / checkpoint default"],
+            OPERATION_INSTRUCTIONS["Convert"],
         )
 
-    def test_quality_guidance_covers_every_model(self):
-        for model in MODEL_PRESET_GUIDANCE:
-            self.assertTrue(MODEL_QUALITY_GUIDANCE.get(model), model)
+    def test_quality_guidance_is_merged_into_every_model_preset(self):
+        for model, preset in MODEL_PRESET_FORMATS.items():
+            self.assertEqual(MODEL_PRESET_GUIDANCE[model], PRESETS[preset])
+            self.assertIn("supplied", PRESETS[preset].lower(), model)
+            self.assertTrue(any(term in PRESETS[preset].lower()
+                                for term in ("quality", "score", "anchors")), model)
 
 
 class PromptBudgetTests(unittest.TestCase):
@@ -112,8 +116,8 @@ class UiPromptTests(unittest.TestCase):
     def test_details_role_no_longer_orders_a_style(self):
         self.assertNotIn("Japanese light-novel illustration", self.source)
         self.assertNotIn("cinematic storytelling", self.source)
-        self.assertIn("do not invent unrequested artist, style or quality claims", PROMPT_POLICY_V3)
-        self.assertIn("Preserve supplied identity, facts, quantities, negations and technical tokens", PROMPT_POLICY_V3)
+        self.assertIn("Do not invent unsupported details", PROMPT_POLICY_V3)
+        self.assertIn("Preserve explicit facts, counts, negations, spatial relations, weights and technical tokens", PROMPT_POLICY_V3)
         self.assertNotIn("TAG FIDELITY", PROMPT_POLICY_V3)
 
     def test_inline_contract_keeps_token_exclusion_and_conciseness(self):
@@ -122,9 +126,10 @@ class UiPromptTests(unittest.TestCase):
         self.assertIn("one concise English expansion", self.source)
 
     def test_batch_contract_keeps_recipe_conditional(self):
-        self.assertIn("Make the recipe items visible", self.source)
-        self.assertIn("only when the user permits them", self.source)
-        self.assertIn("Follow the selected output profile's format", self.source)
+        self.assertIn("Use a listed hint only when it naturally supports this one image", self.source)
+        self.assertIn("drop that item without replacement instead of changing the fixed content", self.source)
+        self.assertIn("Use only lenses allowed by the request", self.source)
+        self.assertIn("Vary only dimensions the user leaves open", PROMPT_POLICY_V3)
 
 
 if __name__ == "__main__":

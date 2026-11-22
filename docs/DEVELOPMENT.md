@@ -89,3 +89,11 @@ python -m unittest discover -s tests -p test_gradio_native_inputs_patch.py
 ```
 
 原 asset 旁保存 `.lps-native-inputs.bak` 备份。新增脚本需重启 Forge 注册后刷新页面。Gradio 升级或重装可能替换 asset，此时需重新核对版本和补丁；不要向不匹配的 bundle 强行应用。缺少前端兼容函数时补丁回退到原输入收集，不关闭 Regional Prompter。独立 Gradio 4.40 浏览器测试覆盖 txt2img/img2img 原生无限生成三轮、Active 关闭/开启/关闭、未启用时无上传和蒙版工具保留；完整 Forge GPU 生图未在该测试中执行。
+
+## 功能回归检查
+
+- 内嵌生成读取当前模型预设，服务端队列传递调度器和 Hires 参数。
+- 模板保存保留变化维度，词库索引成功后保存目录，批量温度下限按开关生效。
+- WD14 单图按图片内容与推理配置识别来源，LLM 处理使用完整转换配置。
+- 缓存处理与结果库共用生图队列管理入口，支持刷新进度和取消等待任务。
+- 标签清理保留 loader token，格式转换允许普通 Booru 标签改写为自然语言。

@@ -66,7 +66,7 @@ function harness(options = {}) {
     const context = vm.createContext({ window, document, console, onAfterUiUpdate: fn => afterUiUpdateCallbacks.push(fn), setTimeout: nativeTimer, clearTimeout, setInterval, clearInterval, Blob, Event: DomEvent, AbortController, HTMLInputElement: Control, HTMLTextAreaElement: Control });
     const instrumented = source.replace(
         /\}\)\(\);\s*$/,
-        "window.__probe = { waitForForgeGeneration: (...args) => waitForForgeGeneration(...args), renderServerQueue: (...args) => renderServerQueue(...args), installNativeSubmitBridges, runForgeGeneration, isForgeBusy, wait, enablePluginKeepAlive, serverQueueRowsHtml, watchServerQueue, studioFetch, setStudioFetch: fn => { studioFetch = fn; }, beginInlineRun, requestPromptApi, requestNativeCacheContext, commitInlineCacheCursor, handleNativeGenerate, nativeCacheConfig, startLinkedRun, syncCacheCursor, restoreNativeCacheState: (...args) => restoreNativeCacheState(...args), installNativeCacheState: () => installNativeCacheState(), setForgeRunner: fn => { runForgeGeneration = fn; } };\n})();",
+        "window.__probe = { waitForForgeGeneration: (...args) => waitForForgeGeneration(...args), renderServerQueue: (...args) => renderServerQueue(...args), installNativeSubmitBridges, runForgeGeneration, isForgeBusy, wait, enablePluginKeepAlive, serverQueueRowsHtml, watchServerQueue, studioFetch, setStudioFetch: fn => { studioFetch = fn; }, beginInlineRun, generateInlinePrompt, generateAutoLoopPrompt, requestPromptApi, requestNativeCacheContext, commitInlineCacheCursor, handleNativeGenerate, nativeCacheConfig, startLinkedRun, syncCacheCursor, restoreNativeCacheState: (...args) => restoreNativeCacheState(...args), installNativeCacheState: () => installNativeCacheState(), setForgeRunner: fn => { runForgeGeneration = fn; } };\n})();",
     );
     assert.notEqual(instrumented, source);
     vm.runInContext(instrumented, context, { filename: "llm_prompt_studio_auto_loop.js" });
@@ -172,6 +172,70 @@ function cacheForm(h, slot = "txt2img", dropdown = false) {
     controls.script = script;
     return controls;
 }
+
+function valueControl(h, id, value, type = "text") {
+    h.nodes.set(id, new Control("DIV").append(new Control("INPUT", value, type)));
+}
+
+function tokenControl(h, id, values) {
+    const host = new Control("DIV");
+    for (const value of values) {
+        const token = new Control("DIV");
+        token.className = "token";
+        token.append(Object.assign(new Control("SPAN"), { textContent: value }));
+        host.append(token);
+    }
+    h.nodes.set(id, host);
+}
+
+test("inline and auto-loop generation send the current combined model preset", async () => {
+    const bodies = [];
+    const h = harness({ fetch: async (url, options) => {
+        bodies.push({ url, body: JSON.parse(options.body) });
+        return response({ prompt: "one cat" });
+    } });
+    valueControl(h, "llm_prompt_studio_model_preset", "NoobAI");
+    const inlineRun = h.test.beginInlineRun("txt2img", "txt2img");
+    await h.test.generateInlinePrompt(inlineRun, inlineRun);
+    assert.equal(bodies[0].body.model_preset, "NoobAI");
+    assert.equal(bodies[0].body.preset, "Danbooru Tags");
+    assert.equal(bodies[0].body.base_model, "Pony / Illustrious");
+
+    const h2 = harness({ fetch: async (url, options) => {
+        bodies.push({ url, body: JSON.parse(options.body) });
+        return response({ prompt: "one cat" });
+    } });
+    valueControl(h2, "llm_prompt_studio_model_preset", "Flux Natural");
+    const autoRun = h2.test.beginInlineRun("txt2img", "txt2img");
+    await h2.test.generateAutoLoopPrompt({ request: "scene", modelPreset: "stale" }, autoRun);
+    assert.equal(bodies[1].body.model_preset, "Flux Natural");
+});
+
+test("readTxt2imgSettings reads current scheduler, styles, and Hires controls", () => {
+    const h = harness();
+    valueControl(h, "txt2img_neg_prompt", "bad");
+    valueControl(h, "txt2img_steps", "28");
+    valueControl(h, "txt2img_scheduler", "Karras");
+    tokenControl(h, "txt2img_styles", ["Style A", "Style B"]);
+    valueControl(h, "hr_checkpoint", "checkpoint.safetensors");
+    tokenControl(h, "hr_vae_te", ["vae.safetensors", "text_encoder"]);
+    valueControl(h, "hr_sampler", "DPM++ 2M");
+    valueControl(h, "hr_scheduler", "Exponential");
+    valueControl(h, "hires_prompt", "high detail");
+    valueControl(h, "hires_neg_prompt", "blurry");
+    valueControl(h, "txt2img_hr", "", "checkbox");
+    h.nodes.get("txt2img_hr").querySelector('input[type="checkbox"]').checked = true;
+    const settings = JSON.parse(h.window.llmPromptStudioAutoLoop.readTxt2imgSettings());
+    assert.equal(settings.scheduler, "Karras");
+    assert.deepEqual(settings.styles, ["Style A", "Style B"]);
+    assert.equal(settings.enable_hr, true);
+    assert.equal(settings.hr_checkpoint_name, "checkpoint.safetensors");
+    assert.deepEqual(settings.hr_additional_modules, ["vae.safetensors", "text_encoder"]);
+    assert.equal(settings.hr_sampler_name, "DPM++ 2M");
+    assert.equal(settings.hr_scheduler, "Exponential");
+    assert.equal(settings.hr_prompt, "high detail");
+    assert.equal(settings.hr_negative_prompt, "blurry");
+});
 
 const snapshot = (config = {}, cursors = {}) => ({
     config: { source: "cache", cache_enabled: true, write_mode: "marker", marker: "<cache>", ...config },

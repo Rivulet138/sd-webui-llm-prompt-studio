@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import prompt_studio_core as core
 from prompt_studio_core import (
-    MODEL_PRESET_FORMATS, MODEL_PRESET_GUIDANCE, PRESETS, build_operation_instruction, build_system_prompt,
+    MODEL_PRESET_FORMATS, MODEL_PRESET_GUIDANCE, PRESETS, build_operation_instruction, build_system_prompt, build_user_message,
 )
 
 
@@ -45,7 +45,7 @@ class FaithfulPolishProfileTests(unittest.TestCase):
                     self.assertNotIn("three-part", system.lower())
                     self.assertEqual(system.count("Output profile:"), 1)
 
-    def test_convert_and_polish_explicitly_constrain_content_and_sparse_sources(self):
+    def test_convert_and_polish_preserve_facts_and_follow_explicit_conflict_resolution(self):
         for model, _preset in MODEL_PRESETS:
             for operation in ("Convert", "Polish"):
                 with self.subTest(model=model, operation=operation):
@@ -55,10 +55,10 @@ class FaithfulPolishProfileTests(unittest.TestCase):
                     ).lower()
                     faithful = system.split("<faithful_edit_contract>\n", 1)[1].split(
                         "\n</faithful_edit_contract>", 1)[0]
-                    for fact in ("background", "props", "weather", "materials", "extra subjects", "new setting"):
-                        self.assertIn(fact, faithful)
-                    self.assertIn("sparse sources may produce shorter outputs", faithful)
-                    self.assertIn("never add details to meet a minimum length", faithful)
+                    self.assertIn("follow the user's explicit resolution", faithful)
+                    self.assertIn("otherwise omit only the disputed detail", faithful)
+                    self.assertIn("do not invent unsupported details", system)
+                    self.assertIn("preserve explicit facts, counts, negations, spatial relations", system)
                     self.assertNotIn("<faithful_edit_contract>", faithful)
 
     def test_saved_normal_profile_keeps_only_additive_notes_and_user_requirements(self):
@@ -71,7 +71,9 @@ class FaithfulPolishProfileTests(unittest.TestCase):
                 self.assertIn(PRESETS[preset], system)
                 self.assertEqual(system.count("Output profile:"), 1)
                 self.assertIn("Keep the kettle visibly dented.", system)
-                self.assertIn("Keep the supplied blue book and plain background.", system)
+                request = build_user_message("A reader.", "Keep the supplied blue book and plain background.")
+                payload = json.loads(request.split("\n", 1)[1].rsplit("\n", 1)[0])
+                self.assertEqual(payload["user_requirements"], "Keep the supplied blue book and plain background.")
                 self.assertNotIn('priority="low"', system)
 
     def test_shared_safety_and_nsfw_injection_are_preserved(self):
@@ -101,9 +103,9 @@ class FaithfulPolishProfileTests(unittest.TestCase):
         for model, _preset in MODEL_PRESETS:
             with self.subTest(model=model):
                 system = self.system(model, user_instruction=requirement)
-                payload = system.split('<user_requirement encoding="json">\n', 1)[1].split(
-                    "\n</user_requirement>", 1)[0]
-                self.assertEqual(json.loads(payload)["requirement"], requirement)
+                request = build_user_message("A reader.", requirement)
+                payload = request.split("\n", 1)[1].rsplit("\n", 1)[0]
+                self.assertEqual(json.loads(payload)["user_requirements"], requirement)
                 self.assertIn("technical tokens", system.lower())
 
 

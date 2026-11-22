@@ -1,6 +1,9 @@
 """Shared provider call/retry loop used by generation and transformations."""
 
+import json
 import math
+
+from prompt_studio_core import extract_technical_tokens, missing_technical_tokens
 
 
 class CandidateQualityError(ValueError):
@@ -15,6 +18,7 @@ def run_llm_generation(
     retry_empty_result=False, credentials=None, call_llm=None,
     build_user_message=None, coerce_bool=None, fallback_request_kwargs=None,
     worst_content_similarity=None, max_response_retries=2, candidate_quality=None,
+    protected_tokens=None,
 ):
     """Run one provider request with response retries and diversity gating.
 
@@ -79,6 +83,21 @@ def run_llm_generation(
                 continue
         try:
             candidate = str(finalize_result(raw_candidate) or "").strip()
+            # Regional JSON escapes loader paths. Validate its actual base prompt.
+            finalized_prompt = candidate
+            if candidate.startswith("{"):
+                try:
+                    structured = json.loads(candidate)
+                except ValueError:
+                    structured = None
+                if isinstance(structured, dict) and isinstance(structured.get("base_prompt"), str):
+                    finalized_prompt = structured["base_prompt"]
+            required_tokens = extract_technical_tokens(raw_candidate)
+            for token in protected_tokens or []:
+                if not missing_technical_tokens([token], raw_candidate):
+                    required_tokens.append(token)
+            if missing_technical_tokens(required_tokens, finalized_prompt):
+                raise CandidateQualityError("Prompt finalization changed or removed a technical token.")
         except CandidateQualityError:
             quality_failures += 1
             result = ""
@@ -87,8 +106,7 @@ def run_llm_generation(
             retry_reason = "quality"
             attempt += 1
             continue
-        if candidate_quality is not None:
-            quality_passes += 1
+        quality_passes += 1
         if not candidate and retry_empty_result:
             if attempt >= max_response_retries:
                 result = candidate
@@ -117,6 +135,6 @@ def run_llm_generation(
         result = accepted
     elif best_candidate:
         result = best_candidate
-    elif candidate_quality is not None and quality_failures and not quality_passes:
+    elif quality_failures and not quality_passes:
         raise CandidateQualityError("所有 LLM 候选均未通过质量校验。")
     return result, system, diversity_retries_used

@@ -1967,25 +1967,44 @@ class CredentialStore:
             return True
 
 
+_LOADER_TOKEN_RE = re.compile(r"<(?:lora|lyco|hypernet):[^>]+>", re.IGNORECASE)
+
+
+def extract_loader_tokens(text: str) -> list[str]:
+    """Return explicit loader instructions in source order, preserving spelling."""
+    return list(dict.fromkeys(match.group(0) for match in _LOADER_TOKEN_RE.finditer(str(text or ""))))
+
+
 def process_tags(text: str, remove_bad: bool = True, remove_terms: str = "", shuffle: bool = False, underscores_to_spaces: bool = False, max_tags: int = 0) -> str:
-    parts = [item.strip() for item in text.split(",") if item.strip()]
+    # Split around loaders first so their names and embedded punctuation stay intact.
+    parts = [item.strip() for item in re.split(f"({_LOADER_TOKEN_RE.pattern})|,", text, flags=re.IGNORECASE)
+             if item and item.strip()]
     blocked = {term.strip().replace("_", " ").lower() for term in remove_terms.split(",") if term.strip()}
     result = []
     seen = set()
     for item in parts:
-        normalized = item.replace("_", " ").lower()
-        if remove_bad and normalized in BAD_TAGS:
-            continue
-        if any(re.fullmatch(re.escape(pattern).replace(r"\*", ".*"), normalized) for pattern in blocked):
-            continue
-        key = normalized
-        if key not in seen:
-            seen.add(key)
-            result.append(item.replace("_", " ") if underscores_to_spaces else item)
+        is_loader = bool(_LOADER_TOKEN_RE.fullmatch(item))
+        normalized = item if is_loader else item.replace("_", " ").lower()
+        if not is_loader:
+            if remove_bad and normalized in BAD_TAGS:
+                continue
+            if any(re.fullmatch(re.escape(pattern).replace(r"\*", ".*"), normalized) for pattern in blocked):
+                continue
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(item.replace("_", " ") if underscores_to_spaces and not is_loader else item)
     if shuffle:
         random.SystemRandom().shuffle(result)
     if max_tags > 0:
-        result = result[:max_tags]
+        limited = []
+        tag_count = 0
+        for item in result:
+            if _LOADER_TOKEN_RE.fullmatch(item):
+                limited.append(item)
+            elif tag_count < max_tags:
+                limited.append(item)
+                tag_count += 1
+        result = limited
     return ", ".join(result)
 
 
@@ -2012,11 +2031,32 @@ def _inert_json(value: Any) -> str:
             .replace("&", "\\u0026"))
 
 
+# Shipped rules from saved profiles predating model-owned output formats.
+_LEGACY_PRESET_RULES = """Return exactly one comma-separated line of canonical lowercase Danbooru tags with underscores, usually 8-60 tags, no prose. Use fewer tags when the visible/requested facts do not support more; never pad to reach a minimum.
+Preserve named characters and explicit attributes exactly as supplied. Add (tag:weight) only when the user asks for emphasis.
+Return one compact comma-separated line, usually 8-40 tags, followed by at most one short natural-language clause that clarifies an action, a spatial relation, a composition fact or a material fact. Do not pad the tag list.
+Return one compact paragraph of 30-200 words, not a list, not markdown.
+One clause per fact; be concrete and economical.
+Return exactly one lowercase comma-separated line with underscores, usually 8-60 tags, no prose. Use fewer tags when the image does not support more; never pad the list.
+Keep checkpoint-specific quality, rating, era or source anchors only when the user supplied them; never invent or expand an anchor block, and never emit Pony score_* tags.
+Return one comma-separated Danbooru-first prompt, 6-50 tags.
+Keep character fidelity and a readable composition ahead of any boilerplate. Weight only a genuinely important feature, and only when the user asks.
+Return one descriptive paragraph of 70-160 words, no markdown, one coherent daily-life image.
+Ground every sentence in something visible; never invent plot, backstory, inner thoughts, dialogue or narration.
+Return one descriptive paragraph, usually 70-160 words, no markdown, one coherent image. Use a shorter paragraph for sparse sources; never invent facts to meet a word count or force a daily-life setting."""
+_LEGACY_PRESET_PREFIX_RE = re.compile(
+    r"^(?:" + "|".join(re.escape(line) for line in sorted(_LEGACY_PRESET_RULES.splitlines(), key=len, reverse=True))
+    + r"|Return one descriptive paragraph of 70-160 words, no markdown(?:, one coherent daily-life image)?[,.]?"
+    + r"|Return one comma-separated Danbooru-first prompt, 6-50 tags[,.]?)(?=\s|$)\s*",
+    re.IGNORECASE,
+)
+
+
 def _system_supplement(text: str, operation_instruction: str = "") -> str:
-    """Keep additive notes while removing repeated built-in rules."""
+    """Keep user notes while migrating repeated current and historical rules."""
     known_lines = {
         " ".join(line.split()).casefold()
-        for value in (*PRESETS.values(),
+        for value in (*PRESETS.values(), _LEGACY_PRESET_RULES,
                       FAITHFUL_EDIT_GUIDANCE,
                       PROMPT_POLICY_V3, operation_instruction)
         for line in value.splitlines() if line.strip()
@@ -2024,7 +2064,7 @@ def _system_supplement(text: str, operation_instruction: str = "") -> str:
     kept = []
     seen = set()
     for line in str(text or "").splitlines():
-        line = line.strip()
+        line = _LEGACY_PRESET_PREFIX_RE.sub("", line.strip()).strip()
         key = " ".join(line.split()).casefold()
         if key and key not in known_lines and key not in seen:
             seen.add(key)
@@ -2125,27 +2165,47 @@ _CONSTRAINT_SCENE_MARKERS = {
     "night": ("night", "nighttime", "midnight", "moonlit", "at night", "夜晚", "深夜", "月光下"),
 }
 
-_TECHNICAL_TOKEN_PATTERNS = (
-    re.compile(r"<lora:[^>]+>", re.IGNORECASE),
-    re.compile(r"<lyco:[^>]+>", re.IGNORECASE),
-    re.compile(r"<hypernet:[^>]+>", re.IGNORECASE),
-)
-_TECHNICAL_TRIGGER_RE = re.compile(
-    r"(?<![\w<])([A-Za-z][A-Za-z0-9_.:-]*[_\d][A-Za-z0-9_.:-]*)(?![\w>])"
-)
 _SCENE_BOUNDARY_RE = re.compile(r"[,，.!?;；。！？\n]")
 
 
-def _extract_technical_tokens(text: str) -> list[str]:
-    """Return loader tags and compact trigger tokens exactly as written."""
+_TRIGGER_VALUE = r"`[^`\n]+`|\"[^\"\n]+\"|'[^'\n]+'|[A-Za-z0-9_][A-Za-z0-9_.:-]*"
+_EXPLICIT_TRIGGER_RE = re.compile(
+    r"(?:\b(?:trigger(?:[ \t]+(?:words?|tokens?))?|activation[ \t]+(?:words?|tokens?))"
+    r"[ \t]*[:=][ \t]*"
+    r"|\b(?:keep|preserve|retain|use|include)[ \t]+(?:the[ \t]+)?"
+    r"(?:trigger(?:[ \t]+(?:words?|tokens?))?|activation[ \t]+(?:words?|tokens?))[ \t]+"
+    r"|(?:保留|保持|使用)(?:原始)?(?:触发词|激活词)[ \t]*[:：=]?[ \t]*"
+    r"|(?:触发词|激活词)[ \t]*[:：=][ \t]*)"
+    r"(?P<values>(?:" + _TRIGGER_VALUE + r")(?:[ \t]*[,，][ \t]*(?:" + _TRIGGER_VALUE + r"))*)",
+    re.IGNORECASE,
+)
+
+
+def extract_technical_tokens(text: str) -> list[str]:
+    """Protect loaders and explicitly declared triggers, never infer from spelling."""
     value = str(text or "")
-    matches = [match for pattern in _TECHNICAL_TOKEN_PATTERNS for match in pattern.finditer(value)]
-    tokens = [(match.start(), match.group(0)) for match in matches]
-    stripped = value
-    for pattern in _TECHNICAL_TOKEN_PATTERNS:
-        stripped = pattern.sub(lambda match: " " * len(match.group(0)), stripped)
-    tokens.extend((match.start(), match.group(1)) for match in _TECHNICAL_TRIGGER_RE.finditer(stripped))
+    tokens = [(match.start(), match.group(0)) for match in _LOADER_TOKEN_RE.finditer(value)]
+    for declaration in _EXPLICIT_TRIGGER_RE.finditer(value):
+        for match in re.finditer(_TRIGGER_VALUE, declaration.group("values")):
+            token = match.group(0)
+            token = token[1:-1] if token[0] in "`\"'" else token.rstrip(".:")
+            if token:
+                tokens.append((declaration.start("values") + match.start(), token))
     return list(dict.fromkeys(token for _, token in sorted(tokens)))
+
+
+def missing_technical_tokens(tokens: Iterable[str], text: str) -> list[str]:
+    """Find required token spellings absent from plain prompt text."""
+    value = str(text or "")
+    loaders = set(extract_loader_tokens(value))
+    missing = []
+    for token in tokens:
+        if _LOADER_TOKEN_RE.fullmatch(token):
+            if token not in loaders:
+                missing.append(token)
+        elif not re.search(r"(?<![\w<])" + re.escape(token) + r"(?![\w>])", value):
+            missing.append(token)
+    return missing
 
 
 def _scene_marker_occurrences(text: str, marker: str) -> list[tuple[int, int]]:
@@ -2212,7 +2272,7 @@ def compile_prompt_constraints(text: str) -> dict[str, Any]:
     scene = {name: state[0] for name, state in scene_states.items()}
     forbidden_scene = {name: state[1] for name, state in scene_states.items()}
     return {
-        "technical_tokens": _extract_technical_tokens(value),
+        "technical_tokens": extract_technical_tokens(value),
         "subject_count": subject_count,
         "scene": scene,
         "forbidden_scene": forbidden_scene,
@@ -2259,11 +2319,8 @@ def prompt_constraint_violations(source: str, candidate: str) -> list[str]:
             violations.append(f"forbidden-scene:{name}")
         if expected_scene[name] and actual.get("forbidden_scene", {}).get(name):
             violations.append(f"forbidden-scene:{name}")
-    expected_tokens = {str(token).casefold(): str(token) for token in expected["technical_tokens"]}
-    actual_tokens = {str(token).casefold() for token in actual["technical_tokens"]}
-    for key, token in sorted(expected_tokens.items()):
-        if key not in actual_tokens:
-            violations.append(f"missing-token:{token}")
+    for token in missing_technical_tokens(expected["technical_tokens"], candidate):
+        violations.append(f"missing-token:{token}")
     return list(dict.fromkeys(violations))
 
 

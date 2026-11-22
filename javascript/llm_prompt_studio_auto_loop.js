@@ -172,16 +172,38 @@
             const element = host?.querySelector('input[type="checkbox"]');
             return element ? Boolean(element.checked) : fallback;
         };
+        const styles = id => {
+            const host = find(`txt2img_${id}`);
+            return host ? Array.from(host.querySelectorAll(".token"), token =>
+                String(token.querySelector("span")?.textContent || token.textContent || "").trim()
+            ).filter(Boolean) : [];
+        };
+        const exact = (id, fallback = "") => componentValue(id, fallback);
+        const hiresEnabled = find("txt2img_hr-checkbox")?.querySelector('input[type="checkbox"]')
+            || find("txt2img_hr-visible-checkbox")
+            || find("txt2img_hr")?.querySelector('input[type="checkbox"]');
         return JSON.stringify({
             "negative_prompt": String(componentValue("txt2img_neg_prompt", "") || ""),
             steps: number("steps", 20), width: number("width", 1024), height: number("height", 1024),
             cfg_scale: number("cfg_scale", 6), distilled_cfg_scale: number("distilled_cfg_scale", 3),
-            "sampler_name": raw("sampling", "Euler"), seed: number("seed", -1),
+            "sampler_name": raw("sampling", "Euler"), scheduler: raw("scheduler", "Automatic"),
+            styles: styles("styles"), seed: number("seed", -1),
             batch_size: number("batch_size", 1), batch_count: number("batch_count", 1),
-            enable_hr: checked("hr", false), hr_scale: number("hr_scale", 2),
+            enable_hr: Boolean(hiresEnabled?.checked), hr_scale: number("hr_scale", 2),
             hr_resize_x: number("hr_resize_x", 0), hr_resize_y: number("hr_resize_y", 0),
             denoising_strength: number("denoising_strength", 0.6),
             hr_second_pass_steps: number("hires_steps", 0), hr_upscaler: raw("hr_upscaler", ""),
+            hr_checkpoint_name: exact("hr_checkpoint", "Use same checkpoint"),
+            hr_additional_modules: (() => {
+                const host = find("hr_vae_te");
+                return host ? Array.from(host.querySelectorAll(".token"), token =>
+                    String(token.querySelector("span")?.textContent || token.textContent || "").trim()
+                ).filter(Boolean) : [];
+            })(),
+            hr_sampler_name: exact("hr_sampler", "Use same sampler"),
+            hr_scheduler: exact("hr_scheduler", "Use same scheduler"),
+            hr_prompt: exact("hires_prompt", ""),
+            hr_negative_prompt: exact("hires_neg_prompt", ""),
             hr_cfg: number("hr_cfg", 6), hr_distilled_cfg: number("hr_distilled_cfg", 3),
         });
     }
@@ -743,6 +765,7 @@
         const slot = config.slot === "img2img" ? "img2img" : "txt2img";
         const sharedConfig = {
             ...config,
+            modelPreset: sharedWorkflowValue("model_preset", config.modelPreset || "Pony / Illustrious"),
             preset: sharedWorkflowValue("preset", config.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags")),
             baseModel: sharedWorkflowValue("base_model", config.baseModel || componentValue(inlineId(slot, "base_model"), "Pony / Illustrious")),
             safety: sharedWorkflowValue("safety", config.safety || componentValue(inlineId(slot, "safety"), "SFW")),
@@ -753,6 +776,7 @@
             source_tags: config.fixedPrompt ?? promptValue(slot),
             ...(config.destination === "cache" || config.destination === "queue" ? { cache_result: true } : {}),
             variation: String(sharedConfig.variation || ""),
+            model_preset: normalizeChoiceValue(sharedConfig.modelPreset),
             preset: normalizeChoiceValue(sharedConfig.preset),
             base_model: normalizeChoiceValue(sharedConfig.baseModel),
             safety: normalizeChoiceValue(sharedConfig.safety),
@@ -764,6 +788,7 @@
     async function generateAutoLoopPrompt(config, run) {
         const data = await requestPromptApi(run, "auto-loop-generate", {
             request: String(config.request || ""),
+            model_preset: normalizeChoiceValue(sharedWorkflowValue("model_preset", config.modelPreset || "Pony / Illustrious")),
             preset: normalizeChoiceValue(config.preset, "Danbooru Tags"),
             base_model: normalizeChoiceValue(config.baseModel, "Pony / Illustrious"),
             safety: normalizeChoiceValue(config.safety, "SFW"),
@@ -976,6 +1001,7 @@
             variation: String(overrides.variation || ""),
             source: normalizeChoiceValue(overrides.source, "llm"),
             cacheCursor: overrides.cacheCursor == null || overrides.cacheCursor === "" ? null : normalizeCacheCursor(overrides.cacheCursor, 0),
+            modelPreset: normalizeChoiceValue(sharedWorkflowValue("model_preset", overrides.modelPreset || "Pony / Illustrious")),
             preset: normalizeChoiceValue(sharedWorkflowValue("preset", overrides.preset || componentValue(inlineId(slot, "preset"), "Danbooru Tags"))),
             baseModel: normalizeChoiceValue(sharedWorkflowValue("base_model", overrides.baseModel || componentValue(inlineId(slot, "base_model"), "Pony / Illustrious"))),
             safety: normalizeChoiceValue(sharedWorkflowValue("safety", overrides.safety || componentValue(inlineId(slot, "safety"), "SFW"))),

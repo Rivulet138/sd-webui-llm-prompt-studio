@@ -16,14 +16,14 @@ class TechnicalTokenBoundaryTests(unittest.TestCase):
             "<lora:Style_42:0.8>, <hypernet:Net_7:0.4>, first_trigger"
         )
         self.assertEqual(compile_prompt_constraints(source)["technical_tokens"], [
-            "first_trigger", "<lyco:Lyco_3:0.7>", "second_2",
-            "<lora:Style_42:0.8>", "<hypernet:Net_7:0.4>",
+            "<lyco:Lyco_3:0.7>", "<lora:Style_42:0.8>",
+            "<hypernet:Net_7:0.4>",
         ])
 
     def test_token_only_inside_loader_tag_is_not_a_separate_trigger(self):
         source = "<lora:some_trigger_1:0.8>, independent_2"
         self.assertEqual(compile_prompt_constraints(source)["technical_tokens"],
-                         ["<lora:some_trigger_1:0.8>", "independent_2"])
+                         ["<lora:some_trigger_1:0.8>"])
 
     def test_comma_separates_negation_from_later_scene_marker(self):
         for source in ("no indoor scene, indoor", "no indoor scene\uff0cindoor",
