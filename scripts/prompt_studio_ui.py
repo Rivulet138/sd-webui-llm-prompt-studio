@@ -674,6 +674,11 @@ def _save_diversity_settings(
     return f"已保存：{summary}。下一次生成生效。"
 
 
+def _load_diversity_controls() -> tuple:
+    settings = _diversity_settings()
+    return tuple(settings[key] for key in _DIVERSITY_CONTROL_KEYS)
+
+
 def _reset_diversity_settings() -> tuple:
     """Restore defaults and push the values back into the controls."""
     defaults = dict(_DIVERSITY_SETTINGS_DEFAULTS)
@@ -2656,7 +2661,7 @@ def _preview_batch_sources(source_text, skip_existing, preset, base_model, gener
         message += (
             f" 其中 {stats['content_duplicates']} 条输入与前面几乎描述同一画面（内容相似度阈值 "
             f"{float(stats.get('content_threshold', 0.55)):.2f}），这些输入本身不会带来新画面，"
-            "多样性完全取决于配方与内容去重；如需自动折叠，在 prompt_diversity_v1 中开启 source_fold_duplicates。"
+            "可在「提示词 → 批量多样性」启用“折叠重复输入”。"
         )
     if len(sources) > 200:
         message += " 预览仅显示前 200 条。"
@@ -7559,9 +7564,9 @@ def on_ui_tabs():
                 with gr.Row(elem_classes=["lps-template-picker"]):
                     template_choice = gr.Dropdown(
                         label="模板提示词", choices=_template_choices(),
-                        value=_default_template_choice(), elem_id="llm_prompt_studio_template_choice",
+                        value=_default_template_choice(), elem_id="llm_prompt_studio_prompt_template_choice",
                     )
-                    template_button = gr.Button("套用到创作要求", elem_id="llm_prompt_studio_template_button")
+                    template_button = gr.Button("套用到创作要求", elem_id="llm_prompt_studio_prompt_template_button")
                 with gr.Accordion("编辑模板提示词", open=True, elem_classes=["lps-template-editor"]):
                     template_initial = _load_custom_template_editor(_default_template_choice())
                     template_name = gr.Textbox(label="模板标识", value=template_initial[0], max_lines=1, placeholder="内置模板不可改名；自定义模板填写名称")
@@ -7597,6 +7602,48 @@ def on_ui_tabs():
                         system_profile_save = gr.Button("保存当前预设", variant="primary")
                         restore_preset = gr.Button("清空补充要求")
                     system_profile_status = gr.Markdown("各模型预设可分别保存补充要求。补充要求不能替代模型预设；用户内容要求会明确执行。", elem_classes=["lps-status"])
+                diversity_initial = _diversity_settings()
+                with gr.Accordion("批量多样性", open=False, elem_classes=["lps-settings-panel"]):
+                    gr.Markdown("仅影响批量创作。词库条目作为可选参考，固定主体和技术标记优先。")
+                    with gr.Row():
+                        diversity_recipe_enabled = gr.Checkbox(
+                            label="启用词库配方", value=diversity_initial["recipe_enabled"],
+                            elem_id="llm_prompt_studio_diversity_recipe_enabled",
+                        )
+                        diversity_recipe_dimensions = gr.Number(
+                            label="配方维度", value=diversity_initial["recipe_dimensions"],
+                            minimum=1, maximum=6, precision=0,
+                            elem_id="llm_prompt_studio_diversity_recipe_dimensions",
+                        )
+                        diversity_retry_limit = gr.Number(
+                            label="相似度重试", value=diversity_initial["retry_limit"],
+                            minimum=0, maximum=_MAX_DIVERSITY_RETRIES, precision=0,
+                            elem_id="llm_prompt_studio_diversity_retry_limit",
+                        )
+                        diversity_similarity_threshold = gr.Number(
+                            label="相似度阈值", value=diversity_initial["similarity_threshold"],
+                            minimum=0.2, maximum=0.95, step=0.01,
+                            elem_id="llm_prompt_studio_diversity_similarity_threshold",
+                        )
+                    with gr.Row():
+                        diversity_memory_enabled = gr.Checkbox(
+                            label="启用多样性记忆", value=diversity_initial["memory_enabled"],
+                            elem_id="llm_prompt_studio_diversity_memory_enabled",
+                        )
+                        diversity_batch_temperature_floor = gr.Checkbox(
+                            label=f"批量温度下限（{_MIN_INDEPENDENT_BATCH_TEMPERATURE}）", value=diversity_initial["batch_temperature_floor"],
+                            elem_id="llm_prompt_studio_diversity_batch_temperature_floor",
+                        )
+                        diversity_source_fold_duplicates = gr.Checkbox(
+                            label="折叠重复输入", value=diversity_initial["source_fold_duplicates"],
+                            elem_id="llm_prompt_studio_diversity_source_fold_duplicates",
+                        )
+                    with gr.Row(elem_classes=["lps-primary-actions"]):
+                        diversity_save = gr.Button("保存多样性设置", variant="primary", elem_id="llm_prompt_studio_diversity_save")
+                        diversity_reset = gr.Button("恢复默认", elem_id="llm_prompt_studio_diversity_reset")
+                        diversity_report_button = gr.Button("刷新报告", elem_id="llm_prompt_studio_diversity_report")
+                    diversity_status = gr.Markdown(elem_id="llm_prompt_studio_diversity_status", elem_classes=["lps-status"])
+                    diversity_report = gr.Markdown(elem_id="llm_prompt_studio_diversity_report_output")
                 prompt_template_choice = template_choice
                 prompt_template_button = template_button
                 prompt_template_name = template_name
@@ -7770,6 +7817,25 @@ def on_ui_tabs():
             _prompt_profile_reset,
             inputs=prompt_preset,
             outputs=[prompt_system_override, prompt_system_editor, prompt_profile_status, system_override, system_editor],
+        )
+        diversity_controls = [
+            diversity_recipe_enabled, diversity_recipe_dimensions, diversity_retry_limit,
+            diversity_similarity_threshold, diversity_memory_enabled,
+            diversity_batch_temperature_floor, diversity_source_fold_duplicates,
+        ]
+        diversity_save.click(
+            _save_diversity_settings,
+            inputs=diversity_controls,
+            outputs=diversity_status,
+        )
+        diversity_reset.click(
+            _reset_diversity_settings,
+            outputs=[*diversity_controls, diversity_status],
+        )
+        ui.load(_load_diversity_controls, outputs=diversity_controls, queue=False)
+        diversity_report_button.click(
+            _diversity_report_markdown,
+            outputs=diversity_report,
         )
         ui.load(
             _load_system_prompt_profile, inputs=[preset, base_model],

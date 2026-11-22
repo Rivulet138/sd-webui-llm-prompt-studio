@@ -423,7 +423,7 @@ class GenerateGateTests(unittest.TestCase):
         api = self.build([STREET_C])
         _prompt, _system, _status = self.generate(api, history=[KITCHEN_A, KITCHEN_B])
         system = self.calls[0].system
-        self.assertIn("COVERAGE SO FAR", system)
+        self.assertIn("Optional coverage context already used in this batch", system)
         self.assertNotIn("DIVERSITY LEDGER", system)
         self.assertNotIn("Do not reuse their scene structure", system)
 
