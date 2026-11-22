@@ -327,7 +327,7 @@ class UIEventContractTests(unittest.TestCase):
 
     def test_delete_mode_hides_all_edit_controls(self):
         event = self.event("processed_result_manage_action", "change")
-        callback = eval(compile(ast.Expression(event.args[0]), "ui-change", "eval"), {"gr": GR})
+        callback = eval(compile(ast.Expression(event.args[0]), "ui-change", "eval"), {"gr": GR})  # noqa: S307 - evaluates the UI callback expression extracted from the repository source
         self.assertEqual(callback("delete"), [{"visible": False}] * 3)
         self.assertEqual(callback("edit"), [{"visible": True}] * 3)
         self.assertEqual(len(next(kw.value for kw in event.keywords if kw.arg == "outputs").elts), 3)

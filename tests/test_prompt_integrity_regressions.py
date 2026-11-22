@@ -52,7 +52,7 @@ def ui_api(**overrides):
         build_system_prompt=build_system_prompt,
     )
     namespace.update(overrides)
-    exec(compile(module, str(ROOT / "scripts" / "prompt_studio_ui.py"), "exec"), namespace)
+    exec(compile(module, str(ROOT / "scripts" / "prompt_studio_ui.py"), "exec"), namespace)  # noqa: S102 - loads selected repository functions into an isolated test namespace
     return SimpleNamespace(**namespace)
 
 

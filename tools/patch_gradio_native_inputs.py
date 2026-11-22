@@ -1,6 +1,7 @@
 """Apply or restore the narrow Gradio 4.40 native input-collection hook."""
 import argparse
 import hashlib
+import sys
 from pathlib import Path
 
 
@@ -48,8 +49,8 @@ def main() -> None:
         result = patch_asset(asset, restore=args.restore)
     except (OSError, ValueError) as error:
         parser.exit(1, f"{error}\n")
-    print(f"{result}: {asset}")
-    print("sha256=" + hashlib.sha256(asset.read_bytes()).hexdigest())
+    sys.stdout.write(f"{result}: {asset}\n")
+    sys.stdout.write("sha256=" + hashlib.sha256(asset.read_bytes()).hexdigest() + "\n")
 
 
 if __name__ == "__main__":

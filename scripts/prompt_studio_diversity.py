@@ -42,7 +42,6 @@ import argparse
 import collections
 import json
 import math
-import os
 import re
 import sqlite3
 import sys
@@ -264,8 +263,6 @@ def vendi_score(docs: Sequence[Sequence[str]], max_items: int = 400) -> float:
     size = len(vectors)
     if size < 2:
         return float(size)
-    norms = [math.sqrt(sum(value * value for value in vector.values())) or 1.0
-             for vector in vectors]
     similarity = [[0.0] * size for _ in range(size)]
     for i in range(size):
         similarity[i][i] = 1.0
@@ -397,14 +394,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         texts = load_prompts_from_file(args.file, args.limit)
     else:
         if not Path(args.db).exists():
-            print(f"database not found: {args.db}", file=sys.stderr)
+            sys.stderr.write(f"database not found: {args.db}\n")
             return 2
         texts = load_prompts_from_db(args.db, args.limit)
     if not texts:
-        print("no prompts found", file=sys.stderr)
+        sys.stderr.write("no prompts found\n")
         return 1
     report = diversity_report(texts, threshold=args.threshold)
-    print(json.dumps(report, ensure_ascii=False, indent=2) if args.json else format_report(report))
+    sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) if args.json else format_report(report))
+    sys.stdout.write("\n")
     return 0
 
 

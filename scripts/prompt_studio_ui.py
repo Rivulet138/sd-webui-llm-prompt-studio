@@ -26,7 +26,7 @@ from prompt_studio_image_batch import ImageBatchJob
 from prompt_studio_lexicon_sampling import sample_references as _sample_lexicon_references
 from prompt_studio_lexicon_sampling import sample_terms as _sample_lexicon_terms_impl
 from prompt_studio_generation import (
-    CandidateQualityError,
+    CandidateQualityError,  # noqa: F401 - resolved dynamically by optional quality checks
     run_llm_generation as _run_llm_generation_impl,
 )
 from prompt_studio_native_cache import extract_claim as _native_cache_extract_claim_impl
@@ -45,9 +45,10 @@ from prompt_studio_core import (
     MODEL_PRESET_FORMATS, MODEL_PRESET_GUIDANCE, DEFAULT_WILDCARDS, PRESETS, PROCESSED_DB_PATH, PROVIDER_PROFILES, CredentialStore, StudioDB,
     build_system_prompt, build_user_message, build_operation_instruction, call_llm, get_provider_profile, is_sfw_output,
     LLMRequestError, discover_provider_models,
-    discover_ranbooru_cache, load_ranbooru_cache, process_tags, canonicalize_booru_tags,
+    discover_ranbooru_cache, load_ranbooru_cache, process_tags, canonicalize_booru_tags,  # noqa: F401 - dynamically resolved for optional tag canonicalization
     regional_format, validate_endpoint, normalize_sampling, _cosine, _tokens,
-    prompt_constraint_conflicts, prompt_constraint_violations,
+    prompt_constraint_conflicts,  # noqa: F401 - dynamically resolved for optional constraint checks
+    prompt_constraint_violations,  # noqa: F401 - dynamically resolved for optional constraint checks
 )
 
 
@@ -335,8 +336,6 @@ _BATCH_VARIATION_FOCI = _VARIATION_DIMENSIONS  # Backward-compatible test/API na
 _COMPLETE_PROMPT_CONTRACT = (
     "Return one independently usable prompt for one image, not a checklist, storyboard or collage."
 )
-_INDEPENDENT_BATCH_LOCK = threading.Lock()
-_independent_batch_sequence = 0
 _MIN_INDEPENDENT_BATCH_TEMPERATURE = 1.25
 _MAX_BATCH_SIMILARITY = 0.62
 _MIN_DISTINCTIVE_OVERLAP = 0.40
@@ -375,8 +374,6 @@ _DIVERSITY_SETTINGS_DEFAULTS = {
 _RECENT_BATCH_OUTPUTS: dict[str, list[str]] = {}
 _RECENT_BATCH_OUTPUTS_LOCK = threading.Lock()
 _BATCH_CONTEXT = threading.local()
-_INDEPENDENT_CREATIVE_LOCK = threading.Lock()
-_independent_creative_sequence = 0
 _INDEPENDENT_CREATIVE_FOCI = _VARIATION_DIMENSIONS
 _INSPIRATION_TOPIC_POOL = (
     "日常生活", "校园时光", "节庆活动", "奇幻冒险", "科幻探索", "自然观察",
@@ -438,14 +435,6 @@ def _independent_batch_directive(
     recipe: Iterable[tuple[str, str, str]] | None = None,
 ) -> str:
     """Create a compact directive; batch memory, underused lenses and a sampled recipe drive diversity."""
-    global _independent_batch_sequence
-    requested_sequence = int(sequence or 0)
-    if requested_sequence > 0:
-        focus_index = requested_sequence - 1
-    else:
-        with _INDEPENDENT_BATCH_LOCK:
-            focus_index = _independent_batch_sequence
-            _independent_batch_sequence += 1
     lenses = _choose_variation_lenses(used_lenses, count=2)
     nonce = uuid.uuid4().hex[:12]
     return (
@@ -462,14 +451,6 @@ def _independent_creative_directive(
     recipe: Iterable[tuple[str, str, str]] | None = None,
 ) -> str:
     """Create the compact inline variation and conditional-completeness contract."""
-    global _independent_creative_sequence
-    requested_sequence = int(sequence or 0)
-    if requested_sequence > 0:
-        focus_index = requested_sequence - 1
-    else:
-        with _INDEPENDENT_CREATIVE_LOCK:
-            focus_index = _independent_creative_sequence
-            _independent_creative_sequence += 1
     lenses = _choose_variation_lenses(used_lenses, count=2)
     nonce = uuid.uuid4().hex[:12]
     return (
@@ -4838,7 +4819,6 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     allow_wrap = _coerce_bool(payload.get("allow_wrap"), False)
     records: list[dict[str, Any]] = []
     cursor = after_id
-    wrapped = False
     while len(records) < total_images:
         page = database.list_prompts_after("", min(1000, total_images - len(records)), cursor)
         if page:
@@ -4847,7 +4827,6 @@ def _native_cache_prepare(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         if allow_wrap and cursor > 0:
             cursor = 0
-            wrapped = True
             continue
         break
     usable = [
@@ -5976,7 +5955,7 @@ def _create_inline_cache_panel(slot, prompt_target, queue_controls):
             write.click(_inline_cache_write, inputs=[prompt_target, result, write_mode], outputs=[prompt_target, status])
         queue_refresh.click(_inline_cache_queue_status, inputs=queue_controls["ids"], outputs=enqueue_status)
         queue_cancel.click(_inline_cache_cancel_queues, inputs=queue_controls["ids"], outputs=enqueue_status, queue=False)
-        enqueue_event = enqueue_images.click(
+        enqueue_images.click(
             _inline_cache_enqueue_results,
             inputs=[stage, result_id, result, queue_controls["settings"], queue_controls["ids"]],
             outputs=[stage, queue_controls["ids"], enqueue_status],
@@ -5995,7 +5974,6 @@ def _inline_source_controls(source):
 
 
 def _create_inline_panel(slot, prompt_target):
-    workflow = _workflow_settings()
     # Keep the txt2img injection focused on optional prompt batch generation.
     # Cache processing is rendered in the Studio tab so it has one canonical UI.
     with gr.Column(elem_id=f"llm_prompt_studio_{slot}_inline", elem_classes=["lps-inline-workbench"]):
@@ -6048,11 +6026,11 @@ def _create_inline_panel(slot, prompt_target):
                         variant="stop",
                         elem_id=f"llm_prompt_studio_{slot}_inline_stop",
                     )
-            inline_cache_enabled = gr.Checkbox(
+            gr.Checkbox(
                 label="启用缓存 Prompt 注入", value=False,
                 elem_id=f"llm_prompt_studio_{slot}_inline_cache_enabled",
             )
-            with gr.Row(elem_classes=["lps-form-row", "lps-inline-merge"]) as inline_merge:
+            with gr.Row(elem_classes=["lps-form-row", "lps-inline-merge"]):
                 inline_write_mode = gr.Dropdown(
                     label="与当前 Prompt 合并方式",
                     choices=[
@@ -6069,7 +6047,7 @@ def _create_inline_panel(slot, prompt_target):
                     placeholder="例如 {{LLM}}",
                     elem_id=f"llm_prompt_studio_{slot}_inline_marker",
                 )
-            inline_loop_status = gr.HTML("缓存注入关闭", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
+            gr.HTML("缓存注入关闭", elem_id=f"llm_prompt_studio_{slot}_inline_loop_status", elem_classes=["lps-status"])
             gr.HTML("", elem_id=f"llm_prompt_studio_{slot}_inline_queue_log", elem_classes=["lps-auto-loop-log"])
             source_outputs = [llm_fields, source_hint, inline_cache_cursor]
             inline_source.change(_inline_source_controls, inputs=[inline_source], outputs=source_outputs, queue=False)
@@ -7610,19 +7588,6 @@ def on_ui_tabs():
                         transform_save = gr.Button("保存转换配置", variant="primary")
                         transform_clear_credentials = gr.Button("清除转换 API Key")
                     transform_status = gr.Markdown(_credential_status(transform_settings["provider"], transform_settings["endpoint"]), elem_classes=["lps-status"])
-                # Keep the old callback names for the compact cache panel contract.
-                settings_cache_temperature = transform_temperature
-                settings_cache_top_p = transform_top_p
-                settings_cache_top_k = transform_top_k
-                settings_cache_max_tokens = transform_max_tokens
-                settings_cache_timeout = transform_timeout
-                settings_cache_retry_count = transform_retry_count
-                settings_cache_thinking_enabled = transform_thinking_enabled
-                settings_cache_send_temperature = transform_send_temperature
-                settings_cache_thinking_budget = transform_thinking_budget
-                settings_cache_reasoning_effort = transform_reasoning_effort
-                settings_cache_save = transform_save
-                settings_cache_status = transform_status
                 with gr.Row(elem_classes=["lps-primary-actions", "lps-action-bar"]):
                     test = gr.Button("测试连接", elem_id="llm_prompt_studio_test_connection")
                     save_connection = gr.Button("保存并应用", variant="primary")
@@ -7790,7 +7755,6 @@ def on_ui_tabs():
                         wd_directory_value = DB.get_setting("wd14_local_directory", "")
                         wd_models, wd_default = discover_local_models(wd_directory_value)
                         wd_paths = {path for _label, path in wd_models}
-                        wd_endpoint = gr.State(workflow["wd_endpoint"])
                         with gr.Row():
                             wd_model = gr.Dropdown(label="本地模型", choices=wd_models,
                                 value=workflow["wd_model"] if workflow["wd_model"] in wd_paths else wd_default,
@@ -7973,13 +7937,13 @@ def on_ui_tabs():
             inputs=[transform_provider, transform_endpoint],
             outputs=transform_status,
         )
-        settings_cache_save.click(
+        transform_save.click(
             _save_transform_llm_settings,
             inputs=[transform_provider, transform_endpoint, transform_model, transform_api_key,
                     transform_temperature, transform_timeout, transform_max_tokens, transform_send_temperature,
                     transform_retry_count, transform_thinking_enabled, transform_thinking_budget,
                     transform_reasoning_effort, transform_top_p, transform_top_k],
-            outputs=settings_cache_status,
+            outputs=transform_status,
         )
         clear_credentials.click(_clear_llm_credentials, inputs=[provider, endpoint], outputs=test_status)
         fallback_clear_credentials.click(
@@ -8262,7 +8226,7 @@ def on_ui_tabs():
         )
         processed_queue_refresh.click(_inline_cache_queue_status, inputs=processed_result_queue_ids, outputs=processed_result_status)
         processed_queue_cancel.click(_inline_cache_cancel_queues, inputs=processed_result_queue_ids, outputs=processed_result_status, queue=False)
-        processed_result_enqueue_event = processed_result_enqueue.click(
+        processed_result_enqueue.click(
             _processed_result_enqueue,
             inputs=[processed_result_selection, processed_result_query, processed_result_queue_ids, processed_result_generation_settings, processed_result_scope],
             outputs=[processed_result_queue_ids, processed_result_status],

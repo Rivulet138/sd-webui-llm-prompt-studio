@@ -31,7 +31,7 @@ def ui_functions(*names, constants=(), **context):
                 selected.append(node)
     namespace = dict(Any=Any, LOGGER=logging.getLogger(__name__))
     namespace.update(context)
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(source_path), "exec"), namespace)
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(source_path), "exec"), namespace)  # noqa: S102 - loads selected repository functions into an isolated test namespace
     return SimpleNamespace(**namespace)
 
 

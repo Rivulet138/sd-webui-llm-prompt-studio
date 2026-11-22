@@ -44,7 +44,7 @@ def ui_functions(*names, constants=(), **context):
     namespace = dict(Any=Any, StudioDB=StudioDB, MODEL_PRESET_FORMATS=MODEL_PRESET_FORMATS, threading=threading, time=time, json=json, re=re,
                      hashlib=hashlib, uuid=uuid, LOGGER=logging.getLogger("queue-test"), MAX_SERVER_QUEUE_REQUESTS=5000)
     namespace.update(context)
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(ROOT / "scripts/prompt_studio_ui.py"), "exec"), namespace)
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(ROOT / "scripts/prompt_studio_ui.py"), "exec"), namespace)  # noqa: S102 - loads selected repository functions into an isolated test namespace
     return SimpleNamespace(**namespace)
 
 
@@ -509,8 +509,10 @@ class NativeCacheContextTests(unittest.TestCase):
         tree = ast.parse((ROOT / "scripts/prompt_studio_native.py").read_text(encoding="utf-8"))
         namespace = {**vars(self.api), "shared": shared,
                      "scripts": SimpleNamespace(Script=object, AlwaysVisible=object())}
-        exec(compile(ast.Module(body=[node for node in tree.body if isinstance(node, ast.ClassDef)],
-                                type_ignores=[]), "prompt_studio_native.py", "exec"), namespace)
+        exec(  # noqa: S102 - loads the repository class definition into an isolated test namespace
+            compile(ast.Module(body=[node for node in tree.body if isinstance(node, ast.ClassDef)],
+                        type_ignores=[]), "prompt_studio_native.py", "exec"), namespace
+        )
         return namespace["Script"]()
 
     def test_native_hook_rejects_cancelled_or_missing_claim_and_interrupts_forge(self):

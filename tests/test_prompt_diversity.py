@@ -15,7 +15,7 @@ from pathlib import Path
 
 from types import SimpleNamespace
 
-from test_queue_regressions import ROOT, StudioDB, ui_functions
+from test_queue_regressions import StudioDB, ui_functions
 from prompt_studio_core import (
     LLMRequestError,
     _cosine,

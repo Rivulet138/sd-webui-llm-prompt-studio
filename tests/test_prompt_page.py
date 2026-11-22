@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
-from test_queue_regressions import ROOT, StudioDB, ui_functions
+from test_queue_regressions import StudioDB, ui_functions
 from prompt_studio_core import _cosine, _tokens, build_operation_instruction, build_system_prompt
 from prompt_studio_diversity import diversity_report, format_report
 
